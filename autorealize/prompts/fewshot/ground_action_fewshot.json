@@ -1,0 +1,72 @@
+﻿[
+  {
+    "input": {
+      "file": "sales.csv",
+      "column_issue": "amount 列中出现 'INF' 和空字符串",
+      "task": "预测下个月销售额"
+    },
+    "output": {
+      "target_file": "sales.csv",
+      "purpose": "修复金额列非法值，避免训练/评估报错",
+      "agent_type": "repairer",
+      "toolset": [
+        "table_io",
+        "python_sandbox",
+        "contract_check",
+        "constraint_engine",
+        "monitor",
+        "checker"
+      ],
+      "action": "transform",
+      "reason": "INF 与空字符串会导致数值计算异常；保留原始业务含义",
+      "python_code": "import numpy as np\n\ndef stage_transform(df):\n    out = df.copy()\n    if 'amount' in out.columns:\n        out['amount'] = out['amount'].replace(['INF', 'inf', ''], np.nan)\n        out['amount'] = out['amount'].astype(float)\n    return out\n",
+      "contract": {
+        "required_input_columns": [
+          "amount"
+        ],
+        "preserve_columns": [
+          "amount"
+        ],
+        "remove_columns": [],
+        "add_columns": [],
+        "row_count_rule": "same",
+        "value_constraints": {
+          "amount": {
+            "no_inf": true
+          }
+        },
+        "post_conditions": [
+          "row_count_same",
+          "no_inf"
+        ]
+      }
+    }
+  },
+  {
+    "input": {
+      "file": "train.csv",
+      "column_issue": "未发现明显异常，仅需要确认",
+      "task": "叶片分类"
+    },
+    "output": {
+      "target_file": "train.csv",
+      "purpose": "仅确认数据状态，不做改写",
+      "agent_type": "noop_keeper",
+      "toolset": [],
+      "action": "noop",
+      "reason": "当前无需清洗，保持原始数据",
+      "python_code": "def stage_transform(df):\n    return df.copy()\n",
+      "contract": {
+        "required_input_columns": [],
+        "preserve_columns": [],
+        "remove_columns": [],
+        "add_columns": [],
+        "row_count_rule": "same",
+        "value_constraints": {},
+        "post_conditions": [
+          "row_count_same"
+        ]
+      }
+    }
+  }
+]

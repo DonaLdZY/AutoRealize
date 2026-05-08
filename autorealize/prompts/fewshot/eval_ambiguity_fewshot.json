@@ -1,0 +1,32 @@
+[
+  {
+    "bad_example": {
+      "text": "Primary Metric 可使用 RMSE 或 MAE；切分推荐 rolling-window。",
+      "why_ambiguous": "主指标不唯一，且切分参数缺失。"
+    },
+    "good_example": {
+      "text": "Primary Metric = RMSE；rolling-window: 训练窗口=180天，验证窗口=30天，步长=30天；random_state=20250430。",
+      "why_clear": "主指标唯一且参数完整可复现。"
+    }
+  },
+  {
+    "bad_example": {
+      "text": "推荐任务采用 Accuracy 评估。",
+      "why_ambiguous": "任务类型与指标不一致，且无法反映排序质量。"
+    },
+    "good_example": {
+      "text": "recommendation_ranking 任务使用 NDCG@10 = mean(DCG@10 / IDCG@10)。",
+      "why_clear": "排序任务使用唯一排序指标并给出公式。"
+    }
+  },
+  {
+    "bad_example": {
+      "text": "submission 需包含 id 与预测值。",
+      "why_ambiguous": "缺少列顺序、行数约束、类型约束。"
+    },
+    "good_example": {
+      "text": "submission.csv 列顺序固定为 [user_id,item_id,score]；行数=user_count*10；score 为 float，禁止 NaN/Inf。",
+      "why_clear": "文件契约可直接执行校验。"
+    }
+  }
+]

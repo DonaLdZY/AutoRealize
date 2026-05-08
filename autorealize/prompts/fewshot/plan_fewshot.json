@@ -1,0 +1,29 @@
+[
+  {
+    "task_type": "time_series_regression",
+    "objectives": [
+      "预测下个月销售额"
+    ],
+    "phases": [
+      {
+        "phase_id": "P1",
+        "title": "数据认知",
+        "objective": "识别字段含义与文件关联",
+        "inputs": [
+          "raw files"
+        ],
+        "outputs": [
+          "data_description"
+        ],
+        "substeps": [
+          "表格统计",
+          "文档摘要",
+          "跨文件关系发现"
+        ]
+      }
+    ],
+    "evaluation_metric": "RMSE",
+    "evaluation_formula": "RMSE = sqrt(mean((y_pred - y_true)^2))",
+    "submission_spec": "sample_submission.csv: [id, target]"
+  }
+]
