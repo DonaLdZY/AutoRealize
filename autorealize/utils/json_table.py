@@ -8,7 +8,7 @@ import pandas as pd
 
 
 def load_json_file(path: Path) -> Any:
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     return json.loads(text)
 
 

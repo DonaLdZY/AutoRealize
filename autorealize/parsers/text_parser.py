@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -14,13 +14,20 @@ class TextParser(BaseParser):
 
     def parse(self, path: Path) -> ParsedFile:
         text = ""
+        encoding_used = ""
         for enc in self.encodings:
             try:
                 text = path.read_text(encoding=enc)
+                encoding_used = enc
                 break
             except UnicodeDecodeError:
                 continue
         if not text:
-            text = "文件可读性较差或为空。"
-        summary = text[:3000]
-        return ParsedFile(path=path, kind=self.kind, text_summary=summary, metadata={"chars": len(text)})
+            text = "文件为空，或无法按候选编码可靠读取。"
+        summary = text[:24000]
+        return ParsedFile(
+            path=path,
+            kind=self.kind,
+            text_summary=summary,
+            metadata={"chars": len(text), "encoding": encoding_used},
+        )

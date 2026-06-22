@@ -1,86 +1,51 @@
-[
+﻿[
   {
     "input": {
-      "task_hint": "预测下个月销售额",
+      "task_hint": "predict a future numeric value for each entity and timestamp",
       "signals": {
         "has_time_col": true,
-        "has_store_col": true,
-        "label_col": "fmoney"
+        "has_entity_col": true,
+        "label_col": "target_value"
       }
     },
     "output": {
       "task_type": "time_series_regression",
-      "confidence": 0.95,
-      "reasoning": "目标是未来时间窗口数值预测且存在时间键与实体键。",
+      "confidence": 0.9,
+      "reasoning": "The task asks for numeric prediction over time and the data contains both entity/time keys and an observed target column.",
       "primary_metric": "RMSE",
-      "metric_formula": "RMSE = sqrt(mean((y_pred - y_true)^2))",
-      "submission_schema_hint": ["sstoreno", "dtdate", "fmoney"]
+      "metric_formula": "RMSE = sqrt(mean((y_pred - y_true)^2))"
     }
   },
   {
     "input": {
-      "task_hint": "给每个乘客预测是否幸存",
+      "task_hint": "predict a binary outcome for each record",
       "signals": {
-        "label_col": "Survived",
+        "label_col": "target",
         "label_unique": 2
       }
     },
     "output": {
       "task_type": "binary_classification",
-      "confidence": 0.97,
-      "reasoning": "标签为二值分类变量。",
+      "confidence": 0.9,
+      "reasoning": "The supervised label has two observed classes and the task asks for a per-record outcome.",
       "primary_metric": "Accuracy",
-      "metric_formula": "Accuracy = (TP + TN) / (TP + TN + FP + FN)",
-      "submission_schema_hint": ["PassengerId", "Survived"]
+      "metric_formula": "Accuracy = (TP + TN) / (TP + TN + FP + FN)"
     }
   },
   {
     "input": {
-      "task_hint": "为每个用户推荐Top10商品",
+      "task_hint": "choose feasible assignments under capacity and compatibility constraints",
       "signals": {
-        "has_user_item_interactions": true
-      }
-    },
-    "output": {
-      "task_type": "recommendation_ranking",
-      "confidence": 0.93,
-      "reasoning": "目标是排序推荐而非单点回归/分类。",
-      "primary_metric": "NDCG@10",
-      "metric_formula": "NDCG@10 = mean(DCG@10 / IDCG@10)",
-      "submission_schema_hint": ["user_id", "item_id", "score"]
-    }
-  },
-  {
-    "input": {
-      "task_hint": "构建订单与车辆匹配系统，降低配送总成本",
-      "signals": {
-        "has_route_constraints": true,
+        "has_decision_units": true,
         "has_capacity_constraints": true
       }
     },
     "output": {
       "task_type": "optimization",
-      "confidence": 0.94,
-      "reasoning": "目标是受约束的组合决策优化。",
-      "primary_metric": "AvgTotalCost",
-      "metric_formula": "AvgTotalCost = mean(transport_cost + penalty_unassigned + overtime_cost)",
-      "submission_schema_hint": ["order_id", "vehicle_id", "dispatch_time"]
-    }
-  },
-  {
-    "input": {
-      "task_hint": "训练智能体在仿真环境中最大化长期收益",
-      "signals": {
-        "has_state_action_reward": true
-      }
-    },
-    "output": {
-      "task_type": "reinforcement_learning",
-      "confidence": 0.96,
-      "reasoning": "含状态动作奖励与策略优化表述。",
-      "primary_metric": "EpisodeReturn",
-      "metric_formula": "EpisodeReturn = sum_t r_t",
-      "submission_schema_hint": ["episode_id", "total_reward"]
+      "confidence": 0.9,
+      "reasoning": "The output is a constrained decision/assignment rather than a single supervised label prediction.",
+      "primary_metric": "ObjectiveValue",
+      "metric_formula": "ObjectiveValue = task-defined reward_or_cost_function(solution)"
     }
   }
 ]

@@ -1,195 +1,214 @@
 # AutoRealize
 
-AutoRealize 是一个面向真实工业数据场景的上游系统：输入“原始数据目录 + 简短任务描述”，输出可直接交给 ML-Master / AutoML 系统消费的标准化产物（`description.md`、`sample_submission.csv`、清洗后数据、过程报告）。
+AutoRealize is the upstream task-realization component for AutoDecision. It converts a raw data directory plus an optional natural-language requirement into an AutoML-ready task package:
 
-它重点解决三件事：
+- `description.md`
+- `sample_submission.csv`
+- process reports and telemetry under `realize_report/`
 
-1. 数据认知：识别每个文件/字段的作用与风险。
-2. 任务定义：产出无歧义的 Kaggle 风格任务说明。
-3. 数据清洗：在可回滚、可检查的流程下做最小必要清洗。
+AutoRealize now contains two core stages:
 
-## 1. 核心能力
+1. Data cognition: inspect the directory tree, read files, profile tabular data, understand documents/images/archives/JSON, and discover cross-file relations.
+2. Task definition: synthesize a Kaggle-style task description and submission format from the requirement and data cognition output.
 
-- 分层智能体流程：`Orchestrator`（编排）→ `Architect`（方案/约束）→ `Ground Agents`（执行）。
-- 自动模式配重调度：按数据与任务信号决定 P1/P2/P3 是否执行。
-- 多格式解析（注册表模式）：`csv/xlsx/xls/json/txt/md/docx/pdf/toml/图片/压缩包`。
-- 压缩包能力：支持 `zip/tar/tar.gz/rar(环境支持时)` 自动展开。
-- JSON 兼容：可表格化时走表格分析；不可表格化时输出嵌套结构认知。
-- 视觉认知：可调用 VLLM 对图片样本做语义摘要（目录级和文件级）。
-- 强约束任务书生成：
-  - 检查评估协议唯一性与无歧义性；
-  - 检查文档引用文件必须真实存在（防幻觉文件名）。
-- 清洗安全机制：
-  - 渐进式执行（小样本到全量）；
-  - 快照与回滚；
-  - 契约检查 + 约束引擎 + checker 校验。
-- 高可观测性：终端实时事件 + `realize_report/event_stream.jsonl` 结构化事件流（前端可直接消费）。
+## Capabilities
 
-## 2. 安装
+- Two-stage workflow: `DataCognitionModule` and `TaskDefinitionModule`.
+- Parser registry for CSV, XLSX, JSON, TXT/MD, DOCX, PDF, TOML/YAML, images, and archives.
+- Parallel data cognition for file reading and table profiling.
+- Filename-aware reasoning for files such as `train`, `test`, `sampleSubmission`, `readme`, and requirement documents.
+- JSON handling for both tabular JSON and nested/config-like JSON.
+- Compact image-directory cognition with optional VLLM image summaries.
+- Constraint memory extracted from documents, fields, metrics, time clues, and business rules.
+- Kaggle-style `description.md` with task goal, data inventory, field descriptions, metric, validation protocol, submission format, constraints, and risks.
+- `sample_submission.csv` generation or reuse, with format validation.
+- Frontend-friendly observability through terminal logs, `event_stream.jsonl`, `current_state.json`, and `frontend_manifest.json`.
 
-### 2.1 环境要求
-
-- Python 3.10+（建议 3.11+）
-- Windows / macOS / Linux
-
-### 2.2 安装依赖
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2.3 配置 API Key
+Python 3.10+ is recommended. Windows, macOS, and Linux are supported.
 
-DeepSeek（主 LLM）：
+## API Key
+
+The text LLM uses a DeepSeek/OpenAI-compatible endpoint by default.
+
+Windows PowerShell:
+
+```powershell
+$env:DEEPSEEK_API_KEY="sk-xxxx"
+```
+
+Linux/macOS:
 
 ```bash
-# Windows PowerShell
-$env:DEEPSEEK_API_KEY="sk-xxxx"
-
-# Linux/macOS
 export DEEPSEEK_API_KEY="sk-xxxx"
 ```
 
-默认模型配置见 `autorealize/config.py`：
+Default text model settings:
 
 - `base_url = "https://api.deepseek.com"`
 - `model_name = "deepseek-v4-pro"`
 
-## 3. 快速开始
+Vision model settings are in `VLLMConfig`.
 
-### 3.1 基本运行
+## Quick Start
 
-```bash
-python -m autorealize.cli \
-  --input-root "path to data root" \
-  --output-root "runs" \
-  --task "预测下个月销量" \
-  --run-name "task name"
+```powershell
+python -m autorealize.cli `
+  --input-root "Sample/Sample1/raw2" `
+  --output-root "runs" `
+  --task "forecast next month sales" `
+  --run-name "run_001_sales_demo"
 ```
 
-### 3.2 常用命令
+LLM configuration and network access are required. AutoRealize fails fast when the LLM API key or endpoint is unavailable.
 
-关闭清洗（只做认知+任务定义）：
+Generate a demo `predict_split` when no independent prediction set exists:
 
-```bash
-python -m autorealize.cli \
-  --input-root "path to data root" \
-  --output-root "runs" \
-  --task "预测下个月销量" \
-  --run-name "task name"
-  --no-cleaning
-```
-
-离线模式（不调用 LLM API）：
-
-```bash
-python -m autorealize.cli \
-  --input-root "Sample/Sample1/raw2" \
-  --output-root "runs" \
-  --task "预测下个月销量" \
-  --run-name "run_003_offline" \
-  --offline
-```
-
-当数据无独立预测集时，自动生成 `predict_split`（默认关闭）：
-
-```bash
-python -m autorealize.cli \
-  --input-root "path to data root" \
-  --output-root "runs" \
-  --task "预测下个月销量" \
-  --run-name "task name"
+```powershell
+python -m autorealize.cli `
+  --input-root "Sample/Sample1/raw2" `
+  --output-root "runs" `
+  --task "forecast next month sales" `
+  --run-name "run_003_predict_split" `
   --auto-generate-predict-split
 ```
 
-## 4. CLI 参数
+## Configuration
 
-- `--input-root`：原始数据目录（必填）
-- `--output-root`：输出根目录（必填）
-- `--task`：用户任务描述（必填）
-- `--run-name`：本次运行名（必填，建议“编号+目的”）
-- `--no-cleaning`：关闭数据清洗阶段
-- `--offline`：离线模式，不调用 LLM API
-- `--auto-generate-predict-split`：缺少预测集时自动生成预测切分
-- `--parallel-cleaning`：显式开启文件级并行清洗（当前配置默认已开启）
+Print the default configuration:
 
-## 5. 输出目录（给 ML-Master / AutoML）
-
-运行后目录：`<output-root>/<run-name>/`
-
-关键产物：
-
-- `description.md`：面向下游建模系统的任务书（Kaggle 风格，含任务目标/评估协议/数据说明/提交格式）。
-- `sample_submission.csv`：提交样例（优先复用原始样例；无样例时由系统生成）。
-- `description_origin.md`：若输入里有原 `description.md`，会备份到这里。
-- 数据文件：清洗后的数据按原结构平铺到运行根目录（非放在最终 `data/` 子目录）。
-- `realize_report/`：过程文档与轨迹（供追踪、审计、前端可视化）。
-
-`realize_report/` 典型内容：
-
-- `data_description.md`：数据认知结果（文件级/字段级/关系级）
-- `cleaning_report.md`：清洗目标、动作与结果
-- `cleaning_scripts/`：执行过的清洗脚本归档
-- `trajectory_events.jsonl`：阶段轨迹
-- `event_stream.jsonl`：全量结构化事件流（推荐前端直接消费）
-- `llm_traces.jsonl`：LLM 调用轨迹
-- `run_summary.json`：运行摘要
-
-## 6. 关键行为说明
-
-### 6.1 `sample_submission.csv` 生成策略
-
-1. 优先复用输入中已有样例（兼容 `sample_submission / sampleSubmission / sample-submission` 等命名）。
-2. 若不存在，则结合任务语义、字段与表头生成。
-3. 生成时会尽量遵循“业务键 + 目标列（或多概率列）”契约。
-
-### 6.2 JSON 处理策略
-
-- JSON 不一定是表格：
-  - 可表格化：进入表格分析（列、统计、字段语义）。
-  - 不可表格化：保留为结构语义（根类型、路径摘要）。
-- 默认 `JSON 不参与清洗`（`enable_json_cleaning=False`），但仍参与认知与任务定义。
-
-### 6.3 评估协议“无歧义”保障
-
-系统会在生成 `description.md` 时执行质量门控，重点检查：
-
-- 是否明确主指标与公式；
-- 是否定义 `y_true` 来源；
-- 是否固定切分规则与随机种子；
-- 是否出现“推荐/可选/视情况”等歧义措辞；
-- 是否引用了不存在文件名。
-
-## 7. 并行与性能
-
-默认已开启：
-
-- P1 数据认知并行（逐文件）
-- 关系发现并行
-- 探查动作并行
-- P3 文件级并行清洗
-
-并行参数可在 `autorealize/config.py` 的 `ParallelConfig` 调整，例如：
-
-- `cognition_max_workers`
-- `relations_max_workers`
-- `probe_max_workers`
-- `cleaning_max_workers`
-
-## 8. 配置入口
-
-主配置文件：`autorealize/config.py`
-
-建议重点关注：
-
-- `RuntimeSwitches`：流程开关（认知/任务定义/清洗/契约/检查器）
-- `DataConfig`：数据处理策略（JSON 清洗、压缩包、图片目录压缩展示等）
-- `VLLMConfig`：视觉模型配置（base_url、model、key、失败降级）
-- `PromptConfig`：提示词与质量门配置
-- `ParallelConfig`：并行配置
-
-## 9. 测试
-
-```bash
-pytest -q tests
+```powershell
+python -m autorealize.cli --print-default-config
 ```
+
+Write the default configuration:
+
+```powershell
+python -m autorealize.cli --write-default-config config.json
+```
+
+Run with a configuration file:
+
+```powershell
+python -m autorealize.cli `
+  --input-root "path/to/data" `
+  --output-root "runs" `
+  --task "business requirement" `
+  --run-name "run_004_config" `
+  --config "config.json"
+```
+
+Common fields:
+
+- `switches.run_data_cognition`: run the data cognition stage.
+- `switches.run_task_definition`: run task definition and submission generation.
+- `data.auto_generate_predict_split`: generate a demo prediction split when no independent prediction set is detected.
+- `data.table_profile_sample_rows`: maximum rows used for table profiling.
+- `data.generated_sample_submission_max_rows`: maximum sample rows when a generated submission is only a format example.
+- `parallel.enable_parallel_cognition`: enable parallel data cognition.
+- `parallel.cognition_max_workers`: data cognition worker count.
+- `telemetry.enabled`: write event stream and current state snapshots.
+- `llm.enable_cache`: cache LLM responses.
+- `llm.request_timeout_seconds`: per-request LLM timeout.
+- `llm.max_concurrent_requests`: maximum concurrent LLM requests.
+- `knowledge.enabled`: write the local knowledge store.
+
+Each run writes `realize_report/config_schema.json`, which can be used by a frontend to build a configuration panel.
+
+## Output Layout
+
+Run directory: `<output-root>/<run-name>/`
+
+Root-level artifacts for downstream AutoML:
+
+- `description.md`: Kaggle-style task statement.
+- `sample_submission.csv`: sample submission file.
+- `description_origin.md`: backup when the input data already contains `description.md`.
+- Data files: copied input data, flattened into the run root while preserving relative structure as much as possible.
+
+Process reports under `realize_report/`:
+
+- `data_description.md`: global data cognition document.
+- `data_cognition_report.json`: structured cognition report.
+- `task_definition_report.json`: structured task-definition report.
+- `submission_report.json`: sample submission generation/reuse/validation report.
+- `file_cognition/`: per-file cognition JSON/Markdown artifacts.
+- `constraint_memory.json`: cross-stage constraint memory.
+- `knowledge_base.json`: knowledge-base summary.
+- `knowledge_store.jsonl`: local knowledge entries.
+- `retrieved_knowledge.json`: knowledge retrieved for task definition.
+- `rag_manifest.json`: manifest for future RAG/vector-store integration.
+- `trajectory_events.jsonl`: legacy trajectory events.
+- `trajectory.md`: trajectory index.
+- `llm_traces.jsonl`: LLM request/response traces.
+- `run_summary.json`: run summary.
+
+## Frontend Integration
+
+Recommended frontend entrypoints:
+
+- `realize_report/frontend_manifest.json`: module/artifact/event-source manifest.
+- `realize_report/event_stream.jsonl`: append-only structured event stream.
+- `realize_report/current_state.json`: current state snapshot for polling.
+- `realize_report/event_taxonomy.json`: event taxonomy and field descriptions.
+- `realize_report/final_config.json`: resolved config used in the run.
+- `realize_report/config_schema.json`: config schema and field descriptions.
+
+Suggested frontend flow:
+
+1. Load `frontend_manifest.json` to initialize module cards and artifact links.
+2. Poll `current_state.json` for overall status, active component, and recent events.
+3. Incrementally read `event_stream.jsonl` by `seq` for detailed timelines.
+4. Use `classification.layer/scope` to group events by workflow lane.
+5. Use `config_schema.json` to generate configuration forms.
+
+## Workflow
+
+### Data Cognition
+
+1. Copy the input directory into the run workspace.
+2. Write `directory_tree.txt`.
+3. Apply filename-pattern sampling to avoid reading every file in massive homogeneous groups.
+4. Read files in parallel:
+   - Tables: columns, preview rows, numeric/categorical/datetime stats, nulls, abnormal tokens.
+   - JSON: tabular expansion or nested-structure summary.
+   - Documents: context, requirements, constraints, and data notes.
+   - Images: metadata plus optional VLLM visual summary.
+   - Archives: extraction or structure logging.
+5. Write per-file cognition artifacts.
+6. Discover cross-file relations, field alignment, time clues, and metric candidates.
+7. Build `knowledge_base.json` and `knowledge_store.jsonl`.
+
+### Task Definition
+
+1. Read the natural-language requirement and data cognition output.
+2. Retrieve relevant fields, constraints, metrics, and document notes from the knowledge store.
+3. Classify the task type: regression, classification, time-series forecasting, recommendation, optimization, or decision modeling.
+4. Infer the prediction/decision unit, target field, train/predict boundary, and leakage constraints.
+5. Define a precise evaluation protocol: primary metric, formula, `y_true` source, split method, random seed, and reporting rules.
+6. Write `description.md`.
+7. Reuse or generate `sample_submission.csv` and validate the format.
+
+## Tests
+
+```powershell
+pytest -q
+```
+
+Current test coverage includes:
+
+- Output layout.
+- JSON table handling and content preservation.
+- Archive handling.
+- Image cognition.
+- Sample submission reuse/generation/validation.
+- Frontend event stream and manifest.
+
+## Current Positioning
+
+AutoRealize is a research demo and engineering skeleton. It prioritizes a runnable two-stage workflow, AutoML-ready artifacts, observable execution, configurable behavior, and a replaceable local knowledge store.

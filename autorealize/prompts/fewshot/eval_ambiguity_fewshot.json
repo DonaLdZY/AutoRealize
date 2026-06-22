@@ -5,8 +5,8 @@
       "why_ambiguous": "主指标不唯一，且切分参数缺失。"
     },
     "good_example": {
-      "text": "Primary Metric = RMSE；rolling-window: 训练窗口=180天，验证窗口=30天，步长=30天；random_state=20250430。",
-      "why_clear": "主指标唯一且参数完整可复现。"
+      "text": "Primary Metric = RMSE；rolling-window: 训练窗口=180天，验证窗口=30天，步长=30天；若评估代码包含随机过程，seed 使用外部配置或官方说明给出的值并写入实验记录。",
+      "why_clear": "主指标唯一且切分参数完整；随机性来源明确但不凭空指定具体种子。"
     }
   },
   {

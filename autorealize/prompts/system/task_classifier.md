@@ -28,4 +28,7 @@
 - reasoning: 一句话说明判断依据
 - primary_metric: 唯一主指标名称（例如 RMSE / LogLoss / NDCG@10 / AvgTotalCost / EpisodeReturn）
 - metric_formula: 可直接计算的公式字符串
-- submission_schema_hint: 建议提交列顺序（例如 ["id","target"] 或 ["user_id","item_id","score"]）
+
+注意：
+- 本智能体只负责任务分型与指标倾向，不允许决定 submission/sample_submission 的列名或列顺序。
+- 提交文件 schema 由后续专门的任务定义与 sample_submission schema 智能体结合完整数据认知、约束记忆和官方样例决定。

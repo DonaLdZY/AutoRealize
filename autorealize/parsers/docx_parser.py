@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -18,6 +18,6 @@ class DocxParser(BaseParser):
         return ParsedFile(
             path=path,
             kind=self.kind,
-            text_summary=text[:4000] if text else "空文档或仅包含图形元素。",
+            text_summary=text[:24000] if text else "空文档，或仅包含图片/形状等非文本元素。",
             metadata={"paragraph_count": len(paragraphs)},
         )

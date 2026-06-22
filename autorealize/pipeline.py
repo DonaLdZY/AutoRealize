@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
 import base64
+import builtins
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -13,33 +16,230 @@ import pandas as pd
 from openai import OpenAI
 
 from .agents.architect import Architect
-from .agents.ground import GroundExecutor
-from .agents.ground_agents import PredictSplitGeneratorGroundAgent
 from .agents.orchestrator import Orchestrator
 from .config import AutoRealizeConfig
 from .cognition import llm_cognition_for_file
 from .llm.client import LLMClient
-from .logging_utils import configure_event_sink, log_event
-from .models import FileRole, FileSummary, SubmissionScriptPlan, TaskClassification
+from .logging_utils import configure_event_sink, log_event, write_event_taxonomy
+from .knowledge.local_store import LocalKnowledgeStore
+from .models import ConstraintMemory, FileRole, FileSummary, SubmissionCheckVerdict, SubmissionScriptPlan, TaskClassification
 from .models import AmbiguityReview
 from .parsers import build_registry
+from .prompt_cache import stable_dynamic_prompt
+from .profiling.csv_utils import read_csv_auto
 from .profiling.relations import detect_relations
-from .profiling.stats import profile_dataframe, read_table
+from .profiling.stats import (
+    column_profile_to_dict,
+    excel_sheet_groups_from_profiles,
+    profile_dataframe,
+    profile_excel_sheets,
+    read_table,
+    table_probe_sample_rows,
+    table_sampling_metadata,
+)
 from .prompts.manager import PromptManager
 from .report_writer import (
+    SECTION_ALIASES,
+    append_constraint_memory_section,
     apply_eval_fixes,
     build_description_markdown,
     coverage_defects,
     description_quality_check,
     eval_ambiguity_defects,
-    write_cleaning_report,
     write_data_description,
 )
 from .trajectory import TrajectoryLogger
+from .modules.data_cognition import DataCognitionModule
+from .modules.task_definition import TaskDefinitionModule
+from .modules.types import DataCognitionResult, RuntimeServices, TaskDefinitionResult
 from .utils.archives import archive_stem, extract_archive, is_archive_file
 from .utils.filesystem import rel, safe_copytree, walk_dirs, walk_files
 
 logger = logging.getLogger(__name__)
+NETWORK_RETRY_MAX_ATTEMPTS = 5
+NETWORK_RETRY_MAX_SLEEP_SECONDS = 30.0
+
+
+def _is_retryable_network_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    try:
+        if int(status_code) in {429, 500, 502, 503, 504}:
+            return True
+    except Exception:
+        pass
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    if any(
+        key in name
+        for key in [
+            "timeout",
+            "connection",
+            "ratelimit",
+            "internalserver",
+            "apierror",
+            "apiconnection",
+            "badgateway",
+            "serviceunavailable",
+            "gateway",
+            "httpstatus",
+        ]
+    ):
+        return True
+    return any(
+        key in msg
+        for key in [
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "10061",
+            "actively refused",
+            "积极拒绝",
+            "temporary failure",
+            "temporarily unavailable",
+            "bad gateway",
+            "502",
+            "503",
+            "504",
+            "rate limit",
+            "too many requests",
+            "getaddrinfo",
+            "11001",
+            "name resolution",
+            "name or service not known",
+            "server disconnected",
+            "remote protocol error",
+        ]
+    )
+
+
+def _openai_create_with_network_retry(client: OpenAI, *, label: str, **kwargs):
+    last_exc: Exception | None = None
+    for attempt in range(1, NETWORK_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            retryable = _is_retryable_network_error(exc)
+            logger.warning(
+                "%s request failed, retryable=%s, attempt=%s/%s: %s",
+                label,
+                retryable,
+                attempt,
+                NETWORK_RETRY_MAX_ATTEMPTS,
+                exc,
+            )
+            if (not retryable) or attempt >= NETWORK_RETRY_MAX_ATTEMPTS:
+                raise
+            time.sleep(min(NETWORK_RETRY_MAX_SLEEP_SECONDS, 5.0 * attempt))
+    if last_exc is not None:
+        raise last_exc
+
+
+def _json_safe(value):
+    """Convert pandas/numpy-ish values into JSON-safe Python objects."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+    if isinstance(value, pd.Timedelta):
+        return None if pd.isna(value) else str(value)
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _json_dumps_safe(value, **kwargs) -> str:
+    return json.dumps(_json_safe(value), **kwargs)
+
+
+def _extract_constraint_memory(
+    *,
+    llm_client: LLMClient,
+    prompt_mgr: PromptManager,
+    file_summaries: list[FileSummary],
+    task_hint: str,
+) -> dict:
+    """抽取跨阶段复用的关键约束记忆。"""
+    # 规则先验：先从字段和摘要里抓明显约束线索。
+    hints: list[dict] = []
+    keyword_groups = {
+        "运价/费率约束": ["运价", "费率", "单价", "成本", "合同", "price", "rate", "cost"],
+        "容量约束": ["体积", "重量", "装载", "容量", "载重", "volume", "weight", "capacity"],
+        "时序/日分配约束": ["每日", "日期", "时间", "day", "date", "time"],
+        "地址/区间约束": ["发货", "收货", "地址", "起点", "终点", "区间", "origin", "destination"],
+    }
+    for fs in file_summaries:
+        text = f"{fs.path} {fs.summary} {' '.join(fs.columns[:80])}".lower()
+        for cname, kws in keyword_groups.items():
+            if any(k.lower() in text for k in kws):
+                hints.append(
+                    {
+                        "name": cname,
+                        "description": f"从 `{fs.path}` 检测到与“{cname}”相关信息。",
+                        "evidence": [fs.path, fs.summary[:160]],
+                        "related_fields": [c for c in fs.columns if any(k.lower() in str(c).lower() for k in kws)][:12],
+                        "priority": "high" if "约束" in cname or "容量" in cname else "medium",
+                    }
+                )
+
+    dedup: dict[str, dict] = {}
+    for it in hints:
+        n = it.get("name", "")
+        if n not in dedup:
+            dedup[n] = it
+        else:
+            dedup[n]["evidence"] = list(dict.fromkeys((dedup[n].get("evidence", []) + it.get("evidence", []))))[:6]
+            dedup[n]["related_fields"] = list(
+                dict.fromkeys((dedup[n].get("related_fields", []) + it.get("related_fields", [])))
+            )[:20]
+    rule_items = list(dedup.values())[:20]
+
+    system = (
+        "你是约束抽取器。请仅输出 JSON，结构必须满足给定 schema。"
+        "你的任务是从文件摘要与字段中提取对任务有决定作用的业务约束、数据约束、评估约束。"
+    )
+    stable, dynamic = stable_dynamic_prompt(
+        stable={
+            "task_hint": task_hint,
+            "file_summaries": [fs.model_dump() for fs in file_summaries][:80],
+        },
+        dynamic={"instruction": "提炼可执行约束，不要泛泛而谈；每条约束给证据与相关字段。"},
+        stable_title="Stable constraint extraction context",
+        dynamic_title="Dynamic constraint extraction request",
+        stable_limit=12000,
+    )
+    mem = llm_client.ask_structured(
+        model_cls=ConstraintMemory,
+        system_prompt=system,
+        user_prompt=dynamic,
+        prompt_name="constraint_memory_extractor",
+        static_context_prompt=stable,
+        dynamic_user_prompt=dynamic,
+    )
+    out = mem.model_dump()
+    # Rule hints may enrich the LLM result, but they are never a replacement for LLM extraction.
+    if rule_items:
+        exist = {str(x.get("name", "")) for x in out.get("items", [])}
+        for it in rule_items:
+            if it.get("name") not in exist:
+                out.setdefault("items", []).append(it)
+    return out
 
 
 class AutoRealizePipeline:
@@ -53,7 +253,8 @@ class AutoRealizePipeline:
         task_hint: str,
         run_name: str,
     ) -> Path:
-        log_event(logger, "pipeline", "RUN_STARTED", run_name=run_name, input_root=str(input_root))
+        run_started_at = time.perf_counter()
+        # RUN_STARTED 只保留一条（包含 output_root），避免终端重复刷屏。
         run_dir = output_root / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         data_out = run_dir / "data"
@@ -61,7 +262,25 @@ class AutoRealizePipeline:
         source_file_set = {rel(p, data_out) for p in walk_files(data_out)}
         report_dir = run_dir / "realize_report"
         report_dir.mkdir(parents=True, exist_ok=True)
-        configure_event_sink(report_dir / "event_stream.jsonl")
+        configure_event_sink(
+            report_dir / self.config.telemetry.event_stream_filename,
+            state_path=report_dir / self.config.telemetry.current_state_filename,
+            run_id=run_name,
+            enabled=self.config.telemetry.enabled,
+            recent_limit=self.config.telemetry.recent_events_limit,
+        )
+        log_event(logger, "pipeline", "RUN_STARTED", run_name=run_name, input_root=str(input_root), output_root=str(run_dir))
+        if self.config.telemetry.write_config_snapshot:
+            (report_dir / "final_config.json").write_text(
+                _json_dumps_safe(self.config.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if self.config.telemetry.write_config_schema:
+            (report_dir / "config_schema.json").write_text(
+                _json_dumps_safe(self.config.schema_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        write_event_taxonomy(report_dir / "event_taxonomy.json")
         log_event(logger, "pipeline", "WORKSPACE_COPIED", workspace=str(data_out))
         self._expand_archives(data_out, report_dir)
         _preserve_original_description(data_out, run_dir)
@@ -71,338 +290,94 @@ class AutoRealizePipeline:
         traj.log("bootstrap", "start", {"input_root": str(input_root), "run_name": run_name})
         registry = build_registry(self.config)
 
-        llm_client = None
-        try:
-            llm_client = LLMClient(self.config, report_dir)
-            traj.log("bootstrap", "llm", {"enabled": True, "model": self.config.llm.model_name})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("LLM 鍒濆鍖栧け璐ワ紝杩涘叆绂荤嚎鍏滃簳妯″紡: %s", exc)
-            traj.log("bootstrap", "llm", {"enabled": False, "error": str(exc)})
-        log_event(logger, "llm", "CLIENT_READY", enabled=bool(llm_client), model=self.config.llm.model_name)
+        llm_client = LLMClient(self.config, report_dir)
+        llm_client.health_check()
+        traj.log("bootstrap", "llm", {"enabled": True, "model": self.config.llm.model_name})
+        log_event(logger, "llm", "CLIENT_READY", enabled=True, model=self.config.llm.model_name)
 
         prompt_mgr = PromptManager(self.config)
-        orchestrator = Orchestrator(self.config)
-        architect = Architect(self.config, llm_client, prompt_mgr)
-        log_event(logger, "agent.orchestrator", "CREATED", mode=("auto" if self.config.switches.auto_mode else "interactive"))
-        log_event(logger, "agent.orchestrator", "ACTIVATED")
-        inventory = _collect_inventory(data_out)
-        decision = orchestrator.decide(task_hint=task_hint, data_root=data_out, inventory=inventory)
-        log_event(
-            logger,
-            "agent.orchestrator",
-            "COMPLETED",
-            run_data_cognition=decision.run_data_cognition,
-            run_task_definition=decision.run_task_definition,
-            run_data_cleaning=decision.run_data_cleaning,
+        knowledge_store = None
+        if self.config.knowledge.enabled:
+            knowledge_store = LocalKnowledgeStore(
+                report_dir / self.config.knowledge.store_filename,
+                max_entry_chars=self.config.knowledge.max_entry_chars,
+                boost_structured=self.config.knowledge.boost_structured_knowledge,
+            )
+            log_event(logger, "knowledge.local_store", "CREATED", file=self.config.knowledge.store_filename)
+        services = RuntimeServices(
+            llm_client=llm_client,
+            prompt_mgr=prompt_mgr,
+            registry=registry,
+            trajectory=traj,
+            knowledge_store=knowledge_store,
         )
-        logger.info(
-            "[编排] 决策: data_cognition=%s | task_definition=%s | data_cleaning=%s | mode=%s | rationale=%s",
-            decision.run_data_cognition,
-            decision.run_task_definition,
-            decision.run_data_cleaning,
-            decision.mode,
-            decision.rationale,
-        )
-        for phase in decision.phase_plans:
-            logger.info(
-                "[编排] 阶段=%s(%s) | enabled=%s | score=%.4f | weight=%.2f | depends_on=%s | reason=%s",
-                phase.phase_id,
-                phase.title,
-                phase.enabled,
-                phase.score,
-                phase.weight,
-                ",".join(phase.depends_on) if phase.depends_on else "-",
-                phase.reason,
-            )
-        traj.log("orchestrator", "inventory", inventory)
-        traj.log("orchestrator", "decision", decision.to_dict())
+        log_event(logger, "workflow", "CREATED", design="spec_demo_two_modules")
+        log_event(logger, "workflow", "ACTIVATED")
 
-        # Stage 1: 鏁版嵁璁ょ煡
-        file_summaries: list[FileSummary] = []
-        table_columns: dict[str, list[str]] = {}
-        original_requirement_texts: list[str] = []
+        cognition_result = DataCognitionResult()
+        task_result = TaskDefinitionResult()
 
-        if decision.run_data_cognition:
-            log_event(logger, "stage.P1", "ACTIVATED")
-            selected_files, compact_image_dirs = _select_cognition_files(data_out, self.config)
-            log_event(logger, "stage.P1", "FILES_SELECTED", count=len(selected_files), compact_image_dirs=len(compact_image_dirs))
-            if self.config.parallel.enable_parallel_cognition and len(selected_files) > 1:
-                workers = max(1, int(self.config.parallel.cognition_max_workers))
-                log_event(logger, "stage.P1.parallel", "ACTIVATED", workers=workers, files=len(selected_files))
-                futures = []
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for file in selected_files:
-                        futures.append(
-                            ex.submit(
-                                _cognize_one_file,
-                                file=file,
-                                data_root=data_out,
-                                registry=registry,
-                                config=self.config,
-                                llm_client=llm_client,
-                                prompt_mgr=prompt_mgr,
-                                task_hint=task_hint,
-                            )
-                        )
-                    for fut in as_completed(futures):
-                        res = fut.result()
-                        file_summaries.append(res["fs"])
-                        if res["columns"]:
-                            table_columns[res["rpath"]] = res["columns"]
-                        if res["is_requirement"] and res["summary_text"]:
-                            original_requirement_texts.append(res["summary_text"])
-                log_event(logger, "stage.P1.parallel", "COMPLETED", files=len(selected_files))
-            else:
-                for file in selected_files:
-                    res = _cognize_one_file(
-                        file=file,
-                        data_root=data_out,
-                        registry=registry,
-                        config=self.config,
-                        llm_client=llm_client,
-                        prompt_mgr=prompt_mgr,
-                        task_hint=task_hint,
-                    )
-                    file_summaries.append(res["fs"])
-                    if res["columns"]:
-                        table_columns[res["rpath"]] = res["columns"]
-                    if res["is_requirement"] and res["summary_text"]:
-                        original_requirement_texts.append(res["summary_text"])
-            # 澶у浘鐗囩洰褰曞彧淇濈暀鏍锋湰鍥炬枃浠剁骇璁ょ煡锛屽苟琛ュ厖鐩綍绾х敤閫旀憳瑕?
-            for dir_rel, sample_files in compact_image_dirs.items():
-                log_event(logger, "agent.image_dir_summary", "ACTIVATED", dir=dir_rel, samples=len(sample_files))
-                vision_summary = _infer_image_dir_purpose(data_out, dir_rel, sample_files, self.config)
-                file_summaries.append(
-                    FileSummary(
-                        path=f"{dir_rel}/",
-                        role=FileRole.data_description,
-                        summary=vision_summary,
-                        columns=[],
-                        warnings=[],
-                    )
-                )
-                log_event(logger, "agent.image_dir_summary", "COMPLETED", dir=dir_rel)
-            rel_hints = detect_relations(
-                table_columns,
-                parallel=self.config.parallel.enable_parallel_relations,
-                max_workers=self.config.parallel.relations_max_workers,
-            )
-            rel_map: dict[str, list[str]] = {}
-            for h in rel_hints:
-                rel_map.setdefault(h.left_file, []).append(h.right_file)
-                rel_map.setdefault(h.right_file, []).append(h.left_file)
-            for fs in file_summaries:
-                fs.related_files = rel_map.get(fs.path, [])[:8]
+        if self.config.switches.run_data_cognition:
+            cognition_module = DataCognitionModule(self.config, services, report_dir)
+            cognition_result = cognition_module.run(data_out, task_hint)
+        else:
+            log_event(logger, "module.data_cognition", "SKIPPED", reason="switch_disabled")
 
-            dir_summaries = _summarize_dirs(data_out, file_summaries)
-            log_event(logger, "stage.P1", "GENERATING_FILE", file="realize_report/data_description.md")
-            write_data_description(report_dir / "data_description.md", file_summaries, dir_summaries, rel_hints)
-            log_event(logger, "stage.P1", "GENERATED_FILE", file="realize_report/data_description.md")
-            log_event(logger, "stage.P1", "COMPLETED", files=len(file_summaries), relations=len(rel_hints))
-            traj.log("data_cognition", "done", {"files": len(file_summaries), "relations": len(rel_hints)})
+        if self.config.switches.run_task_definition:
+            task_module = TaskDefinitionModule(self.config, services, run_dir, report_dir)
+            task_result = task_module.run(data_out, task_hint, cognition_result)
+        else:
+            log_event(logger, "module.task_definition", "SKIPPED", reason="switch_disabled")
 
-        # Stage 2: 浠诲姟瀹氫箟
-        plan = None
-        if decision.run_task_definition:
-            log_event(logger, "agent.architect", "CREATED")
-            log_event(logger, "stage.P2", "ACTIVATED")
-            data_digest = (report_dir / "data_description.md").read_text(encoding="utf-8")[:12000]
-            original_text = "\n\n".join(original_requirement_texts) if original_requirement_texts else task_hint
-            log_event(logger, "agent.architect", "ACTIVATED", task="build_plan")
-            plan = architect.build_plan(task_hint=task_hint, cognition_digest=data_digest)
-            log_event(logger, "agent.architect", "COMPLETED", task="build_plan")
-            c1 = architect.critique_plan(plan)
-            c2 = architect.critique_expansion(plan)
-            log_event(logger, "stage.P2", "PLAN_CRITIQUE_COMPLETED", plan_severity=c1.severity.value, expansion_severity=c2.severity.value)
-            traj.log(
-                "task_definition",
-                "critique",
-                {"plan_severity": c1.severity.value, "expansion_severity": c2.severity.value, "issues": c1.issues + c2.issues},
-            )
-            downstream_context = _infer_downstream_context(data_out, file_summaries, task_hint, self.config)
-            if self.config.data.auto_generate_predict_split:
-                _maybe_generate_predict_split(data_out, downstream_context, self.config)
-                # 生成后重新推断，确保上下文与目录一致。
-                downstream_context = _infer_downstream_context(data_out, file_summaries, task_hint, self.config)
-            task_cls = _classify_task_type(
-                llm_client=llm_client,
-                prompt_mgr=prompt_mgr,
-                task_hint=task_hint,
-                data_digest=data_digest,
-                downstream_context=downstream_context,
-            )
-            if task_cls is not None:
-                log_event(
-                    logger,
-                    "agent.task_classifier",
-                    "COMPLETED",
-                    task_type=task_cls.task_type,
-                    confidence=f"{task_cls.confidence:.3f}",
-                    primary_metric=task_cls.primary_metric,
-                )
-                traj.log("task_definition", "task_classifier", task_cls.model_dump())
-                downstream_context["task_type_hint"] = task_cls.task_type
-                if task_cls.primary_metric:
-                    plan.evaluation_metric = task_cls.primary_metric
-                if task_cls.metric_formula:
-                    plan.evaluation_formula = task_cls.metric_formula
-                if task_cls.submission_schema_hint:
-                    downstream_context["submission_columns"] = [str(x) for x in task_cls.submission_schema_hint if str(x).strip()]
-            # P2 获取到更强的 train/test/label 证据后，回写修正 P1 文件摘要，避免前后矛盾。
-            _refine_file_summaries_by_downstream_context(file_summaries, downstream_context)
-            # 重新生成 data_description，确保交叉阅读（含 sample_submission）后的结论落盘。
-            rel_hints_refined = detect_relations(
-                table_columns,
-                parallel=self.config.parallel.enable_parallel_relations,
-                max_workers=self.config.parallel.relations_max_workers,
-            )
-            dir_summaries_refined = _summarize_dirs(data_out, file_summaries)
-            write_data_description(report_dir / "data_description.md", file_summaries, dir_summaries_refined, rel_hints_refined)
-            desc = build_description_markdown(
-                plan,
-                original_text,
-                _digest_data_inventory(file_summaries),
-                file_summaries=file_summaries,
-                downstream_context=downstream_context,
-            )
-            defects = description_quality_check(desc) + coverage_defects(desc, original_text)
-            missing_refs = _find_missing_file_references(desc, data_out)
-            defects.extend([f"引用了不存在文件: {x}" for x in missing_refs])
-            if defects and llm_client is not None:
-                for i in range(self.config.prompt.description_quality_max_retries):
-                    regenerated = _rewrite_mutable_sections_with_llm(
-                        llm_client=llm_client,
-                        prompt_mgr=prompt_mgr,
-                        base_desc=desc,
-                        defects=defects,
-                        downstream_context=downstream_context,
-                        prompt_name=f"description_retry_{i+1}",
-                    )
-                    if self.config.prompt.enforce_description_real_file_refs:
-                        missing_refs = _find_missing_file_references(regenerated, data_out)
-                        if missing_refs:
-                            new_defects = (
-                                description_quality_check(regenerated)
-                                + coverage_defects(regenerated, original_text)
-                                + [f"引用了不存在文件: {x}" for x in missing_refs]
-                            )
-                        else:
-                            new_defects = description_quality_check(regenerated) + coverage_defects(regenerated, original_text)
-                    else:
-                        regenerated = _enforce_existing_file_references(regenerated, data_out)
-                        new_defects = description_quality_check(regenerated) + coverage_defects(regenerated, original_text)
-                    if not new_defects:
-                        desc = regenerated
-                        defects = []
-                        break
-                    defects = new_defects
-            # 浣庝笂涓嬫枃鍙嶆€濇鏌ワ細浠呭熀浜庡綋鍓嶆枃妗ｏ紝寰幆鍒版棤姝т箟鎴栬揪鍒伴噸璇曚笂闄?
-            desc = _resolve_eval_ambiguity(
-                desc=desc,
-                downstream_context=downstream_context,
-                llm_client=llm_client,
-                prompt_mgr=prompt_mgr,
-                data_root=data_out,
-            )
-            log_event(logger, "stage.P2", "EVAL_CHECK_COMPLETED")
+        if knowledge_store is not None:
+            knowledge_store.flush()
+            if self.config.knowledge.write_rag_manifest:
+                knowledge_store.write_manifest(report_dir / "rag_manifest.json")
+            log_event(logger, "knowledge.local_store", "FLUSHED")
+        log_event(logger, "workflow", "COMPLETED")
 
-            # 浠呭鏈€缁堢増鏈仛涓€娆￠獙鏀讹紝閬垮厤娌跨敤鏃╂湡缂洪櫡
-            defects = description_quality_check(desc) + coverage_defects(desc, original_text) + eval_ambiguity_defects(desc)
-            missing_refs = _find_missing_file_references(desc, data_out)
-            defects.extend([f"引用了不存在文件: {x}" for x in missing_refs])
-            defects = list(dict.fromkeys(defects))
-            if self.config.prompt.enforce_description_real_file_refs and missing_refs:
-                raise RuntimeError(f"description 引用了不存在文件，且重试后仍失败: {missing_refs[:8]}")
-            log_event(logger, "stage.P2", "GENERATING_FILE", file="description.md")
-            (run_dir / "description.md").write_text(desc, encoding="utf-8")
-            log_event(logger, "stage.P2", "GENERATED_FILE", file="description.md", defects=len(defects))
-            traj.log("task_definition", "done", {"defects_after_gate": len(defects)})
-            log_event(logger, "stage.P2", "GENERATING_FILE", file="sample_submission.csv")
-            _generate_sample_submission(
-                data_out,
-                run_dir,
-                self.config,
-                downstream_context=downstream_context,
-                llm_client=llm_client,
-            )
-            log_event(logger, "stage.P2", "GENERATED_FILE", file="sample_submission.csv")
-            log_event(logger, "stage.P2", "COMPLETED")
-
-        # Stage 3: 鏁版嵁娓呮礂
-        cleaning_lines: list[str] = []
-        if decision.run_data_cleaning:
-            log_event(logger, "stage.P3", "ACTIVATED")
-            candidate_files: list[Path] = []
-            for file in walk_files(data_out):
-                rfile = rel(file, data_out)
-                if rfile not in source_file_set:
-                    continue
-                suffix = file.suffix.lower()
-                if suffix not in {".csv", ".xlsx", ".xls", ".json"}:
-                    continue
-                if suffix == ".json" and not self.config.data.enable_json_cleaning:
-                    log_event(logger, "stage.P3", "SKIP_FILE", file=rfile, reason="json_cleaning_disabled")
-                    continue
-                candidate_files.append(file)
-
-            def _clean_one(file: Path) -> list[str]:
-                rfile = rel(file, data_out)
-                local_lines: list[str] = []
-                try:
-                    ground = GroundExecutor(self.config, architect, data_out, report_dir)
-                    log_event(logger, "stage.P3", "CLEANING_FILE", file=rfile)
-                    result = ground.execute_for_table(file, task_hint)
-                    log_event(logger, "stage.P3", "CLEANING_RESULT", file=result.file, action=result.action, success=result.success)
-                    local_lines.append(
-                        f"- `{result.file}` | action={result.action} | success={result.success} | reason={result.reason}"
-                    )
-                    if result.monitor_alerts:
-                        local_lines.append(f"  monitor: {'; '.join(result.monitor_alerts)}")
-                    if result.contract_issues:
-                        local_lines.append(f"  contract: {'; '.join(result.contract_issues)}")
-                    if result.constraint_issues:
-                        local_lines.append(f"  constraints: {'; '.join(result.constraint_issues)}")
-                    if result.checker_reason:
-                        local_lines.append(f"  checker: {result.checker_reason}")
-                    if result.artifacts:
-                        local_lines.append(f"  artifacts: {'; '.join(result.artifacts)}")
-                    scripts_dir = report_dir / "cleaning_scripts"
-                    scripts_dir.mkdir(parents=True, exist_ok=True)
-                    script_file = scripts_dir / (result.file.replace("/", "__") + ".py")
-                    script_file.write_text(result.script, encoding="utf-8")
-                except Exception as exc:  # noqa: BLE001
-                    log_event(logger, "stage.P3", "CLEANING_FAILED", file=rfile, error=str(exc)[:180])
-                    local_lines.append(f"- `{rfile}` | success=False | error={exc}")
-                return local_lines
-
-            if self.config.parallel.enable_parallel_cleaning and len(candidate_files) > 1:
-                workers = max(1, int(self.config.parallel.cleaning_max_workers))
-                log_event(logger, "stage.P3.parallel", "ACTIVATED", workers=workers, files=len(candidate_files))
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = [ex.submit(_clean_one, f) for f in candidate_files]
-                    for fut in as_completed(futures):
-                        cleaning_lines.extend(fut.result())
-                log_event(logger, "stage.P3.parallel", "COMPLETED", files=len(candidate_files))
-            else:
-                for f in candidate_files:
-                    cleaning_lines.extend(_clean_one(f))
-            log_event(logger, "stage.P3", "GENERATING_FILE", file="realize_report/cleaning_report.md")
-            write_cleaning_report(report_dir / "cleaning_report.md", cleaning_lines)
-            log_event(logger, "stage.P3", "GENERATED_FILE", file="realize_report/cleaning_report.md")
-            log_event(logger, "stage.P3", "COMPLETED", tables=len(cleaning_lines))
-            traj.log("data_cleaning", "done", {"table_files": len(cleaning_lines)})
-
-        # 姹囨€荤储寮?
         traj.write_markdown_index()
         summary = {
+            "schema_version": "autorealize.run_summary.v1",
             "run_name": run_name,
             "input_root": str(input_root),
             "data_output_root": str(data_out),
+            "run_dir": str(run_dir),
             "task_hint": task_hint,
+            "duration_seconds_before_flatten": round(time.perf_counter() - run_started_at, 4),
+            "modules": {
+                "data_cognition": {
+                    "enabled": bool(self.config.switches.run_data_cognition),
+                    "files": len(cognition_result.file_summaries),
+                    "relations": len(cognition_result.relation_hints),
+                    "artifact": "data_description.md",
+                },
+                "task_definition": {
+                    "enabled": bool(self.config.switches.run_task_definition),
+                    "description": "description.md",
+                    "sample_submission": "sample_submission.csv" if task_result.sample_submission_path else None,
+                    "defects_after_gate": len(task_result.defects),
+                },
+            },
+            "telemetry": {
+                "event_stream": self.config.telemetry.event_stream_filename,
+                "current_state": self.config.telemetry.current_state_filename,
+                "event_taxonomy": "event_taxonomy.json",
+                "frontend_manifest": "frontend_manifest.json",
+                "final_config": "final_config.json",
+                "config_schema": "config_schema.json",
+            },
+            "knowledge": {
+                "enabled": bool(self.config.knowledge.enabled),
+                "store": self.config.knowledge.store_filename,
+                "rag_manifest": "rag_manifest.json" if self.config.knowledge.write_rag_manifest else None,
+            },
         }
-        (report_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        (report_dir / "run_summary.json").write_text(_json_dumps_safe(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         traj.log("finalize", "done", summary)
         self._flatten_data_to_root(run_dir, data_out, report_dir)
+        _write_frontend_manifest(run_dir, report_dir, run_name, input_root, task_hint, self.config)
+        _append_output_layout_to_description(run_dir, report_dir)
         log_event(logger, "pipeline", "RUN_COMPLETED", run_dir=str(run_dir))
         return run_dir
 
@@ -475,7 +450,7 @@ def _preserve_original_description(data_root: Path, run_dir: Path) -> None:
     candidates = [p for p in walk_files(data_root) if p.name.lower() == "description.md"]
     if not candidates:
         return
-    # ????????????
+    # 选择层级最浅、路径最短的原始 description.md 作为备份。
     candidates = sorted(candidates, key=lambda x: (len(x.parts), str(x)))
     src = candidates[0]
     target = run_dir / "description_origin.md"
@@ -484,15 +459,11 @@ def _preserve_original_description(data_root: Path, run_dir: Path) -> None:
 
 
 def _append_output_layout_to_description(run_dir: Path, report_dir: Path) -> None:
-    """在 description.md 末尾追加输出目录结构与文件职责说明。"""
-    desc_path = run_dir / "description.md"
-    if not desc_path.exists():
-        return
-
+    """将输出目录结构写入过程报告，不污染最终 description.md。"""
     lines: list[str] = [
+        "# 输出目录结构",
         "",
-        "## Output Layout",
-        "### Directory Tree",
+        "## 目录树",
         "```text",
     ]
 
@@ -508,21 +479,20 @@ def _append_output_layout_to_description(run_dir: Path, report_dir: Path) -> Non
     walk_tree(run_dir)
     lines.append("```")
     lines.append("")
-    lines.append("### File & Directory Roles")
+    lines.append("## 文件与目录职责")
 
     role_map = {
         "description.md": "面向 ML-Master/AutoML 的任务说明文档（Kaggle 风格）",
         "sample_submission.csv": "提交样例文件（优先复用原始样例）",
         "description_origin.md": "原始数据中自带的 description.md 备份",
-        "realize_report": "AutoRealize 过程报告目录（认知/清洗/轨迹/日志）",
+        "realize_report": "AutoRealize 过程报告目录（认知/任务定义/轨迹/日志）",
         "data_description.md": "原始数据认知文档",
-        "cleaning_report.md": "数据清洗报告（目标、动作、结果）",
         "trajectory_events.jsonl": "结构化运行事件轨迹",
         "trajectory.md": "运行轨迹索引",
         "llm_traces.jsonl": "LLM 请求与响应轨迹",
+        "llm_usage.jsonl": "每次 LLM/VLLM 调用的 token usage 账本",
+        "llm_usage_summary.json": "LLM/VLLM token usage 汇总与 provider cache 统计",
         "event_stream.jsonl": "全量结构化事件流（前端监控首选数据源）",
-        "cleaning_scripts": "清洗脚本留档",
-        "ground_artifacts": "Ground Agent 执行产物目录",
         "run_summary.json": "本次运行摘要",
     }
 
@@ -538,10 +508,100 @@ def _append_output_layout_to_description(run_dir: Path, report_dir: Path) -> Non
         seen.add(f.name)
         lines.append(f"- `{f.name}`: {role_map.get(f.name, '自动生成文件')}")
 
-    text = desc_path.read_text(encoding="utf-8")
-    if "## Output Layout" not in text:
-        text = text.rstrip() + "\n" + "\n".join(lines) + "\n"
-        desc_path.write_text(text, encoding="utf-8")
+    (report_dir / "output_layout.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _write_frontend_manifest(
+    run_dir: Path,
+    report_dir: Path,
+    run_name: str,
+    input_root: Path,
+    task_hint: str,
+    config: AutoRealizeConfig,
+) -> None:
+    """写出前端入口清单，集中暴露运行产物、事件源与可配置能力。"""
+    def exists_rel(path: str) -> dict:
+        p = run_dir / path
+        return {"path": path, "exists": p.exists(), "kind": "dir" if p.is_dir() else "file"}
+
+    report_files = [
+        "realize_report/event_stream.jsonl",
+        "realize_report/current_state.json",
+        "realize_report/event_taxonomy.json",
+        "realize_report/final_config.json",
+        "realize_report/config_schema.json",
+        "realize_report/run_summary.json",
+        "realize_report/trajectory.md",
+        "realize_report/trajectory_events.jsonl",
+        "realize_report/llm_traces.jsonl",
+        "realize_report/llm_usage.jsonl",
+        "realize_report/llm_usage_summary.json",
+        "realize_report/data_description.md",
+        "realize_report/data_cognition_report.json",
+        "realize_report/task_definition_report.json",
+        "realize_report/submission_report.json",
+        "realize_report/knowledge_base.json",
+        "realize_report/knowledge_store.jsonl",
+        "realize_report/retrieved_knowledge.json",
+        "realize_report/rag_manifest.json",
+        "realize_report/file_cognition",
+    ]
+    output_files = ["description.md", "sample_submission.csv", "description_origin.md"]
+    data_files = []
+    for p in sorted(walk_files(run_dir), key=lambda x: str(x).lower()):
+        if report_dir in p.parents:
+            continue
+        if p.name in {"description.md", "sample_submission.csv", "description_origin.md"}:
+            continue
+        data_files.append(str(p.relative_to(run_dir)).replace("\\", "/"))
+
+    manifest = {
+        "schema_version": "autorealize.frontend_manifest.v1",
+        "run_name": run_name,
+        "input_root": str(input_root),
+        "run_dir": str(run_dir),
+        "task_hint": task_hint,
+        "watch": {
+            "event_stream": "realize_report/event_stream.jsonl",
+            "current_state": "realize_report/current_state.json",
+            "event_taxonomy": "realize_report/event_taxonomy.json",
+        },
+        "modules": [
+            {
+                "id": "data_cognition",
+                "title": "数据认知",
+                "main_artifacts": ["realize_report/data_description.md", "realize_report/file_cognition", "realize_report/knowledge_base.json"],
+                "event_scopes": ["module.data_cognition", "stage.P1", "knowledge.local_store"],
+                "enabled": bool(config.switches.run_data_cognition),
+            },
+            {
+                "id": "task_definition",
+                "title": "任务定义",
+                "main_artifacts": ["description.md", "sample_submission.csv", "realize_report/retrieved_knowledge.json"],
+                "event_scopes": ["module.task_definition", "checker.sample_submission"],
+                "enabled": bool(config.switches.run_task_definition),
+            },
+        ],
+        "artifacts": {
+            "outputs": [exists_rel(x) for x in output_files],
+            "reports": [exists_rel(x) for x in report_files],
+            "data_files": data_files,
+        },
+        "config_entrypoints": {
+            "snapshot": "realize_report/final_config.json",
+            "schema": "realize_report/config_schema.json",
+            "cli_print_default": "python -m autorealize.cli --print-default-config",
+            "cli_write_default": "python -m autorealize.cli --write-default-config config.json",
+        },
+        "frontend_notes": [
+            "优先轮询 current_state.json 展示状态，按 seq 增量读取 event_stream.jsonl 追加细节。",
+            "模块卡片可用 modules[*].event_scopes 过滤事件。",
+            "点击文件产物时优先打开 artifacts 中 exists=true 的条目。",
+        ],
+    }
+    out = report_dir / "frontend_manifest.json"
+    out.write_text(_json_dumps_safe(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event(logger, "pipeline.frontend_manifest", "GENERATED_FILE", file="realize_report/frontend_manifest.json")
 
 def _collect_inventory(data_root: Path) -> dict:
     files = walk_files(data_root)
@@ -623,126 +683,576 @@ def _digest_data_inventory(file_summaries: list[FileSummary]) -> str:
 
 
 def _guess_column_semantics(columns: list[str], profiles: list[dict], task_hint: str) -> dict[str, str]:
-    hint = (task_hint or "").lower()
-    prof_map = {str(p.get("name", "")): p for p in profiles}
-    out: dict[str, str] = {}
-    for c in columns:
-        name = str(c)
-        lc = name.lower()
-        p = prof_map.get(name, {})
-        unique_count = int(p.get("unique_count") or 0)
-        null_ratio = float(p.get("null_ratio") or 0.0)
-
-        if "id" in lc or "编号" in name or "单号" in name:
-            out[name] = "主键/单据标识字段（用于去重、关联或提交索引）"
+    profile_by_name = {str(p.get("name", "")): p for p in profiles if str(p.get("name", "")).strip()}
+    semantics: dict[str, str] = {}
+    for col in columns:
+        name = str(col).strip()
+        if not name:
             continue
-        if any(k in lc for k in ["date", "time", "timestamp"]) or lc.startswith("dt") or any(k in name for k in ["日期", "时间"]):
-            out[name] = "时间字段（用于时间切分、滚动验证与时序特征）"
-            continue
-        if any(k in lc for k in ["store", "shop", "branch"]) or any(k in name for k in ["门店", "店号", "店铺", "仓"]):
-            out[name] = "业务实体字段（门店/仓/站点等），可作为分组键或主特征"
-            continue
-        if any(k in lc for k in ["goods", "sku", "item", "product"]) or any(k in name for k in ["商品", "货品", "品类"]):
-            out[name] = "商品维度字段（SKU/货品/品类等），可用于细粒度预测"
-            continue
-        if any(k in lc for k in ["money", "amount", "price", "sales", "revenue"]) or any(k in name for k in ["金额", "销售额", "单价", "毛利", "折扣"]):
-            if "predict" in hint or "预测" in task_hint:
-                out[name] = "业务数值字段（金额/销售相关），可能是目标值或关键解释变量"
-            else:
-                out[name] = "业务数值字段（金额/价格/收入）"
-            continue
-        if any(k in lc for k in ["qty", "quantity", "count", "num"]) or any(k in name for k in ["数量", "件数", "库存"]):
-            out[name] = "数量/计数字段（可用于需求强度与供给能力建模）"
-            continue
-        if any(k in lc for k in ["target", "label"]) or lc in {"y", "fmoney", "requester_received_pizza"}:
-            out[name] = "目标标签字段（训练可用，测试集通常缺失）"
-            continue
-        if p.get("datetime_stats"):
-            out[name] = "可解析为日期时间的字段（建议保留时间语义）"
-            continue
-        if p.get("numeric_stats"):
-            if unique_count <= 2 and null_ratio < 0.2:
-                out[name] = "二值/状态型数值字段（可能表示是否、开关或事件状态）"
-            else:
-                out[name] = "数值型特征字段（可用于建模）"
-            continue
-        if unique_count == 1:
-            out[name] = "常量字段（当前文件内取值单一，跨文件拼接时可能仍有作用）"
-            continue
-        if ("predict" in hint or "预测" in task_hint) and unique_count < 80:
-            out[name] = "离散业务属性字段（可做类别编码）"
+        lower = name.lower()
+        profile = profile_by_name.get(name, {})
+        logical = str(profile.get("logical_type", "") or profile.get("dtype", "")).lower()
+        parts: list[str] = []
+        if any(k in lower for k in ["id", "key", "code"]) or any(k in name for k in ["编号", "代码", "编码", "订单号", "单号"]):
+            parts.append("业务实体或关联键字段")
+        elif any(k in lower for k in ["target", "label", "class", "category", "y"]) or any(k in name for k in ["标签", "目标", "类别", "结果"]):
+            parts.append("可能的标签、目标或结果字段")
+        elif any(k in lower for k in ["date", "time", "dt"]) or any(k in name for k in ["日期", "时间", "时刻"]):
+            parts.append("时间字段")
+        elif any(k in lower for k in ["cost", "price", "fee", "amount", "rate", "score"]) or any(k in name for k in ["成本", "价格", "费用", "金额", "费率", "得分"]):
+            parts.append("金额、成本、价格或评分字段")
+        elif any(k in lower for k in ["qty", "count", "num", "volume", "weight"]) or any(k in name for k in ["数量", "件数", "体积", "重量", "容量"]):
+            parts.append("数量、容量或规模字段")
+        elif any(k in name for k in ["类型", "类别", "车型", "状态"]) or logical == "categorical":
+            parts.append("分类或枚举字段")
+        elif logical in {"integer", "float", "numeric_string", "mixed_numeric_text"}:
+            parts.append("数值型字段")
+        elif logical == "datetime":
+            parts.append("时间字段")
         else:
-            out[name] = "文本/类别字段（需结合业务文档确认语义）"
-    return out
+            parts.append("业务属性字段")
+
+        null_ratio = profile.get("null_ratio")
+        unique_count = profile.get("unique_count")
+        stats = profile.get("numeric_stats") if isinstance(profile.get("numeric_stats"), dict) else {}
+        datetime_stats = profile.get("datetime_stats") if isinstance(profile.get("datetime_stats"), dict) else {}
+        extras: list[str] = []
+        if unique_count is not None:
+            extras.append(f"去重值约 {unique_count} 个")
+        if null_ratio is not None:
+            try:
+                extras.append(f"缺失率 {float(null_ratio):.2%}")
+            except Exception:
+                pass
+        if stats:
+            extras.append(
+                "数值范围 "
+                + f"{stats.get('min')} 到 {stats.get('max')}"
+                + (f"，均值 {stats.get('mean'):.6g}" if isinstance(stats.get("mean"), (int, float)) else "")
+            )
+        if datetime_stats:
+            granularity = datetime_stats.get("granularity") or ""
+            extras.append(
+                f"时间范围 {datetime_stats.get('min')} 到 {datetime_stats.get('max')}"
+                + (f"，粒度 {granularity}" if granularity else "")
+            )
+        semantics[name] = "；".join([parts[0], *extras[:3]])
+    return semantics
+
+
+def _guess_semantic_meta(columns: list[str], profiles: list[dict], semantics: dict[str, str], *, source: str) -> dict[str, dict]:
+    return {
+        str(col): {
+            "source": source,
+            "confidence": "medium",
+            "confidence_score": 0.6,
+            "evidence": "deterministic_column_profile",
+        }
+        for col in columns
+        if str(col) in semantics
+    }
+
+
+def _fill_deterministic_file_memory(fs: FileSummary, parsed_kind: str) -> None:
+    """Populate human-readable cognition fields without calling an LLM."""
+    meta = fs.source_metadata or {}
+    facts: list[str] = []
+    risks: list[str] = []
+    related: list[str] = list(fs.related_files or [])
+    role = fs.role.value if hasattr(fs.role, "value") else str(fs.role)
+
+    shape = meta.get("shape")
+    if isinstance(shape, list) and len(shape) >= 2:
+        facts.append(f"结构化表规模约为 {shape[0]} 行、{shape[1]} 列。")
+    if meta.get("shape_estimated"):
+        risks.append("行数或 shape 由轻量方式估算，必要时应在建模代码中重新核对。")
+    dialect = meta.get("csv_dialect") if isinstance(meta.get("csv_dialect"), dict) else {}
+    if dialect:
+        if dialect.get("inferred"):
+            facts.append(
+                "CSV 需要非默认读取方式："
+                f"sep={dialect.get('sep')!r}"
+                + (f", engine={dialect.get('engine')!r}" if dialect.get("engine") else "")
+                + f"，原因={dialect.get('reason') or '自动探测'}。"
+            )
+        else:
+            facts.append("CSV 可按默认逗号分隔读取。")
+    sheets = meta.get("excel_sheets") if isinstance(meta.get("excel_sheets"), list) else []
+    sheet_names = meta.get("excel_sheet_names") if isinstance(meta.get("excel_sheet_names"), list) else []
+    if sheet_names:
+        facts.append(f"Excel 工作簿包含 {len(sheet_names)} 个 sheet：" + "、".join(f"`{x}`" for x in sheet_names[:12]) + (" 等。" if len(sheet_names) > 12 else "。"))
+        if len(sheet_names) > 1:
+            risks.append("多 sheet Excel 不能依赖 pandas 默认读取第一个 sheet，后续代码应显式指定 sheet_name。")
+    json_schema = meta.get("json_first_level_schema") if isinstance(meta.get("json_first_level_schema"), dict) else {}
+    if json_schema:
+        facts.append(
+            f"JSON 第一层样本数 {json_schema.get('sample_count')}，schema 相似度 {json_schema.get('schema_similarity')}。"
+        )
+    if fs.column_profiles:
+        high_null = []
+        keyish = []
+        for p in fs.column_profiles:
+            name = str(p.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                if float(p.get("null_ratio") or 0.0) >= 0.98:
+                    high_null.append(name)
+            except Exception:
+                pass
+            lower = name.lower()
+            if any(k in lower for k in ["id", "key", "code"]) or any(k in name for k in ["编号", "代码", "订单号", "单号"]):
+                keyish.append(name)
+        if keyish:
+            fs.key_entities = list(dict.fromkeys([*fs.key_entities, *keyish]))[:20]
+            facts.append("疑似主键/关联键字段：" + "、".join(f"`{x}`" for x in keyish[:12]) + "。")
+        if high_null:
+            risks.append("以下字段几乎全空：" + "、".join(f"`{x}`" for x in high_null[:12]) + "。")
+
+    if parsed_kind in {"document", "structured_document"}:
+        facts.append("该文件按说明文档或结构化文档读取，内容会作为任务定义和约束抽取的候选证据。")
+        if fs.path.lower().endswith("description.md"):
+            facts.append("该文件名为 description.md，在权威优先级中高于其他说明文档，仅低于用户输入。")
+
+    lines = [
+        f"文件角色判定为 `{role}`。",
+        str(fs.summary or "").strip(),
+    ]
+    if facts:
+        lines.append("关键事实：" + " ".join(facts[:8]))
+    if risks:
+        lines.append("风险与注意事项：" + " ".join(risks[:8]))
+    if sheets:
+        sheet_bits = []
+        for item in sheets[:8]:
+            if not isinstance(item, dict):
+                continue
+            cols = [str(x) for x in (item.get("columns") or [])[:8]]
+            shape_item = item.get("shape") or []
+            sheet_bits.append(
+                f"`{item.get('sheet_name')}` shape={shape_item} columns={cols}"
+            )
+        if sheet_bits:
+            lines.append("Sheet 概览：" + "；".join(sheet_bits))
+    fs.detailed_report = "\n".join([x for x in lines if x]).strip()
+    fs.extracted_knowledge = list(dict.fromkeys([*facts, *fs.extracted_knowledge]))[:40]
+    fs.warnings = list(dict.fromkeys([*fs.warnings, *risks]))[:40]
+    fs.related_files = related[:12]
+
+
+def _refine_semantics_by_relations(file_summaries: list[FileSummary], relation_hints: list) -> None:
+    by_path = {fs.path: fs for fs in file_summaries}
+    for rh in relation_hints:
+        lf = by_path.get(getattr(rh, "left_file", ""))
+        rf = by_path.get(getattr(rh, "right_file", ""))
+        if lf is None or rf is None:
+            continue
+        reason = str(getattr(rh, "short_evidence", "") or getattr(rh, "reason", ""))
+        pairs = []
+        if str(getattr(rh, "left_field", "") or "").strip() or str(getattr(rh, "right_field", "") or "").strip():
+            pairs = [(lf, str(getattr(rh, "left_field", "") or "")), (rf, str(getattr(rh, "right_field", "") or ""))]
+        else:
+            shared = [str(x) for x in (getattr(rh, "shared_columns", []) or [])]
+            pairs = [(fs, col_low) for col_low in shared for fs in [lf, rf]]
+        for fs, target_col in pairs:
+            for c in fs.columns:
+                if str(c).lower().replace(" ", "") != str(target_col).lower().replace(" ", ""):
+                    continue
+                cur = fs.column_semantics.get(c, "")
+                if fs.column_semantic_meta.get(c, {}).get("source") != "llm_field_description":
+                    continue
+                meta = fs.column_semantic_meta.get(c, {})
+                if "join" not in cur and "关联" not in cur:
+                    fs.column_semantics[c] = f"{cur}（跨表可关联字段）".strip()
+                prev = float(meta.get("confidence_score", 0.6))
+                boosted = min(0.95, prev + 0.08)
+                fs.column_semantic_meta[c] = {
+                    "confidence_score": round(boosted, 3),
+                    "confidence": "high" if boosted >= 0.8 else ("medium" if boosted >= 0.65 else "low"),
+                    "source": "cross_file_refine",
+                    "evidence": reason or "shared_column_relation",
+                }
 
 
 def _refine_file_summaries_by_downstream_context(file_summaries: list[FileSummary], downstream_context: dict) -> None:
-    """使用 P2 识别到的 train/test/label 语义回写 P1 摘要，修正早期误判。"""
+    """Use P2 train/test hints without overwriting LLM-authored data descriptions."""
     train_name = str(downstream_context.get("train_table", "") or "").strip()
     predict_name = str(downstream_context.get("predict_table", "") or "").strip()
     target_col = str(downstream_context.get("target_column", "") or "").strip()
-    id_col = str(downstream_context.get("id_column", "") or "").strip()
     submission_cols = [str(x) for x in downstream_context.get("submission_columns", []) if str(x).strip()]
-    if not target_col:
-        return
 
     for fs in file_summaries:
         name = Path(fs.path).name
         lower_name = name.lower()
 
-        # 强化 sample_submission 语义：它是格式规范，不是训练/预测数据。
         if "samplesubmission" in "".join(ch for ch in lower_name if ch.isalnum()) or "sample_submission" in lower_name:
             fs.role = FileRole.task_requirement
             cols_text = ", ".join(submission_cols) if submission_cols else "（列名未识别）"
-            fs.summary = f"官方提交样例文件，定义提交列格式：{cols_text}。"
-            if not fs.column_semantics and submission_cols:
-                fs.column_semantics = {c: "提交文件约束列" for c in submission_cols}
+            if not fs.summary:
+                fs.summary = f"提交样例/格式文件，列顺序为：{cols_text}。"
             continue
 
-        # 明确 train 任务语义
         if train_name and name == train_name:
             fs.role = FileRole.raw_data_table
-            fs.summary = f"训练数据表，包含目标标签 `{target_col}`，用于模型训练与验证。"
-            if fs.column_semantics and target_col in fs.column_semantics:
-                fs.column_semantics[target_col] = "目标标签字段（训练可用，预测阶段不可见）"
+            fs.source_metadata = {**(fs.source_metadata or {}), "downstream_role_hint": "train_table", "target_column_hint": target_col}
+            if target_col and target_col not in fs.summary:
+                fs.summary = (fs.summary.rstrip() + f" 下游任务将 `{target_col}` 识别为训练目标列。").strip()
             continue
 
-        # 明确 test 任务语义，覆盖“错误目标列猜测”
         if predict_name and name == predict_name:
             fs.role = FileRole.raw_data_table
-            fs.summary = (
-                f"预测数据表，不包含可用于训练的真实标签 `{target_col}`；"
-                f"需基于可用特征生成 `{target_col}` 预测结果并按样例提交。"
-            )
-            if fs.column_semantics and target_col in fs.column_semantics:
-                fs.column_semantics[target_col] = "提交目标字段（预测输出列，不是测试真值标签）"
+            fs.source_metadata = {**(fs.source_metadata or {}), "downstream_role_hint": "predict_table", "target_column_hint": target_col}
+            if target_col and target_col not in fs.summary:
+                fs.summary = (
+                    fs.summary.rstrip()
+                    + f" 预测阶段使用该表作为待预测输入；目标列 `{target_col}` 来自训练数据或提交样例，不应作为预测输入特征。"
+                ).strip()
             continue
 
-        # 其余同名衍生文件（如 extracted）也做一致性修正
         if train_name and train_name in fs.path:
             fs.role = FileRole.raw_data_table
-            fs.summary = f"训练数据衍生表，语义同 `{train_name}`，目标标签为 `{target_col}`。"
+            fs.source_metadata = {**(fs.source_metadata or {}), "downstream_role_hint": "train_table_derived", "target_column_hint": target_col}
+            if target_col and target_col not in fs.summary:
+                fs.summary = (fs.summary.rstrip() + f" 下游任务将 `{target_col}` 识别为训练目标列。").strip()
         elif predict_name and predict_name in fs.path:
             fs.role = FileRole.raw_data_table
-            fs.summary = (
-                f"预测数据衍生表，语义同 `{predict_name}`，用于生成 `{target_col}` 预测值。"
-            )
+            fs.source_metadata = {**(fs.source_metadata or {}), "downstream_role_hint": "predict_table_derived", "target_column_hint": target_col}
+            if target_col and target_col not in fs.summary:
+                fs.summary = (
+                    fs.summary.rstrip()
+                    + f" 预测阶段使用该表作为待预测输入；目标列 `{target_col}` 来自训练数据或提交样例，不应作为预测输入特征。"
+                ).strip()
+
+
+def _validate_generated_submission(
+    out_df: pd.DataFrame,
+    *,
+    ctx: dict,
+    source_df: pd.DataFrame,
+) -> list[str]:
+    """Validate generated sample_submission against inferred semantic contract."""
+    issues: list[str] = []
+    cols = [str(c) for c in out_df.columns.tolist()]
+    submission_cols = [str(x) for x in ctx.get("submission_columns", []) if str(x).strip()]
+
+    semantic = ctx.get("semantic_keys", {}) or {}
+    entity_id_key = str(semantic.get("entity_id_key", "") or "")
+    group_id_key = str(semantic.get("group_id_key", "") or "")
+    resource_keys = [str(x) for x in semantic.get("resource_keys", []) if str(x).strip()]
+
+    if submission_cols and cols != submission_cols:
+        issues.append(f"column_order_mismatch: got={cols}, expected={submission_cols}")
+
+    # semantic keys are hints only, not hard failures.
+    if entity_id_key and entity_id_key not in cols:
+        issues.append(f"hint_missing_entity_id_key: {entity_id_key}")
+
+    if group_id_key and group_id_key not in cols:
+        issues.append(f"hint_missing_group_id_key: {group_id_key}")
+
+    if resource_keys and not any(k in cols for k in resource_keys):
+        issues.append(f"hint_missing_resource_keys: expected_any_of={resource_keys}")
+
+    if len(out_df) == 0:
+        issues.append("empty_submission")
+
+    if len(source_df) > 0 and len(out_df) > len(source_df) * 3:
+        issues.append(f"abnormal_row_count: out={len(out_df)}, source={len(source_df)}")
+
+    return issues
+
+
+
+def _evaluate_submission_with_llm(
+    *,
+    llm_client: LLMClient,
+    task_hint: str,
+    task_type_hint: str,
+    candidate_name: str,
+    source_columns: list[str],
+    source_preview: list[dict],
+    generated_columns: list[str],
+    generated_preview: list[dict],
+    semantic_keys: dict,
+    constraint_memory: dict | None = None,
+) -> SubmissionCheckVerdict:
+    stable, dynamic = stable_dynamic_prompt(
+        stable={
+            "rules": [
+                "只检查 schema/列语义，不检查样例值是否已经是优化后的最终答案。",
+                "候选 sample_submission 必须服务下游 ML-Master/AutoML，而不是服务 AutoRealize 自身。",
+                "优先判断提交文件是否表达题目真正需要预测/决策的对象，而不是套用固定模板。",
+                "不要把所有问题硬套成 id+target；优化、推荐、编排、分配类问题可以有多列决策输出。",
+                "sample_submission.csv 是格式/列契约样例，不是已经求解完成的最优方案。",
+                "只有当缺少必要列、列含义无法表达任务输出、列顺序违反官方样例时，才 needs_regenerate=true。",
+                "若原始数据/文档中有官方 sample submission 语义，必须优先尊重官方样例。",
+            ],
+            "task_hint": task_hint,
+            "task_type_hint": task_type_hint,
+            "semantic_keys": semantic_keys,
+            "constraint_memory": constraint_memory or {},
+        },
+        dynamic={
+            "candidate_table": candidate_name,
+            "source_columns": source_columns,
+            "source_preview": source_preview,
+            "generated_columns": generated_columns,
+            "generated_preview": generated_preview,
+        },
+        stable_title="Stable sample submission checker rules",
+        dynamic_title="Dynamic sample submission candidate",
+        stable_limit=9000,
+        dynamic_limit=9000,
+    )
+    return llm_client.ask_structured(
+        model_cls=SubmissionCheckVerdict,
+        system_prompt="你是严格的提交格式检查器。只能输出 JSON。",
+        user_prompt=dynamic,
+        prompt_name="sample_submission_checker",
+        static_context_prompt=stable,
+        dynamic_user_prompt=dynamic,
+    )
+
+
+def _schema_blocking_checker_issues(issues: list[str]) -> list[str]:
+    """Keep only checker issues that should block a sample_submission schema.
+
+    The LLM checker sometimes drifts into judging whether the example rows are
+    already optimized. That is wrong for sample_submission.csv: placeholders are
+    acceptable as long as the columns can express the downstream output.
+    """
+    blocking: list[str] = []
+    value_only_markers = [
+        "placeholder",
+        "default",
+        "not optimized",
+        "not solved",
+        "no actual optimization",
+        "占位",
+        "默认",
+        "全为",
+        "均为",
+        "相同",
+        "待优化",
+        "未优化",
+        "优化结果",
+        "实际调度",
+        "实际分配",
+        "决策依据",
+        "未按",
+        "没有按",
+        "未体现",
+        "未考虑",
+        "未提供任何优化",
+        "运力结算",
+        "装载约束",
+        "业务约束",
+        "求解",
+        "最优",
+    ]
+    hard_schema_markers = [
+        "column_order_mismatch",
+        "empty_submission",
+        "列顺序",
+        "字段缺失",
+        "缺少字段",
+        "缺少列",
+        "不包含",
+        "未包含",
+        "无法表达",
+        "不能表达",
+        "schema",
+        "column",
+    ]
+    for issue in issues:
+        text = str(issue).strip()
+        lower = text.lower()
+        if not text:
+            continue
+        is_value_only = any(marker in lower or marker in text for marker in value_only_markers)
+        is_schema = any(marker in lower or marker in text for marker in hard_schema_markers)
+        if is_value_only:
+            continue
+        if is_schema:
+            blocking.append(issue)
+            continue
+        # Conservative default: unclear checker complaints remain blocking.
+        blocking.append(issue)
+    return blocking
+
+
+
+def _try_build_submission_from_plan(
+    *,
+    plan: SubmissionScriptPlan,
+    df: pd.DataFrame,
+    data_root: Path,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    issues: list[str] = []
+
+    def _resolve_input_path(path_like):
+        if not isinstance(path_like, (str, Path)):
+            return path_like
+        path = Path(path_like)
+        if path.is_absolute() or path.exists():
+            return path_like
+        candidate = data_root / path
+        if candidate.exists():
+            return candidate
+        for p in walk_files(data_root):
+            if p.name == path.name:
+                return p
+        return path_like
+
+    class _PathAwarePandas:
+        def __getattr__(self, name: str):
+            return getattr(pd, name)
+
+        def read_csv(self, filepath_or_buffer, *args, **kwargs):
+            resolved = _resolve_input_path(filepath_or_buffer)
+            if isinstance(resolved, (str, Path)):
+                return read_csv_auto(Path(resolved), *args, **kwargs)
+            return pd.read_csv(resolved, *args, **kwargs)
+
+        def read_excel(self, io, *args, **kwargs):
+            return pd.read_excel(_resolve_input_path(io), *args, **kwargs)
+
+        def read_json(self, path_or_buf, *args, **kwargs):
+            return pd.read_json(_resolve_input_path(path_or_buf), *args, **kwargs)
+
+        def read_parquet(self, path, *args, **kwargs):
+            return pd.read_parquet(_resolve_input_path(path), *args, **kwargs)
+
+    path_aware_pd = _PathAwarePandas()
+
+    def _path_aware_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+        if name == "pandas":
+            return path_aware_pd
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    safe_builtins = vars(builtins).copy()
+    safe_builtins["__import__"] = _path_aware_import
+    generated_path = data_root / "sample_submission.csv"
+    generated_existed_before = generated_path.exists()
+    old_cwd = Path.cwd()
+
+    def _as_dataframe(candidate) -> pd.DataFrame | None:
+        if isinstance(candidate, pd.DataFrame):
+            return candidate
+        if isinstance(candidate, (list, tuple)):
+            for item in candidate:
+                if isinstance(item, pd.DataFrame):
+                    return item
+        return None
+
+    def _call_submission_builder(fn) -> tuple[pd.DataFrame | None, str | None]:
+        try:
+            signature = inspect.signature(fn)
+            params = list(signature.parameters.values())
+            positional = [
+                p
+                for p in params
+                if p.kind
+                in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+            ]
+            has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+            required_positional = [p for p in positional if p.default is inspect.Parameter.empty]
+            result = fn() if not required_positional and not has_varargs else fn(df.copy())
+        except Exception as first_exc:  # noqa: BLE001
+            try:
+                result = fn(df.copy())
+            except Exception as second_exc:  # noqa: BLE001
+                return None, f"{first_exc}; retry_with_df_failed: {second_exc}"
+        return _as_dataframe(result), None
+
+    try:
+        exec_vars: dict = {
+            "__builtins__": safe_builtins,
+            "pd": path_aware_pd,
+            "df": df.copy(),
+            "out_df": None,
+            "data_root": str(data_root),
+            "input_root": str(data_root),
+        }
+        os.chdir(data_root)
+        exec(plan.python_code, exec_vars, exec_vars)  # noqa: S102
+        out_df = _as_dataframe(exec_vars.get("out_df"))
+        if not isinstance(out_df, pd.DataFrame):
+            for name in ("submission", "sample_submission", "result", "output"):
+                candidate_df = _as_dataframe(exec_vars.get(name))
+                if candidate_df is not None:
+                    out_df = candidate_df
+                    break
+        builder_errors: list[str] = []
+        if not isinstance(out_df, pd.DataFrame):
+            for name in ("generate_submission", "build_submission", "create_submission", "make_submission", "main"):
+                fn = exec_vars.get(name)
+                if not callable(fn):
+                    continue
+                candidate_df, err = _call_submission_builder(fn)
+                if err:
+                    builder_errors.append(f"{name}: {err}")
+                    continue
+                if candidate_df is not None:
+                    out_df = candidate_df
+                    break
+        if not isinstance(out_df, pd.DataFrame) and generated_path.exists():
+            out_df = read_csv_auto(generated_path)
+        if not isinstance(out_df, pd.DataFrame) or out_df.empty:
+            if builder_errors:
+                return None, ["plan_python_output_empty_or_invalid", *builder_errors[:3]]
+            return None, ["plan_python_output_empty_or_invalid"]
+        expected = [str(x) for x in plan.submission_columns if str(x).strip()]
+        if expected and list(out_df.columns) != expected:
+            for col in expected:
+                if col not in out_df.columns:
+                    if col in df.columns:
+                        source_values = df[col].reset_index(drop=True)
+                        out_df = out_df.reset_index(drop=True)
+                        out_df[col] = source_values.reindex(range(len(out_df))).fillna("").to_list()
+                    else:
+                        out_df[col] = 0.0 if col == expected[-1] else ""
+            out_df = out_df[expected]
+        return out_df, issues
+    except Exception as exc:  # noqa: BLE001
+        return None, [f"plan_python_exec_error: {exc}"]
+    finally:
+        os.chdir(old_cwd)
+        if generated_path.exists() and not generated_existed_before:
+            try:
+                generated_path.unlink()
+            except Exception:
+                pass
+
 
 
 def _generate_sample_submission(
     data_root: Path,
     run_dir: Path,
     cfg: AutoRealizeConfig,
+    *,
     downstream_context: dict | None = None,
-    llm_client: LLMClient | None = None,
+    llm_client: LLMClient,
 ) -> None:
-    """Generate a fallback sample submission file for downstream AutoML."""
+    """Generate sample_submission for downstream AutoML. Requires LLM when no official sample exists."""
     target_file = run_dir / "sample_submission.csv"
+    ctx = downstream_context or _infer_downstream_context(data_root, [], "", cfg)
     if target_file.exists():
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": True,
+                "source": "preexisting_output",
+                "target_file": "sample_submission.csv",
+                "reason": "target file already exists",
+            },
+        )
         return
-    # 浼樺厛澶嶇敤鏁版嵁涓凡鏈?sample_submission锛岄伩鍏嶉敊璇帹鏂负涓ゅ垪琛ㄣ€?
+
     def _is_sample_submission_name(path: Path) -> bool:
-        # 兼容 sample_submission / sampleSubmission / sample-submission 等命名
         normalized = "".join(ch for ch in path.stem.lower() if ch.isalnum())
         return "samplesubmission" in normalized
 
@@ -756,24 +1266,108 @@ def _generate_sample_submission(
         sample_src = existing_samples[0]
         if sample_src.suffix.lower() == ".csv":
             shutil.copy2(sample_src, target_file)
+            _write_submission_report(
+                run_dir,
+                {
+                    "passed": True,
+                    "source": "official_sample_reused",
+                    "sample_source": str(sample_src.relative_to(data_root)).replace("\\", "/"),
+                    "target_file": "sample_submission.csv",
+                    "columns": list(read_csv_auto(target_file, nrows=0).columns),
+                },
+            )
             return
         try:
             df_sample = pd.read_excel(sample_src)
             df_sample.to_csv(target_file, index=False, encoding="utf-8-sig")
+            _write_submission_report(
+                run_dir,
+                {
+                    "passed": True,
+                    "source": "official_sample_reused",
+                    "sample_source": str(sample_src.relative_to(data_root)).replace("\\", "/"),
+                    "target_file": "sample_submission.csv",
+                    "columns": [str(c) for c in df_sample.columns.tolist()],
+                },
+            )
             return
         except Exception:  # noqa: BLE001
             pass
-    # 未提供官方 sample_submission 时，优先由 LLM 生成“构建样例提交”的脚本与列契约。
-    table_files = [p for p in walk_files(data_root) if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}]
-    if not table_files:
-        return
-    ctx = downstream_context or _infer_downstream_context(data_root, [], "", cfg)
+
     task_hint = str(ctx.get("task_hint", "")).strip()
     task_type_hint = str(ctx.get("task_type_hint", "")).strip()
     predict_name = str(ctx.get("predict_table", "")).strip()
+    has_real_predict_table = bool(predict_name)
+    confirmed_submission_cols = [str(x) for x in ctx.get("submission_columns", []) if str(x).strip()]
+    authoritative_contract = ctx.get("authoritative_submission_contract") or {}
+    if not isinstance(authoritative_contract, dict):
+        authoritative_contract = {}
+    authoritative_contract_defined = bool(authoritative_contract.get("is_defined"))
+    task_type_lower = task_type_hint.lower()
+    looks_like_rl_or_optimization = any(
+        key in task_type_lower
+        for key in [
+            "reinforcement",
+            "rl",
+            "optimization",
+            "optimisation",
+            "planning",
+            "scheduling",
+            "assignment",
+        ]
+    )
+    if not confirmed_submission_cols and (
+        looks_like_rl_or_optimization or not has_real_predict_table or not authoritative_contract_defined
+    ):
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": True,
+                "source": "skipped_no_authoritative_contract",
+                "target_file": None,
+                "columns": [],
+                "task_type_hint": task_type_hint,
+                "real_predict_table": has_real_predict_table,
+                "authoritative_contract_defined": authoritative_contract_defined,
+                "issues": [],
+                "reason": (
+                    "No official sample_submission or authoritative output contract was found. "
+                    "AutoRealize will not invent a submission schema; downstream AutoML must follow description.md/evaluation protocol."
+                ),
+            },
+        )
+        log_event(
+            logger,
+            "checker.sample_submission",
+            "SKIPPED",
+            reason="no_authoritative_contract",
+            task_type_hint=task_type_hint,
+            real_predict_table=has_real_predict_table,
+        )
+        return
+
+    table_files = [p for p in walk_files(data_root) if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}]
+    if not table_files:
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": True,
+                "source": "skipped_no_authoritative_contract",
+                "target_file": None,
+                "columns": [],
+                "task_type_hint": task_type_hint,
+                "issues": [],
+                "reason": "No table files or official sample_submission were found; no sample schema was generated.",
+            },
+        )
+        log_event(logger, "checker.sample_submission", "SKIPPED", reason="no_table_files")
+        return
+
     id_col = str(ctx.get("id_column", "id")).strip() or "id"
     target_col = str(ctx.get("target_column", "target")).strip() or "target"
-    submission_cols = [str(x) for x in ctx.get("submission_columns", []) if str(x).strip()]
+    schema_hints = [str(x) for x in ctx.get("submission_schema_hints", []) if str(x).strip()]
+
+    semantic = ctx.get("semantic_keys", {}) or {}
 
     candidate = None
     if predict_name:
@@ -786,119 +1380,340 @@ def _generate_sample_submission(
         candidate = non_submission_tables[0] if non_submission_tables else table_files[0]
 
     try:
-        if candidate.suffix.lower() == ".csv":
-            df = pd.read_csv(candidate)
-        elif candidate.suffix.lower() == ".json":
-            from .utils.json_table import read_json_as_table
-
-            df, _ = read_json_as_table(
+        df = read_table(
+            candidate,
+            json_flatten_sep=cfg.data.json_flatten_sep,
+            json_flatten_max_level=cfg.data.json_flatten_max_level,
+            json_keep_raw_nested_columns=cfg.data.json_keep_raw_nested_columns,
+            max_rows=table_probe_sample_rows(
                 candidate,
-                sep=cfg.data.json_flatten_sep,
-                max_level=cfg.data.json_flatten_max_level,
-                keep_raw_nested_columns=cfg.data.json_keep_raw_nested_columns,
-            )
-        else:
-            df = pd.read_excel(candidate)
-    except Exception:  # noqa: BLE001
+                configured_rows=cfg.data.table_profile_sample_rows,
+                large_threshold_bytes=cfg.data.large_table_threshold_bytes,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        issues = [f"candidate_read_failed: {candidate.name}: {exc}"]
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": False,
+                "source": "skipped_generation_failed",
+                "candidate_table": candidate.name,
+                "target_file": None,
+                "columns": [],
+                "issues": issues,
+                "reason": "Candidate table could not be read; sample_submission generation was skipped without interrupting AutoRealize.",
+            },
+        )
+        log_event(logger, "checker.sample_submission", "WARNING", reason="candidate_read_failed", error=str(exc)[:240])
         return
     if df.empty:
+        issues = [f"candidate_empty: {candidate.name}"]
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": False,
+                "source": "skipped_generation_failed",
+                "candidate_table": candidate.name,
+                "target_file": None,
+                "columns": [],
+                "issues": issues,
+                "reason": "Candidate table is empty; sample_submission generation was skipped without interrupting AutoRealize.",
+            },
+        )
+        log_event(logger, "checker.sample_submission", "WARNING", reason="candidate_empty", candidate_table=candidate.name)
         return
 
     if id_col not in df.columns:
-        fallback_id = None
+        inferred_id = None
         for c in df.columns:
             lc = str(c).lower()
-            if "id" in lc or "number" in lc or "order" in lc:
-                fallback_id = str(c)
+            if "id" in lc or "number" in lc or "order" in lc or "code" in lc:
+                inferred_id = str(c)
                 break
-        id_col = fallback_id or str(df.columns[0])
+        id_col = inferred_id or str(df.columns[0])
 
-    if not submission_cols:
-        submission_cols = [id_col, target_col]
+    preview = _json_safe(df.head(min(30, len(df))).to_dict(orient="records"))
+    plan_prompt = (
+        "Return strict JSON with fields: purpose, submission_columns, python_code, id_column, target_columns.\n"
+        "Goal: design sample_submission schema from task semantics and dataset structure.\n"
+        f"candidate_table={candidate.name}\n"
+        f"task_hint={task_hint}\n"
+        f"task_type_hint={task_type_hint}\n"
+        f"confirmed_submission_columns={confirmed_submission_cols}\n"
+        f"submission_schema_hints={schema_hints}\n"
+        f"semantic_keys={_json_dumps_safe(semantic, ensure_ascii=False)}\n"
+        f"constraint_memory={_json_dumps_safe(ctx.get('constraint_memory', {}), ensure_ascii=False)[:4000]}\n"
+        f"columns={list(df.columns)}\n"
+        f"preview={_json_dumps_safe(preview, ensure_ascii=False)[:6000]}\n"
+        "Constraints:\n"
+        "1) If confirmed_submission_columns is non-empty, output out_df with exactly those columns in that order.\n"
+        "2) If confirmed_submission_columns is empty, design the schema from the task semantics; submission_schema_hints are non-binding hints, not a required template.\n"
+        "3) Do not force id+target or any fixed template when optimization/recommendation/custom tasks need richer output fields.\n"
+        "4) Use original field names from data whenever they accurately express the output meaning.\n"
+        "5) Reflect critical constraints from constraint_memory in submission field design.\n"
+        "6) python_code should use the provided DataFrame variable df and assign the final DataFrame to out_df.\n"
+        "7) do not read input files or write output files unless absolutely necessary; the execution sandbox will save out_df.\n"
+    )
 
-    # LLM 先决：无官方样例时，优先让 LLM 从任务语义生成提交格式与脚本。
-    if llm_client is not None:
-        try:
-            preview = df.head(min(30, len(df))).to_dict(orient="records")
-            lower_cols = [str(c).lower() for c in df.columns]
-            sales_hint = (
-                any(k in (task_hint or "") for k in ["销量", "销售额", "下个月", "次月"])
-                or any(k in (task_hint or "").lower() for k in ["sales", "revenue", "forecast"])
-                or (
-                    any("store" in c or "shop" in c for c in lower_cols)
-                    and any(c.startswith("dt") or "date" in c or "time" in c for c in lower_cols)
-                    and any("money" in c or "sales" in c or "revenue" in c for c in lower_cols)
+    def _align_confirmed_columns(plan: SubmissionScriptPlan) -> SubmissionScriptPlan:
+        if confirmed_submission_cols and plan.submission_columns != confirmed_submission_cols:
+            return SubmissionScriptPlan(
+                purpose=(plan.purpose or "") + " | aligned_to_confirmed_submission_columns",
+                submission_columns=confirmed_submission_cols,
+                python_code=plan.python_code,
+                id_column=plan.id_column,
+                target_columns=[c for c in confirmed_submission_cols[1:]],
+            )
+        return plan
+
+    def _write_generation_skipped(
+        *,
+        issues: list[str],
+        reason: str,
+        round_idx: int | None = None,
+        generated_columns: list[str] | None = None,
+        generated_preview: list[dict] | None = None,
+        non_blocking_checker_warnings: list[str] | None = None,
+    ) -> None:
+        _write_submission_report(
+            run_dir,
+            {
+                "passed": False,
+                "source": "skipped_generation_failed",
+                "candidate_table": candidate.name,
+                "task_type_hint": task_type_hint,
+                "target_file": None,
+                "columns": generated_columns or [],
+                "preview": (generated_preview or [])[:5],
+                "issues": issues,
+                "non_blocking_checker_warnings": non_blocking_checker_warnings or [],
+                "round": round_idx,
+                "reason": reason,
+            },
+        )
+        log_event(
+            logger,
+            "checker.sample_submission",
+            "WARNING",
+            reason="generation_skipped",
+            issues=issues[:5],
+            round=round_idx,
+        )
+
+    def _plan_with_feedback(
+        *,
+        base_prompt: str,
+        previous_plan: SubmissionScriptPlan | None,
+        feedback: list[str],
+        round_idx: int,
+        generated_columns: list[str] | None = None,
+        generated_preview: list[dict] | None = None,
+    ) -> SubmissionScriptPlan:
+        repair_payload = {
+            "instruction": (
+                "The previous sample_submission plan failed validation or execution. "
+                "Regenerate the strict JSON plan. Do not repeat the same mistake."
+            ),
+            "repair_round": round_idx,
+            "feedback_errors": feedback,
+            "previous_plan": previous_plan.model_dump() if previous_plan else {},
+            "previous_generated_columns": generated_columns or [],
+            "previous_generated_preview": generated_preview or [],
+            "hard_rules": [
+                "python_code must assign a non-empty pandas DataFrame to out_df, or define a callable that returns one.",
+                "Do not read files by bare relative names unless the file exists under data_root; prefer using the provided df.",
+                "If confirmed_submission_columns is non-empty, output exactly those columns in that order.",
+                "If no authoritative contract exists, do not invent a fixed id+target template.",
+                "Use original column names when they express the required output semantics.",
+            ],
+        }
+        plan = llm_client.ask_structured(
+            model_cls=SubmissionScriptPlan,
+            system_prompt="You are a schema planner repairing sample_submission generation. Output JSON only.",
+            user_prompt=_json_dumps_safe(repair_payload, ensure_ascii=False, indent=2)[:10000],
+            prompt_name=f"sample_submission_script_plan_repair_{round_idx}",
+            static_context_prompt=base_prompt,
+            dynamic_user_prompt="Repair feedback JSON:\n"
+            + _json_dumps_safe(repair_payload, ensure_ascii=False, indent=2)[:10000],
+        )
+        return _align_confirmed_columns(plan)
+
+    try:
+        current_plan = _align_confirmed_columns(llm_client.ask_structured(
+            model_cls=SubmissionScriptPlan,
+            system_prompt="You are a schema planner for sample_submission. Output JSON only.",
+            user_prompt="Generate the initial sample_submission schema plan.",
+            prompt_name="sample_submission_script_plan",
+            static_context_prompt=plan_prompt,
+            dynamic_user_prompt="Generate the initial sample_submission schema plan.",
+        ))
+
+        max_repair_rounds = max(2, int(getattr(cfg.prompt, "description_quality_max_retries", 3)))
+        final_rejection_issues: list[str] = []
+        for round_idx in range(max_repair_rounds + 1):
+            out_df, plan_issues = _try_build_submission_from_plan(plan=current_plan, df=df, data_root=data_root)
+            if out_df is None:
+                final_rejection_issues = plan_issues
+                log_event(
+                    logger,
+                    "checker.sample_submission",
+                    "REPAIRING",
+                    reason="plan_python_failed",
+                    round=round_idx,
+                    issues=plan_issues[:5],
                 )
-            )
-            sales_rule = ""
-            if sales_hint:
-                sales_rule = (
-                    "本任务属于“下个月销量/销售额预测”场景："
-                    "submission_columns 必须优先采用 [门店键, 日期键, 预测销量/销售额] 的三列结构。"
-                    "若存在 `sstoreno`、`dtdate`、`fmoney`，优先输出 [sstoreno, dtdate, fmoney]。"
-                    "禁止仅输出 [id, target] 两列。"
+                if round_idx >= max_repair_rounds:
+                    _write_generation_skipped(
+                        issues=final_rejection_issues,
+                        reason="LLM sample_submission code did not produce a valid DataFrame after repair rounds.",
+                        round_idx=round_idx,
+                    )
+                    return
+                current_plan = _plan_with_feedback(
+                    base_prompt=plan_prompt,
+                    previous_plan=current_plan,
+                    feedback=["Generated python did not produce a valid non-empty DataFrame.", *plan_issues],
+                    round_idx=round_idx + 1,
                 )
-            prompt = (
-                "请输出严格 JSON，字段包含: purpose, submission_columns, python_code, id_column, target_columns。\n"
-                "目标：从任务语义与数据字段出发，设计 sample_submission 列结构，并生成 Python 脚本创建 DataFrame。\n"
-                f"候选预测表: {candidate.name}\n"
-                f"任务描述: {task_hint}\n"
-                f"任务类型提示: {task_type_hint}\n"
-                f"建议 id 列: {id_col}\n"
-                f"建议目标列: {submission_cols[1:] if len(submission_cols) >= 2 else [target_col]}\n"
-                f"下游推断建议 submission 列: {submission_cols}\n"
-                f"表头: {list(df.columns)}\n"
-                f"预览: {json.dumps(preview, ensure_ascii=False)[:6000]}\n"
-                f"{sales_rule}\n"
-                "要求：\n"
-                "1) 你给出的 `submission_columns` 必须与脚本生成的 out_df 列顺序完全一致；\n"
-                "2) 脚本最后把结果写到变量 `out_df`（DataFrame）；\n"
-                "3) 若任务是分类概率提交，可输出 id+多概率列；若是回归/时序预测，输出业务键+目标值。\n"
-            )
-            plan = llm_client.ask_structured(
-                model_cls=SubmissionScriptPlan,
-                system_prompt="你是提交样例脚本生成器。必须仅输出 JSON。",
-                user_prompt=prompt,
-                prompt_name="sample_submission_script_plan",
-            )
-            local_vars: dict = {"pd": pd, "df": df.copy(), "out_df": None}
-            exec(plan.python_code, {}, local_vars)  # noqa: S102
-            out_df = local_vars.get("out_df")
-            if isinstance(out_df, pd.DataFrame) and not out_df.empty:
-                if plan.submission_columns:
-                    expected = [str(x) for x in plan.submission_columns if str(x).strip()]
-                    if expected and list(out_df.columns) != expected:
-                        # 强制按契约重排/补列，避免脚本与结构化输出不一致。
-                        for col in expected:
-                            if col not in out_df.columns:
-                                out_df[col] = 0.0 if col == expected[-1] else ""
-                        out_df = out_df[expected]
-                    submission_cols = expected or submission_cols
-                out_df.to_csv(target_file, index=False, encoding="utf-8-sig")
-                return
-        except Exception:
-            pass
-
-    out = pd.DataFrame()
-    # 以 submission_cols 为唯一输出契约来源，避免与 id_col 推断冲突。
-    if submission_cols:
-        for i, col in enumerate(submission_cols):
-            if i == len(submission_cols) - 1:
-                # 最后一列默认为目标列，样例文件统一填充占位值。
-                out[col] = 0.0
                 continue
-            if col in df.columns:
-                out[col] = df[col]
+
+            rule_issues = _validate_generated_submission(out_df, ctx=ctx, source_df=df)
+            generated_cols = [str(c) for c in out_df.columns.tolist()]
+            generated_preview = _json_safe(out_df.head(min(20, len(out_df))).to_dict(orient="records"))
+
+            try:
+                checker = _evaluate_submission_with_llm(
+                    llm_client=llm_client,
+                    task_hint=task_hint,
+                    task_type_hint=task_type_hint,
+                    candidate_name=candidate.name,
+                    source_columns=[str(c) for c in df.columns.tolist()],
+                    source_preview=preview,
+                    generated_columns=generated_cols,
+                    generated_preview=generated_preview,
+                    semantic_keys=semantic,
+                    constraint_memory=ctx.get("constraint_memory", {}),
+                )
+            except Exception as exc:  # noqa: BLE001
+                final_rejection_issues = [f"sample_submission_checker_failed: {exc}"]
+                _write_generation_skipped(
+                    issues=final_rejection_issues,
+                    reason="LLM checker failed; sample_submission generation was skipped without interrupting AutoRealize.",
+                    round_idx=round_idx,
+                    generated_columns=generated_cols,
+                    generated_preview=generated_preview,
+                )
+                return
+
+            checker_issues = list(checker.issues or [])
+            blocking_checker_issues = _schema_blocking_checker_issues(checker_issues)
+            hard_rule_issues = [x for x in rule_issues if not x.startswith("hint_")]
+            if (checker.passed and not checker.needs_regenerate or not blocking_checker_issues) and not hard_rule_issues:
+                if not has_real_predict_table:
+                    out_df = out_df.head(max(1, int(cfg.data.generated_sample_submission_max_rows))).copy()
+                out_df.to_csv(target_file, index=False, encoding="utf-8-sig")
+                validation = {
+                    "passed": True,
+                    "issues": blocking_checker_issues + hard_rule_issues + plan_issues,
+                    "non_blocking_checker_warnings": [
+                        x for x in checker_issues if x not in blocking_checker_issues
+                    ],
+                    "source": "llm_plan+llm_checker",
+                    "round": round_idx,
+                    "real_predict_table": has_real_predict_table,
+                    "sample_rows_only": not has_real_predict_table,
+                }
+                (run_dir / "realize_report" / "sample_submission_validation.json").write_text(
+                    _json_dumps_safe(validation, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _write_submission_report(
+                    run_dir,
+                    {
+                        "passed": True,
+                        "source": "llm_plan+llm_checker",
+                        "candidate_table": candidate.name,
+                        "task_type_hint": task_type_hint,
+                        "purpose": current_plan.purpose,
+                        "columns": generated_cols,
+                        "preview": generated_preview[:5],
+                        "issues": blocking_checker_issues + hard_rule_issues + plan_issues,
+                        "non_blocking_checker_warnings": [
+                            x for x in checker_issues if x not in blocking_checker_issues
+                        ],
+                        "round": round_idx,
+                        "target_file": "sample_submission.csv",
+                        "real_predict_table": has_real_predict_table,
+                        "sample_rows_only": not has_real_predict_table,
+                    },
+                )
+                log_event(logger, "checker.sample_submission", "COMPLETED", passed=True)
+                return
+
+            repair_feedback = blocking_checker_issues + hard_rule_issues + plan_issues
+            if round_idx >= max_repair_rounds:
+                final_rejection_issues = repair_feedback
+                _write_generation_skipped(
+                    issues=final_rejection_issues,
+                    reason="LLM checker did not approve a valid sample_submission schema after repair rounds.",
+                    round_idx=round_idx,
+                    generated_columns=generated_cols,
+                    generated_preview=generated_preview,
+                    non_blocking_checker_warnings=[
+                        x for x in checker_issues if x not in blocking_checker_issues
+                    ],
+                )
+                return
+
+            if blocking_checker_issues and checker.needs_regenerate and checker.revised_python_code.strip():
+                revised_cols = [str(x) for x in checker.revised_submission_columns if str(x).strip()]
+                current_plan = SubmissionScriptPlan(
+                    purpose=(current_plan.purpose or "") + " | revised_by_checker",
+                    submission_columns=revised_cols or current_plan.submission_columns,
+                    python_code=checker.revised_python_code,
+                    id_column=current_plan.id_column,
+                    target_columns=current_plan.target_columns,
+                )
             else:
-                # 键列缺失时保底使用 id 列或空串。
-                if i == 0 and id_col in df.columns:
-                    out[col] = df[id_col].astype(str).tolist()
-                else:
-                    out[col] = ""
-    else:
-        out[id_col] = df[id_col].astype(str).tolist()
-        out[target_col] = 0.0
-    out.to_csv(target_file, index=False, encoding="utf-8-sig")
+                log_event(
+                    logger,
+                    "checker.sample_submission",
+                    "REPAIRING",
+                    reason="checker_rejected_without_repair_code",
+                    round=round_idx,
+                    issues=repair_feedback[:5],
+                )
+                current_plan = _plan_with_feedback(
+                    base_prompt=plan_prompt,
+                    previous_plan=current_plan,
+                    feedback=[
+                        "Checker rejected the generated sample_submission but did not provide repair code.",
+                        *repair_feedback,
+                    ],
+                    round_idx=round_idx + 1,
+                    generated_columns=generated_cols,
+                    generated_preview=generated_preview,
+                )
+    except Exception as exc:
+        _write_generation_skipped(
+            issues=[str(exc)],
+            reason="Unexpected sample_submission generation failure; stage was skipped without interrupting AutoRealize.",
+        )
+        return
+
+
+def _write_submission_report(run_dir: Path, payload: dict) -> None:
+    report_dir = run_dir / "realize_report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema_version": "autorealize.submission_report.v1",
+        **payload,
+    }
+    (report_dir / "submission_report.json").write_text(
+        _json_dumps_safe(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _infer_downstream_context(
@@ -907,23 +1722,15 @@ def _infer_downstream_context(
     task_hint: str,
     cfg: AutoRealizeConfig,
 ) -> dict:
-    """推断下游 AutoML 所需的 train/test/label 语义，优先使用强规则避免歧义。"""
+    """Infer train/predict/label semantics and non-binding submission hints."""
     table_paths = [p for p in walk_files(data_root) if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}]
     hint_lower = task_hint.lower()
     placeholders = {"", "nan", "none", "null", "na", "n/a", "unknown", "?"}
-    label_priority = [
-        "requester_received_pizza",
-        "transported",
-        "species",
-        "fmoney",
-        "target",
-        "label",
-        "y",
-    ]
+    label_priority = ["target", "label", "y"]
 
     def _read_small_table(path: Path, nrows: int = 200) -> pd.DataFrame:
         if path.suffix.lower() == ".csv":
-            return pd.read_csv(path, nrows=nrows)
+            return read_csv_auto(path, nrows=nrows)
         if path.suffix.lower() == ".json":
             from .utils.json_table import read_json_as_table
 
@@ -950,54 +1757,88 @@ def _infer_downstream_context(
             return 0.0
         return non_missing / max(len(s), 1)
 
-    def _best_id_column(columns: list[str]) -> str:
-        id_keywords = ["id", "order_id", "order", "request_id", "passengerid"]
+    def _unique_ratio(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns:
+            return 0.0
+        s = df[col]
+        if len(s) == 0:
+            return 0.0
+        nn = s.dropna()
+        if len(nn) == 0:
+            return 0.0
+        return float(nn.nunique()) / float(len(nn))
+
+    def _best_col_by_keywords(columns: list[str], keyword_groups: list[list[str]]) -> str:
+        lower = [str(c).lower() for c in columns]
+        for group in keyword_groups:
+            if group == ["id"]:
+                for idx, lc in enumerate(lower):
+                    raw = str(columns[idx])
+                    if lc == "id" or lc.endswith("_id") or raw.endswith("编号") or raw.endswith("代码") or raw.endswith("编码"):
+                        return raw
+                continue
+            for idx, lc in enumerate(lower):
+                if all(k in lc for k in group):
+                    return str(columns[idx])
+            for idx, lc in enumerate(lower):
+                if any(k in lc for k in group):
+                    return str(columns[idx])
         for c in columns:
-            lc = c.lower()
-            if any(k == lc or k in lc for k in id_keywords):
-                return c
-        return columns[0] if columns else "id"
+            cs = str(c)
+            for group in keyword_groups:
+                if any(k in cs for k in group):
+                    return cs
+        return ""
+
+    def _best_group_key(columns: list[str]) -> str:
+        lower = [str(c).lower() for c in columns]
+        strong_patterns = [
+            ["group", "id"],
+            ["origin", "order"],
+            ["parent", "id"],
+            ["batch", "id"],
+        ]
+        for pat in strong_patterns:
+            for i, lc in enumerate(lower):
+                if all(k in lc for k in pat):
+                    return str(columns[i])
+
+        for c in columns:
+            cs = str(c)
+            if ("原始" in cs and ("订单" in cs or "单号" in cs)) or ("父级" in cs) or ("批次" in cs):
+                return cs
+        return ""
+
+    def _best_id_column(columns: list[str], df: pd.DataFrame) -> str:
+        candidates: list[tuple[float, str]] = []
+        for c in columns:
+            name = str(c)
+            lc = name.lower()
+            score = 0.0
+            if any(x in lc for x in ["origin", "group", "parent", "batch"]):
+                score -= 1.5
+            if "id" == lc or lc.endswith("_id"):
+                score += 4.0
+            if "order" in lc or "request" in lc or "code" in lc or "number" in lc:
+                score += 2.5
+            if any(k in name for k in ["编号", "代码", "编码", "单号", "订单", "请求", "主键"]):
+                score += 2.5
+            if score <= 0:
+                continue
+            score += _unique_ratio(df, name) * 3.0
+            candidates.append((score, name))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        return candidates[0][1]
 
     def _best_time_column(columns: list[str]) -> str:
         for c in columns:
             lc = str(c).lower()
             if lc.startswith("dt") or any(k in lc for k in ["date", "time", "month", "day"]):
                 return str(c)
-            if any(k in str(c) for k in ["日期", "时间", "月份", "天"]):
+            if any(k in str(c) for k in ["日期", "时间", "月份", "每日"]):
                 return str(c)
-        return ""
-
-    def _best_store_like_column(columns: list[str]) -> str:
-        for c in columns:
-            lc = str(c).lower()
-            if any(k in lc for k in ["store", "shop", "branch", "station"]):
-                return str(c)
-            if any(k in str(c) for k in ["门店", "店号", "店铺", "仓"]):
-                return str(c)
-        return ""
-
-    def _best_sales_target(columns: list[str]) -> str:
-        priority = [
-            "fmoney",
-            "sales",
-            "sale_amount",
-            "revenue",
-            "amount",
-            "qty",
-            "quantity",
-            "fquantity",
-        ]
-        lower_map = {str(c).lower(): str(c) for c in columns}
-        for p in priority:
-            if p in lower_map:
-                return lower_map[p]
-        for c in columns:
-            name = str(c)
-            lc = name.lower()
-            if any(k in lc for k in ["money", "sales", "revenue", "amount"]):
-                return name
-            if any(k in name for k in ["销售额", "销量", "金额"]):
-                return name
         return ""
 
     def _is_train_filename(name_lower: str) -> bool:
@@ -1007,6 +1848,7 @@ def _infer_downstream_context(
         return re.search(r"(^|[_\-.])(test|testing)([_\-.]|$)", name_lower) is not None
 
     table_infos: list[dict] = []
+    # Only official sample/submission files may populate this hard contract.
     submission_columns: list[str] = []
     for table in table_paths:
         try:
@@ -1015,6 +1857,7 @@ def _infer_downstream_context(
             continue
         if df is None or df.empty:
             continue
+
         columns = [str(c) for c in df.columns.tolist()]
         lower_cols = {c.lower(): c for c in columns}
         name_lower = table.name.lower()
@@ -1029,7 +1872,6 @@ def _infer_downstream_context(
         if is_submission and not submission_columns:
             submission_columns = columns
 
-        # 识别 label 可用性：列存在 + 非空非占位值
         label_candidates: list[tuple[str, float]] = []
         for lp in label_priority:
             if lp in lower_cols:
@@ -1045,6 +1887,26 @@ def _infer_downstream_context(
         if label_candidates:
             label_col, label_score = sorted(label_candidates, key=lambda x: (-x[1], x[0]))[0]
 
+        entity_id_key = _best_col_by_keywords(
+            columns,
+            [["order", "id"], ["request", "id"], ["entity", "id"], ["单", "号"], ["订单"], ["id"]],
+        )
+        group_id_key = _best_group_key(columns)
+        resource_key_1 = _best_col_by_keywords(
+            columns,
+            [["carrier", "code"], ["provider", "code"], ["vendor", "code"], ["承运", "商"], ["供应", "商"]],
+        )
+        resource_key_2 = _best_col_by_keywords(
+            columns,
+            [["vehicle", "type"], ["truck", "type"], ["resource", "type"], ["车型"], ["车辆"]],
+        )
+
+        id_col = _best_id_column(columns, df)
+        if entity_id_key:
+            id_col = entity_id_key
+        if group_id_key and group_id_key == entity_id_key:
+            group_id_key = ""
+
         table_infos.append(
             {
                 "path": str(table),
@@ -1052,10 +1914,12 @@ def _infer_downstream_context(
                 "rows": int(df.shape[0]),
                 "cols": int(df.shape[1]),
                 "columns": columns,
-                "id_col": _best_id_column(columns),
+                "id_col": id_col,
+                "entity_id_key": entity_id_key,
+                "group_id_key": group_id_key,
+                "resource_key_1": resource_key_1,
+                "resource_key_2": resource_key_2,
                 "time_col": _best_time_column(columns),
-                "store_col": _best_store_like_column(columns),
-                "sales_target_col": _best_sales_target(columns),
                 "is_train_name": is_train_name,
                 "is_test_name": is_test_name,
                 "is_submission": is_submission,
@@ -1065,9 +1929,38 @@ def _infer_downstream_context(
             }
         )
 
-    # 强规则：train+有label 优先作为训练；test+无label 优先作为预测
     has_named_train = any(t["is_train_name"] for t in table_infos)
     has_named_test = any(t["is_test_name"] for t in table_infos)
+
+    named_train_infos = [t for t in table_infos if t["is_train_name"] and not t["is_submission"]]
+    named_test_infos = [t for t in table_infos if t["is_test_name"] and not t["is_submission"]]
+    train_schema_hint = sorted(named_train_infos, key=lambda t: -t["rows"])[0] if named_train_infos else None
+    test_schema_hint = sorted(named_test_infos, key=lambda t: -t["rows"])[0] if named_test_infos else None
+
+    if train_schema_hint and test_schema_hint and not train_schema_hint["has_usable_label"]:
+        test_cols = set(test_schema_hint["columns"])
+        train_only = [c for c in train_schema_hint["columns"] if c not in test_cols]
+        if len(train_only) == 1:
+            label_col = train_only[0]
+            train_schema_hint["label_col"] = label_col
+            train_schema_hint["label_score"] = _label_score(_read_small_table(Path(train_schema_hint["path"]), nrows=500)[label_col])
+            train_schema_hint["has_usable_label"] = True
+        else:
+            scored_same_name: list[tuple[float, str]] = []
+            test_df = _read_small_table(Path(test_schema_hint["path"]), nrows=500)
+            train_df = _read_small_table(Path(train_schema_hint["path"]), nrows=500)
+            for c in train_schema_hint["columns"]:
+                if c not in test_cols or c not in train_df.columns or c not in test_df.columns:
+                    continue
+                train_score = _label_score(train_df[c])
+                test_score = _label_score(test_df[c])
+                if train_score > 0 and test_score == 0:
+                    scored_same_name.append((train_score, c))
+            if scored_same_name:
+                _, label_col = sorted(scored_same_name, key=lambda x: (-x[0], x[1]))[0]
+                train_schema_hint["label_col"] = label_col
+                train_schema_hint["label_score"] = float(_label_score(_read_small_table(Path(train_schema_hint["path"]), nrows=500)[label_col]))
+                train_schema_hint["has_usable_label"] = True
 
     train_table = None
     train_named = [t for t in table_infos if t["is_train_name"] and t["has_usable_label"]]
@@ -1075,7 +1968,6 @@ def _infer_downstream_context(
         train_table = sorted(train_named, key=lambda t: (-t["label_score"], -t["rows"]))[0]
     else:
         any_labeled = [t for t in table_infos if t["has_usable_label"] and not t["is_submission"]]
-        # 当存在显式 test 命名文件时，禁止把 test 文件当作训练集
         if has_named_test:
             any_labeled = [t for t in any_labeled if not t["is_test_name"]]
         if any_labeled:
@@ -1087,84 +1979,98 @@ def _infer_downstream_context(
         pred_table = sorted(test_no_label, key=lambda t: -t["rows"])[0]
     else:
         any_no_label = [t for t in table_infos if not t["has_usable_label"] and not t["is_submission"]]
-        # 当存在显式 train 命名文件时，禁止把 train 文件当作预测集
         if has_named_train:
             any_no_label = [t for t in any_no_label if not t["is_train_name"]]
+        # 只有一个普通业务表时，它更可能是历史训练/分析表，而不是独立预测集。
+        # 预测集必须由 test/predict 命名、缺失标签字段、或官方说明明确指向；这里不凭空制造 predict_table。
+        if len([t for t in table_infos if not t["is_submission"]]) <= 1:
+            any_no_label = []
         if any_no_label:
             pred_table = sorted(any_no_label, key=lambda t: -t["rows"])[0]
 
-    # 目标列/ID 推断
-    id_column = pred_table["id_col"] if pred_table else (train_table["id_col"] if train_table else "id")
-    target_column = train_table["label_col"] if train_table else "target"
+    if train_table is None and pred_table is None and table_infos:
+        non_submission = [t for t in table_infos if not t["is_submission"]]
+        if non_submission:
+            train_table = sorted(non_submission, key=lambda t: -t["rows"])[0]
+
+    id_column = pred_table["id_col"] if pred_table else (train_table["id_col"] if train_table else "")
+    target_column = train_table["label_col"] if train_table and train_table.get("has_usable_label") else ""
     y_true_field = target_column
 
-    has_sales_shape = False
-    if train_table:
-        has_sales_shape = bool(
-            str(train_table.get("store_col") or "").strip()
-            and str(train_table.get("time_col") or "").strip()
-            and str(train_table.get("sales_target_col") or "").strip()
-        )
-    is_sales_forecast = (
-        any(k in hint_lower for k in ["sales", "revenue", "forecast"])
-        or any(k in task_hint for k in ["销量", "销售额", "次月", "下个月"])
-        or has_sales_shape
-    )
+    entity_id_key = ""
+    group_id_key = ""
+    resource_keys: list[str] = []
+    for t in [pred_table, train_table]:
+        if not t:
+            continue
+        if not entity_id_key and t.get("entity_id_key"):
+            entity_id_key = str(t.get("entity_id_key"))
+        if not group_id_key and t.get("group_id_key"):
+            group_id_key = str(t.get("group_id_key"))
+        for rk in [t.get("resource_key_1"), t.get("resource_key_2")]:
+            if rk and str(rk) not in resource_keys:
+                resource_keys.append(str(rk))
 
-    if not train_table:
-        if "transport" in hint_lower or "shipping" in hint_lower or "logistics" in hint_lower:
-            target_column = "Transported"
-            y_true_field = "Transported"
-        elif is_sales_forecast:
-            target_column = "predicted_sales"
-            y_true_field = "fmoney"
+    optimization_hint = any(k in hint_lower for k in [
+        "optimization", "dispatch", "matching", "routing", "assignment", "schedule", "plan",
+        "优化", "调度", "匹配", "分配", "排程", "规划",
+    ])
 
-    # 销量/销售额预测任务下，优先用业务字段作为提交锚点，避免退化为仅 id,target。
-    if is_sales_forecast and train_table:
-        sales_target = train_table.get("sales_target_col") or _best_sales_target(train_table.get("columns", []))
-        if sales_target:
-            target_column = str(sales_target)
-            y_true_field = str(sales_target)
-
-    # 类型推断：先看 label 特征，再看任务关键词
-    if "下个月" in task_hint or "次月" in task_hint or "时间序列" in task_hint or has_sales_shape:
+    if train_table and train_table.get("time_col") and train_table["has_usable_label"]:
         task_type_hint = "time_series_regression"
-    elif target_column.lower() in {"requester_received_pizza", "transported"}:
-        task_type_hint = "binary_classification"
-    elif any(k in hint_lower for k in ["classification", "class", "分类", "是否", "true", "false"]):
+    elif optimization_hint:
+        task_type_hint = "optimization"
+    elif any(k in hint_lower for k in ["classification", "class", "分类", "类别", "true", "false"]):
         task_type_hint = "binary_classification"
     elif train_table and train_table["has_usable_label"]:
         task_type_hint = "regression"
     else:
         task_type_hint = "optimization_or_rl"
 
-    if not submission_columns:
-        if is_sales_forecast:
-            submission_columns = []
-            store_col = ""
-            time_col = ""
-            if pred_table:
-                store_col = str(pred_table.get("store_col") or "")
-                time_col = str(pred_table.get("time_col") or "")
-            if not store_col and train_table:
-                store_col = str(train_table.get("store_col") or "")
-            if not time_col and train_table:
-                time_col = str(train_table.get("time_col") or "")
-            if store_col:
-                submission_columns.append(store_col)
-            if time_col and time_col not in submission_columns:
-                submission_columns.append(time_col)
-            if target_column not in submission_columns:
-                submission_columns.append(target_column)
-            if len(submission_columns) < 2:
-                submission_columns = [id_column, target_column]
-        else:
-            submission_columns = [id_column, target_column]
+    submission_schema_hints: list[str] = []
+    if optimization_hint or entity_id_key or group_id_key or resource_keys:
+        for c in [entity_id_key or id_column, group_id_key, *resource_keys]:
+            if c and c not in submission_schema_hints:
+                submission_schema_hints.append(c)
+    elif id_column:
+        submission_schema_hints.append(id_column)
+    if target_column and target_column not in submission_schema_hints:
+        submission_schema_hints.append(target_column)
 
     train_columns = train_table["columns"] if train_table else []
     predict_columns = pred_table["columns"] if pred_table else []
     train_only_columns = [c for c in train_columns if c not in predict_columns and c != target_column]
     predict_only_columns = [c for c in predict_columns if c not in train_columns]
+
+    def _train_table_evidence(table: dict | None) -> str:
+        if not table:
+            return "unknown"
+        if table.get("is_train_name") and table.get("has_usable_label"):
+            return "named_train_table_with_label"
+        if table.get("has_usable_label"):
+            return "label_column_heuristic"
+        return "fallback_largest_non_submission_table_heuristic"
+
+    def _predict_table_evidence(table: dict | None) -> str:
+        if not table:
+            return "unknown"
+        if table.get("is_test_name") and not table.get("has_usable_label"):
+            return "named_test_or_predict_table_without_label"
+        return "multi_table_without_label_heuristic"
+
+    evidence_levels = {
+        "train_table": _train_table_evidence(train_table),
+        "predict_table": _predict_table_evidence(pred_table),
+        "id_column": "column_name_and_uniqueness_heuristic" if id_column else "unknown",
+        "target_column": "label_column_heuristic" if target_column else "unknown",
+        "submission_columns": "official_submission_file" if submission_columns else "unknown",
+        "task_type_hint": "task_hint_keyword_or_schema_heuristic" if task_type_hint else "unknown",
+    }
+    heuristic_fields = [
+        name
+        for name, evidence in evidence_levels.items()
+        if evidence.endswith("_heuristic") or "heuristic" in evidence
+    ]
 
     return {
         "task_hint": task_hint,
@@ -1172,12 +2078,20 @@ def _infer_downstream_context(
         "target_column": target_column,
         "y_true_field": y_true_field,
         "submission_columns": submission_columns,
+        "submission_schema_hints": submission_schema_hints,
         "task_type_hint": task_type_hint,
+        "semantic_keys": {
+            "entity_id_key": entity_id_key or id_column,
+            "group_id_key": group_id_key,
+            "resource_keys": resource_keys,
+        },
         "has_official_test_labels": False,
         "detected_tables": [t["name"] for t in table_infos][:20]
         or [fs.path for fs in file_summaries if fs.role == FileRole.raw_data_table][:20],
         "train_table": train_table["name"] if train_table else "",
         "predict_table": pred_table["name"] if pred_table else "",
+        "evidence_levels": evidence_levels,
+        "heuristic_fields": heuristic_fields,
         "train_columns": train_columns[:200],
         "predict_columns": predict_columns[:200],
         "train_only_columns": train_only_columns[:200],
@@ -1186,16 +2100,15 @@ def _infer_downstream_context(
 
 
 def _classify_task_type(
-    llm_client: LLMClient | None,
+    llm_client: LLMClient,
     prompt_mgr: PromptManager,
     task_hint: str,
     data_digest: str,
     downstream_context: dict,
-) -> TaskClassification | None:
-    if llm_client is None:
-        return None
+    enable_fewshot: bool = False,
+) -> TaskClassification:
     system = prompt_mgr.load("system/task_classifier.md")
-    fewshot = prompt_mgr.load("fewshot/task_classifier_fewshot.json")
+    fewshot = prompt_mgr.load("fewshot/task_classifier_fewshot.json") if enable_fewshot else ""
     light_ctx = {
         "task_hint": task_hint,
         "train_table": downstream_context.get("train_table", ""),
@@ -1203,25 +2116,35 @@ def _classify_task_type(
         "id_column": downstream_context.get("id_column", ""),
         "target_column": downstream_context.get("target_column", ""),
         "task_type_hint_pre": downstream_context.get("task_type_hint", ""),
-        "submission_columns_pre": downstream_context.get("submission_columns", []),
+        "confirmed_submission_columns": downstream_context.get("submission_columns", []),
+        "submission_schema_hints": downstream_context.get("submission_schema_hints", []),
+        "authoritative_memory": downstream_context.get("authoritative_memory", {}),
+        "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
+        "context_priority_order": (downstream_context.get("agent_context_pack") or {}).get("priority_order", []),
+        "do_not_invent": downstream_context.get("do_not_invent", []),
+        "task_classifier_route": (downstream_context.get("context_routes") or {}).get("task_classifier", {}),
         "train_columns": downstream_context.get("train_columns", [])[:80],
         "predict_columns": downstream_context.get("predict_columns", [])[:80],
     }
-    user = (
-        f"任务提示:\n{task_hint}\n\n"
-        f"数据摘要:\n{data_digest[:5000]}\n\n"
-        f"结构化线索:\n{json.dumps(light_ctx, ensure_ascii=False)}"
+    stable, dynamic = stable_dynamic_prompt(
+        stable={
+            "task_hint": task_hint,
+            "data_digest": data_digest[:5000],
+            "structured_clues": light_ctx,
+        },
+        dynamic={"instruction": "Classify the task type and evaluation hints from the stable evidence."},
+        stable_title="Stable task classification evidence",
+        dynamic_title="Dynamic task classification request",
     )
-    try:
-        return llm_client.ask_structured(
-            model_cls=TaskClassification,
-            system_prompt=system,
-            user_prompt=user,
-            prompt_name="task_classifier",
-            fewshot=fewshot,
-        )
-    except Exception:
-        return None
+    return llm_client.ask_structured(
+        model_cls=TaskClassification,
+        system_prompt=system,
+        user_prompt=dynamic,
+        prompt_name="task_classifier",
+        fewshot=fewshot,
+        static_context_prompt=stable,
+        dynamic_user_prompt=dynamic,
+    )
 
 
 def _select_cognition_files(data_root: Path, config: AutoRealizeConfig) -> tuple[list[Path], dict[str, list[Path]]]:
@@ -1245,15 +2168,69 @@ def _select_cognition_files(data_root: Path, config: AutoRealizeConfig) -> tuple
     return sorted(set(selected)), compact_image_dirs
 
 
+def _should_run_llm_file_cognition(
+    *,
+    config: AutoRealizeConfig,
+    parsed_kind: str,
+    role: FileRole,
+    relative_path: str,
+    metadata: dict,
+    allow_hint: bool | None = None,
+) -> bool:
+    mode = str(getattr(config.data, "llm_file_cognition_mode", "all") or "all").lower()
+    if mode in {"all", "selective"}:
+        return True
+    if mode in {"none", "off", "disabled"}:
+        return False
+
+    document_like = parsed_kind in {"document", "structured_document", "archive"}
+    if mode == "documents_only":
+        return document_like or role == FileRole.task_requirement
+
+    if document_like or role == FileRole.task_requirement:
+        return True
+    if bool(allow_hint):
+        return True
+
+    # In selective mode, keep LLM for files where deterministic reading is most
+    # likely to be insufficient or dangerous for downstream AutoML.
+    if parsed_kind == "table":
+        dialect = metadata.get("csv_dialect")
+        if isinstance(dialect, dict) and dialect.get("inferred"):
+            return True
+        sheets = metadata.get("excel_sheet_names") or []
+        if isinstance(sheets, list) and len(sheets) > 1:
+            return True
+        lower = str(relative_path).lower()
+        important_name_markers = [
+            "sample_submission",
+            "submission",
+            "description",
+            "readme",
+            "requirement",
+            "requirements",
+            "spec",
+            "task",
+            "规则",
+            "需求",
+            "任务",
+            "说明",
+            "方案",
+        ]
+        return any(marker in lower for marker in important_name_markers)
+    return False
+
+
 def _cognize_one_file(
     *,
     file: Path,
     data_root: Path,
     registry,
     config: AutoRealizeConfig,
-    llm_client: LLMClient | None,
+    llm_client: LLMClient,
     prompt_mgr: PromptManager,
     task_hint: str,
+    allow_llm_cognition: bool | None = None,
 ) -> dict:
     rpath = rel(file, data_root)
     log_event(logger, "stage.P1", "READING_FILE", file=rpath)
@@ -1272,7 +2249,11 @@ def _cognize_one_file(
             summary=parsed.text_summary[:600],
             columns=parsed.columns,
             warnings=warnings,
-            source_metadata=parsed.metadata or {},
+            source_metadata={
+                **(parsed.metadata or {}),
+                "kind": parsed.kind,
+                "preview": _json_safe((parsed.preview or [])[: max(1, int(config.data.preview_rows))]),
+            },
         )
         if parsed.kind == "table":
             try:
@@ -1281,72 +2262,149 @@ def _cognize_one_file(
                     json_flatten_sep=config.data.json_flatten_sep,
                     json_flatten_max_level=config.data.json_flatten_max_level,
                     json_keep_raw_nested_columns=config.data.json_keep_raw_nested_columns,
+                    max_rows=table_probe_sample_rows(
+                        file,
+                        configured_rows=config.data.table_profile_sample_rows,
+                        large_threshold_bytes=config.data.large_table_threshold_bytes,
+                    ),
                 )
                 prof = profile_dataframe(df_stats, top_k=config.data.category_top_k)
+                sample_rows = table_probe_sample_rows(
+                    file,
+                    configured_rows=config.data.table_profile_sample_rows,
+                    large_threshold_bytes=config.data.large_table_threshold_bytes,
+                )
+                fs.source_metadata["profile_sampling"] = table_sampling_metadata(
+                    file,
+                    configured_rows=config.data.table_profile_sample_rows,
+                    large_threshold_bytes=config.data.large_table_threshold_bytes,
+                    rows_read=len(df_stats),
+                )
+                if file.suffix.lower() in {".xlsx", ".xls"}:
+                    excel_profiles = profile_excel_sheets(
+                        file,
+                        max_rows=sample_rows,
+                        top_k=config.data.category_top_k,
+                        preview_rows=config.data.preview_rows,
+                        large_threshold_bytes=config.data.large_table_threshold_bytes,
+                        full_profile_sheet_threshold=10,
+                        representatives_per_group=config.data.pattern_sample_file_count,
+                    )
+                    fs.source_metadata["excel_sheet_profiles"] = excel_profiles
+                    fs.source_metadata["excel_sheet_groups"] = excel_sheet_groups_from_profiles(excel_profiles)
+                if sample_rows is not None:
+                    fs.warnings.append(f"字段统计基于前 {min(sample_rows, len(df_stats))} 行采样，未全量扫描。")
                 fs.column_profiles = [
                     {
-                        "name": p.name,
-                        "dtype": p.dtype,
-                        "null_ratio": p.null_ratio,
-                        "unique_count": p.unique_count,
-                        "numeric_stats": p.numeric_stats,
-                        "quantiles": p.quantiles,
-                        "datetime_stats": p.datetime_stats,
+                        **column_profile_to_dict(p),
+                        "top_values": p.top_values[:12],
+                        "value_pattern_hints": p.value_pattern_hints[:8],
                         "abnormal_tokens": p.abnormal_tokens[:8],
                     }
                     for p in prof
-                ][:120]
+                ]
                 fs.column_semantics = _guess_column_semantics(
                     columns=parsed.columns,
                     profiles=fs.column_profiles,
                     task_hint=task_hint,
                 )
+                fs.column_semantic_meta = _guess_semantic_meta(
+                    columns=parsed.columns,
+                    profiles=fs.column_profiles,
+                    semantics=fs.column_semantics,
+                    source="heuristic",
+                )
             except Exception as stats_exc:  # noqa: BLE001
                 fs.warnings.append(f"字段统计失败: {stats_exc}")
         if parsed.kind == "image":
             log_event(logger, "stage.P1.image", "ACTIVATED", file=rpath)
-            image_semantic = _infer_single_image_purpose(file, config)
+            image_semantic = _infer_single_image_purpose(file, config, llm_client=llm_client)
             if image_semantic:
                 fs.summary = f"{image_semantic} | {parsed.text_summary[:200]}"
                 log_event(logger, "stage.P1.image", "COMPLETED", file=rpath, semantic_summary=True)
             else:
                 log_event(logger, "stage.P1.image", "COMPLETED", file=rpath, semantic_summary=False)
-        if llm_client is not None and parsed.kind in {"table", "document", "structured_document", "archive"}:
+        _fill_deterministic_file_memory(fs, parsed.kind)
+        should_run_llm = _should_run_llm_file_cognition(
+            config=config,
+            parsed_kind=parsed.kind,
+            role=role,
+            relative_path=rpath,
+            metadata=parsed.metadata or {},
+            allow_hint=allow_llm_cognition,
+        )
+        if parsed.kind in {"table", "document", "structured_document", "archive"} and should_run_llm:
             log_event(logger, "agent.file_cognition", "CREATED", file=rpath, kind=parsed.kind)
             log_event(logger, "agent.file_cognition", "ACTIVATED", file=rpath)
-            fs_llm = llm_cognition_for_file(
-                cfg=config,
-                llm=llm_client,
-                prompt_mgr=prompt_mgr,
-                file_path=file,
-                relative_path=rpath,
-                parsed_kind=parsed.kind,
-                parsed_text_summary=parsed.text_summary,
-                parsed_columns=parsed.columns,
-                parsed_preview=parsed.preview,
-                task_hint=task_hint,
-            )
-            if fs_llm is not None:
-                base_columns = fs.columns[:]
-                base_warnings = fs.warnings[:]
-                base_semantics = dict(fs.column_semantics)
-                base_profiles = list(fs.column_profiles)
-                fs = fs_llm
-                if not fs.columns:
-                    fs.columns = base_columns
-                if not fs.source_metadata:
-                    fs.source_metadata = parsed.metadata or {}
-                if base_warnings:
-                    fs.warnings = list(dict.fromkeys((fs.warnings or []) + base_warnings))
-                if base_semantics:
-                    merged = dict(base_semantics)
-                    merged.update(fs.column_semantics or {})
-                    fs.column_semantics = merged
-                if base_profiles and not fs.column_profiles:
-                    fs.column_profiles = base_profiles
-                if not fs.summary:
-                    fs.summary = parsed.text_summary[:600]
+            try:
+                fs_llm = llm_cognition_for_file(
+                    cfg=config,
+                    llm=llm_client,
+                    prompt_mgr=prompt_mgr,
+                    file_path=file,
+                    relative_path=rpath,
+                    parsed_kind=parsed.kind,
+                    parsed_text_summary=parsed.text_summary,
+                    parsed_columns=parsed.columns,
+                    parsed_preview=parsed.preview,
+                    task_hint=task_hint,
+                    source_metadata=fs.source_metadata,
+                    column_profiles=fs.column_profiles,
+                    heuristic_field_semantics=fs.column_semantics,
+                )
+                if fs_llm is not None:
+                    base_columns = fs.columns[:]
+                    base_warnings = fs.warnings[:]
+                    base_semantics = dict(fs.column_semantics)
+                    base_profiles = list(fs.column_profiles)
+                    base_source_metadata = dict(fs.source_metadata or {})
+                    fs = fs_llm
+                    fs.source_metadata = {
+                        **(parsed.metadata or {}),
+                        **base_source_metadata,
+                        **(fs.source_metadata or {}),
+                    }
+                    if parsed.kind == "table" and base_columns:
+                        # Keep the full physical schema for data files. LLM key_columns are useful
+                        # for focus, but must not replace the complete field list consumed by AutoML.
+                        fs.columns = base_columns
+                    elif not fs.columns:
+                        fs.columns = base_columns
+                    if base_warnings:
+                        fs.warnings = list(dict.fromkeys((fs.warnings or []) + base_warnings))
+                    if base_semantics:
+                        merged = dict(base_semantics)
+                        merged.update(fs.column_semantics or {})
+                        fs.column_semantics = merged
+                    if not getattr(fs, "column_semantic_meta", None):
+                        fs.column_semantic_meta = {}
+                    if base_profiles:
+                        base_meta = _guess_semantic_meta(
+                            columns=base_columns,
+                            profiles=base_profiles,
+                            semantics=base_semantics,
+                            source="heuristic",
+                        )
+                        for k, v in base_meta.items():
+                            if k not in fs.column_semantic_meta:
+                                fs.column_semantic_meta[k] = v
+                    if base_profiles and not fs.column_profiles:
+                        fs.column_profiles = base_profiles
+                    if not fs.summary:
+                        fs.summary = parsed.text_summary[:600]
+            except Exception as llm_exc:  # noqa: BLE001
+                log_event(logger, "agent.file_cognition", "FAILED", file=rpath, error=str(llm_exc)[:180])
+                raise RuntimeError(f"LLM file cognition failed for {rpath}: {llm_exc}") from llm_exc
             log_event(logger, "agent.file_cognition", "COMPLETED", file=rpath)
+        elif parsed.kind in {"table", "document", "structured_document", "archive"}:
+            log_event(
+                logger,
+                "agent.file_cognition",
+                "SKIPPED",
+                file=rpath,
+                kind=parsed.kind,
+                reason="llm_file_cognition_mode",
+            )
         return {
             "rpath": rpath,
             "fs": fs,
@@ -1376,6 +2434,7 @@ def _infer_image_dir_purpose(
     dir_rel: str,
     sample_files: list[Path],
     config: AutoRealizeConfig,
+    llm_client: LLMClient | None = None,
 ) -> str:
     base_summary = (
         f"目录 `{dir_rel}` 含大量图片文件，推断为图像样本目录；"
@@ -1391,18 +2450,23 @@ def _infer_image_dir_purpose(
                 "text": "请用一句中文判断这些样本图像目录的用途（如训练集/测试集），不要输出冗余解释。",
             }
         ]
+        image_payload_chars = 0
         for p in sample_files[: config.vllm.max_images_per_dir]:
             mime = "image/jpeg"
             if p.suffix.lower() == ".png":
                 mime = "image/png"
             b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+            image_payload_chars += len(b64)
             user_content.append(
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"},
                 }
             )
-        resp = client.chat.completions.create(
+        t0 = time.perf_counter()
+        resp = _openai_create_with_network_retry(
+            client,
+            label="vllm_image_dir",
             model=config.vllm.model_name,
             messages=[
                 {"role": "system", "content": "你是数据集目录识别助手。"},
@@ -1410,6 +2474,33 @@ def _infer_image_dir_purpose(
             ],
             stream=False,
         )
+        if llm_client is not None:
+            choice = resp.choices[0] if getattr(resp, "choices", None) else None
+            llm_client._log_provider_usage(
+                prompt_name="vllm_image_dir",
+                mode="vision",
+                response=resp,
+                seconds=time.perf_counter() - t0,
+                finish_reason=str(getattr(choice, "finish_reason", "") or ""),
+                parsed_ok=True,
+                source="vllm_provider",
+                model_name=config.vllm.model_name,
+                prompt_parts=[
+                    {"name": "system_prompt", "role": "system", "content": "你是数据集目录识别助手。"},
+                    {
+                        "name": "user_text",
+                        "role": "user",
+                        "content": "请用一句中文判断这些样本图像目录的用途（如训练集/测试集），不要输出冗余解释。",
+                    },
+                    {
+                        "name": "image_payload_base64",
+                        "role": "user",
+                        "chars": image_payload_chars,
+                        "utf8_bytes": image_payload_chars,
+                        "estimated_tokens": max(1, image_payload_chars // 4),
+                    },
+                ],
+            )
         text = (resp.choices[0].message.content or "").strip()
         if text:
             return f"{base_summary} 视觉抽样结论: {text[:300]}"
@@ -1420,7 +2511,11 @@ def _infer_image_dir_purpose(
         return f"{base_summary} 视觉抽样失败: {exc}"
 
 
-def _infer_single_image_purpose(image_file: Path, config: AutoRealizeConfig) -> str:
+def _infer_single_image_purpose(
+    image_file: Path,
+    config: AutoRealizeConfig,
+    llm_client: LLMClient | None = None,
+) -> str:
     if not config.vllm.enabled:
         return ""
     try:
@@ -1436,7 +2531,10 @@ def _infer_single_image_purpose(image_file: Path, config: AutoRealizeConfig) -> 
         elif suffix == ".gif":
             mime = "image/gif"
         b64 = base64.b64encode(image_file.read_bytes()).decode("ascii")
-        resp = client.chat.completions.create(
+        t0 = time.perf_counter()
+        resp = _openai_create_with_network_retry(
+            client,
+            label="vllm_single_image",
             model=config.vllm.model_name,
             messages=[
                 {"role": "system", "content": "你是数据集图像语义识别助手。"},
@@ -1456,6 +2554,33 @@ def _infer_single_image_purpose(image_file: Path, config: AutoRealizeConfig) -> 
             ],
             stream=False,
         )
+        if llm_client is not None:
+            choice = resp.choices[0] if getattr(resp, "choices", None) else None
+            llm_client._log_provider_usage(
+                prompt_name="vllm_single_image",
+                mode="vision",
+                response=resp,
+                seconds=time.perf_counter() - t0,
+                finish_reason=str(getattr(choice, "finish_reason", "") or ""),
+                parsed_ok=True,
+                source="vllm_provider",
+                model_name=config.vllm.model_name,
+                prompt_parts=[
+                    {"name": "system_prompt", "role": "system", "content": "你是数据集图像语义识别助手。"},
+                    {
+                        "name": "user_text",
+                        "role": "user",
+                        "content": "请用一句中文描述这张图片在数据集中的语义用途，不要复述元数据。",
+                    },
+                    {
+                        "name": "image_payload_base64",
+                        "role": "user",
+                        "chars": len(b64),
+                        "utf8_bytes": len(b64),
+                        "estimated_tokens": max(1, len(b64) // 4),
+                    },
+                ],
+            )
         text = (resp.choices[0].message.content or "").strip()
         return text[:300]
     except Exception:  # noqa: BLE001
@@ -1471,29 +2596,46 @@ def _run_eval_reflector(
     original_text: str,
     task_hint: str,
     data_digest: str,
+    enable_fewshot: bool = False,
 ) -> tuple[str, list[str]]:
     """Low-context evaluation ambiguity reflection loop."""
     system = prompt_mgr.load("system/eval_reflector.md")
-    fewshot = prompt_mgr.load("fewshot/eval_ambiguity_fewshot.json")
+    fewshot = prompt_mgr.load("fewshot/eval_ambiguity_fewshot.json") if enable_fewshot else ""
     defects: list[str] = []
     current = desc
     for idx in range(2):
-        user = (
-            "璇峰彧鍩轰簬浠ヤ笅description鏂囨湰鍒ゆ柇璇勪及鍗忚鏄惁鏃犳涔夛細\n\n"
-            f"{current[:12000]}\n\n"
-            "输出严格JSON。"
+        stable, dynamic = stable_dynamic_prompt(
+            stable={
+                "instruction": (
+                    "请只基于 description 文本判断评估协议是否无歧义。输出严格 JSON；"
+                    "最多列 6 条 ambiguity_points 和 6 条 fixes，每条必须短句，不要展开长解释。"
+                )
+            },
+            dynamic={"description": current[:12000]},
+            stable_title="Stable evaluation ambiguity review rules",
+            dynamic_title="Dynamic description text",
         )
         try:
             review = llm_client.ask_structured(
                 model_cls=AmbiguityReview,
                 system_prompt=system,
-                user_prompt=user,
+                user_prompt=dynamic,
                 prompt_name=f"eval_reflector_{idx+1}",
                 fewshot=fewshot,
+                max_tokens=2000,
+                static_context_prompt=stable,
+                dynamic_user_prompt=dynamic,
             )
-        except Exception as exc:  # noqa: BLE001
-            defects.append(f"eval_reflector璋冪敤澶辫触: {exc}")
-            break
+        except RuntimeError as exc:
+            log_event(
+                logger,
+                "module.task_definition.eval_reflector",
+                "WARNING",
+                round=idx + 1,
+                error=str(exc)[:300],
+                fallback="keep_current_description",
+            )
+            return current, defects
         if review.is_unambiguous:
             break
         defects.extend(review.ambiguity_points)
@@ -1518,9 +2660,10 @@ def _run_eval_reflector(
 def _resolve_eval_ambiguity(
     desc: str,
     downstream_context: dict,
-    llm_client: LLMClient | None,
+    llm_client: LLMClient,
     prompt_mgr: PromptManager,
     data_root: Path,
+    enable_fewshot: bool = False,
 ) -> str:
     current = desc
     y_true_field = str(downstream_context.get("y_true_field", downstream_context.get("target_column", "target")))
@@ -1528,24 +2671,23 @@ def _resolve_eval_ambiguity(
     for _ in range(max_rounds):
         defects = eval_ambiguity_defects(current)
         if not defects:
-            logger.info("[P2-Reflect] 姝т箟妫€鏌ラ€氳繃")
+            logger.info("[P2-Reflect] 歧义检查通过")
             return current
-        logger.info("[P2-Reflect] 鍙戠幇姝т箟锛屽皾璇曚慨澶? %s", defects[:3])
-        # 鍏堝仛瑙勫垯鍖栦慨澶嶏紝淇濇寔鍙帶鍙鐜?
+        logger.info("[P2-Reflect] 发现评估歧义，尝试修复: %s", defects[:3])
+        # 先做规则化修复，保持可控可复现。
         patched = apply_eval_fixes(current, y_true_field=y_true_field)
         if patched != current:
             current = patched
             current = _enforce_existing_file_references(current, data_root)
             continue
-        # 瑙勫垯淇笉鍔ㄦ椂鍐嶅惎鐢ㄩ浂涓婁笅鏂囧弽鎬濇櫤鑳戒綋
-        if llm_client is None:
-            return current
+        # 规则修不动时必须启用低上下文反思智能体。
         reviewed = _run_eval_reflector_once(
             llm_client,
             prompt_mgr,
             current,
             downstream_context=downstream_context,
             y_true_field=y_true_field,
+            enable_fewshot=enable_fewshot,
         )
         if reviewed == current:
             return current
@@ -1559,21 +2701,42 @@ def _run_eval_reflector_once(
     desc: str,
     downstream_context: dict,
     y_true_field: str,
+    enable_fewshot: bool = False,
 ) -> str:
     system = prompt_mgr.load("system/eval_reflector.md")
-    fewshot = prompt_mgr.load("fewshot/eval_ambiguity_fewshot.json")
-    user = (
-        "鍙熀浜庝笅闈㈣繖浠?description 鏂囨湰鍋氭鏌ワ紝涓嶅厑璁稿紩鐢ㄤ换浣曞閮ㄤ笂涓嬫枃銆俓n"
-        "鑻ュ瓨鍦ㄦ涔夛紝璇疯緭鍑虹粨鏋勫寲淇寤鸿锛涜嫢鏃犳涔夛紝璇疯緭鍑?is_unambiguous=true銆俓n\n"
-        f"{desc[:12000]}"
+    fewshot = prompt_mgr.load("fewshot/eval_ambiguity_fewshot.json") if enable_fewshot else ""
+    stable, dynamic = stable_dynamic_prompt(
+        stable={
+            "instruction": (
+                "只基于 description 文本做检查，不允许引用任何外部上下文。"
+                "若存在歧义，请输出结构化修复建议；若无歧义，请输出 is_unambiguous=true。"
+                "最多列 6 条 ambiguity_points 和 6 条 fixes，每条必须短句。"
+            )
+        },
+        dynamic={"description": desc[:12000]},
+        stable_title="Stable single-pass evaluation reflection rules",
+        dynamic_title="Dynamic description text",
     )
-    review = llm_client.ask_structured(
-        model_cls=AmbiguityReview,
-        system_prompt=system,
-        user_prompt=user,
-        prompt_name="eval_reflector_once",
-        fewshot=fewshot,
-    )
+    try:
+        review = llm_client.ask_structured(
+            model_cls=AmbiguityReview,
+            system_prompt=system,
+            user_prompt=dynamic,
+            prompt_name="eval_reflector_once",
+            fewshot=fewshot,
+            max_tokens=2000,
+            static_context_prompt=stable,
+            dynamic_user_prompt=dynamic,
+        )
+    except RuntimeError as exc:
+        log_event(
+            logger,
+            "module.task_definition.eval_reflector",
+            "WARNING",
+            error=str(exc)[:300],
+            fallback="keep_current_description",
+        )
+        return desc
     if review.is_unambiguous or not review.fixes:
         return desc
     patched = apply_eval_fixes(desc, y_true_field=y_true_field)
@@ -1588,6 +2751,13 @@ def _run_eval_reflector_once(
 
 
 def _split_h2_sections(text: str) -> tuple[list[str], dict[str, str]]:
+    def canonical_header(raw: str) -> str:
+        header = re.sub(r"^\d+\.\s+", "", str(raw or "").strip())
+        for canonical, aliases in SECTION_ALIASES.items():
+            if header == canonical or header in aliases:
+                return canonical
+        return header
+
     lines = text.splitlines()
     order: list[str] = []
     sections: dict[str, str] = {}
@@ -1597,9 +2767,9 @@ def _split_h2_sections(text: str) -> tuple[list[str], dict[str, str]]:
     for line in lines:
         if line.startswith("## "):
             sections[current] = "\n".join(bucket).rstrip() + "\n"
-            current = line[3:].strip()
+            current = canonical_header(line[3:].strip())
             order.append(current)
-            bucket = [line]
+            bucket = [f"## {current}"]
         else:
             bucket.append(line)
     sections[current] = "\n".join(bucket).rstrip() + "\n"
@@ -1607,7 +2777,7 @@ def _split_h2_sections(text: str) -> tuple[list[str], dict[str, str]]:
 
 
 def _merge_mutable_sections(base_desc: str, rewritten_part: str) -> str:
-    mutable_headers = {"Task Definition", "Evaluation", "Submission Format"}
+    mutable_headers = {"任务定义", "评估协议", "输出或提交格式", "提交格式"}
     order_base, sections_base = _split_h2_sections(base_desc)
     _, sections_new = _split_h2_sections(rewritten_part)
     for h in mutable_headers:
@@ -1631,23 +2801,32 @@ def _rewrite_mutable_sections_with_llm(
     _ = order
     mutable_now = "\n\n".join(
         [
-            sections.get("Task Definition", ""),
-            sections.get("Evaluation", ""),
-            sections.get("Submission Format", ""),
+            sections.get("任务定义", ""),
+            sections.get("评估协议", ""),
+            sections.get("输出或提交格式", "") or sections.get("提交格式", ""),
         ]
     ).strip()
     system = prompt_mgr.load("system/description_section_rewriter.md")
-    user = (
-        f"当前可变区块:\n{mutable_now[:12000]}\n\n"
-        f"缺陷清单:\n{json.dumps(defects, ensure_ascii=False)}\n\n"
-        f"约束上下文:\n{json.dumps(downstream_context, ensure_ascii=False)[:3000]}\n\n"
-        "你不得引用不存在的文件名；若未识别预测文件，必须明确写“未提供独立预测文件，由训练数据切分验证”。\n"
-        "只输出三个二级章节：Task Definition / Evaluation / Submission Format。"
+    stable, dynamic = stable_dynamic_prompt(
+        stable={
+            "rules": [
+                "你不得引用不存在的文件名；若未识别预测文件，必须明确写“未提供独立预测文件，由训练数据切分验证”。",
+                "只输出三个二级章节：任务定义 / 评估协议 / 输出或提交格式。",
+                "不要输出反思过程、审查日志、Contract Status、issues/fixes、ambiguity_points 等中间过程。",
+            ],
+            "constraint_context": downstream_context,
+        },
+        dynamic={"mutable_sections": mutable_now[:12000], "defects": defects},
+        stable_title="Stable mutable section rewrite rules",
+        dynamic_title="Dynamic mutable sections and defects",
+        stable_limit=6000,
     )
     rewritten_part = llm_client.ask_text(
         system_prompt=system,
-        user_prompt=user,
+        user_prompt=dynamic,
         prompt_name=prompt_name,
+        static_user_prompt=stable,
+        dynamic_user_prompt=dynamic,
     )
     merged = _merge_mutable_sections(base_desc, rewritten_part)
     return merged
@@ -1715,6 +2894,11 @@ def _maybe_generate_predict_split(data_root: Path, downstream_context: dict, cfg
             json_flatten_sep=cfg.data.json_flatten_sep,
             json_flatten_max_level=cfg.data.json_flatten_max_level,
             json_keep_raw_nested_columns=cfg.data.json_keep_raw_nested_columns,
+            max_rows=table_probe_sample_rows(
+                train_path,
+                configured_rows=cfg.data.table_profile_sample_rows,
+                large_threshold_bytes=cfg.data.large_table_threshold_bytes,
+            ),
         )
     except Exception:
         return
@@ -1729,12 +2913,12 @@ def _maybe_generate_predict_split(data_root: Path, downstream_context: dict, cfg
             break
     log_event(logger, "agent.predict_split_generator", "CREATED", train_table=train_name)
     log_event(logger, "agent.predict_split_generator", "ACTIVATED", train_table=train_name)
-    generator = PredictSplitGeneratorGroundAgent(cfg)
-    out = generator.generate(
+    out = _generate_predict_split_dataframe(
         train_df=out,
         task_type=task_type,
         target_col=target_col,
         time_col=time_col,
+        cfg=cfg,
     )
     out_name = f"{Path(train_name).stem}__predict_split.csv"
     out_path = data_root / out_name
@@ -1746,4 +2930,31 @@ def _maybe_generate_predict_split(data_root: Path, downstream_context: dict, cfg
         file=out_name,
         rows=int(len(out)),
     )
+
+
+def _generate_predict_split_dataframe(
+    *,
+    train_df: pd.DataFrame,
+    task_type: str,
+    target_col: str,
+    time_col: str,
+    cfg: AutoRealizeConfig,
+) -> pd.DataFrame:
+    """Generate a lightweight prediction split from the inferred training table."""
+    out = train_df.copy()
+    tt = (task_type or "").lower()
+    if "time_series" in tt and time_col and time_col in out.columns:
+        dt = pd.to_datetime(out[time_col], errors="coerce")
+        valid = dt.notna()
+        if valid.any():
+            max_day = dt[valid].max()
+            min_keep = max_day - pd.Timedelta(days=max(1, int(cfg.data.generated_predict_horizon_days)))
+            out = out[dt >= min_keep].copy()
+    else:
+        ratio = float(cfg.data.generated_predict_split_ratio)
+        n = max(1, int(len(out) * ratio))
+        out = out.tail(n).copy()
+    if target_col and target_col in out.columns:
+        out[target_col] = pd.NA
+    return out
 

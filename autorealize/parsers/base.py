@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +16,7 @@ class ParsedFile:
 
 
 class BaseParser:
-    """解析器基类。"""
+    """Parser base class."""
 
     supported_suffixes: tuple[str, ...] = ()
     kind: str = "unknown"

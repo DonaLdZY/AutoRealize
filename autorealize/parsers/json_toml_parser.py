@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -40,6 +40,52 @@ def _collect_json_paths(obj: Any, prefix: str = "", out: set[str] | None = None,
     return out
 
 
+def _schema_keys(obj: Any, *, max_depth: int = 2, prefix: str = "") -> set[str]:
+    if max_depth < 0:
+        return set()
+    if isinstance(obj, dict):
+        out: set[str] = set()
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.add(key)
+            out.update(_schema_keys(v, max_depth=max_depth - 1, prefix=key))
+        return out
+    if isinstance(obj, list):
+        list_path = f"{prefix}[]" if prefix else "[]"
+        out = {list_path}
+        for item in obj[:3]:
+            out.update(_schema_keys(item, max_depth=max_depth - 1, prefix=list_path))
+        return out
+    return {prefix} if prefix else set()
+
+
+def _first_level_samples(data: Any, *, limit: int = 8) -> list[Any]:
+    if isinstance(data, list):
+        return data[:limit]
+    if isinstance(data, dict):
+        list_values = [v for v in data.values() if isinstance(v, list) and v]
+        if list_values:
+            return max(list_values, key=len)[:limit]
+        return list(data.values())[:limit]
+    return [data]
+
+
+def _schema_similarity(samples: list[Any]) -> dict[str, Any]:
+    schemas = [sorted(_schema_keys(item)) for item in samples]
+    sets = [set(x) for x in schemas if x]
+    if len(sets) <= 1:
+        score = 1.0 if sets else 0.0
+    else:
+        union = set.union(*sets)
+        intersection = set.intersection(*sets)
+        score = round(len(intersection) / max(1, len(union)), 6)
+    return {
+        "sample_count": len(samples),
+        "schema_similarity": score,
+        "schema_samples": schemas[:5],
+    }
+
+
 class JsonParser(BaseParser):
     supported_suffixes = (".json",)
     kind = "structured_document"
@@ -49,13 +95,16 @@ class JsonParser(BaseParser):
         flatten_sep: str = "__",
         flatten_max_level: int | None = None,
         keep_raw_nested_columns: bool = False,
+        preview_rows: int = 10,
     ) -> None:
         self.flatten_sep = flatten_sep
         self.flatten_max_level = flatten_max_level
         self.keep_raw_nested_columns = keep_raw_nested_columns
+        self.preview_rows = max(1, int(preview_rows))
 
     def parse(self, path: Path) -> ParsedFile:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        schema_meta = _schema_similarity(_first_level_samples(data))
         df, meta = read_json_as_table(
             path,
             sep=self.flatten_sep,
@@ -63,11 +112,11 @@ class JsonParser(BaseParser):
             keep_raw_nested_columns=self.keep_raw_nested_columns,
         )
         if meta.get("tabular_candidate"):
-            preview = df.head(20).to_dict(orient="records")
+            preview = df.head(self.preview_rows).to_dict(orient="records")
             return ParsedFile(
                 path=path,
                 kind="table",
-                text_summary=f"JSON表格候选: {meta.get('strategy')} | {df.shape[0]} x {df.shape[1]}",
+                text_summary=f"JSON 可表格化: {meta.get('strategy')} | {df.shape[0]} x {df.shape[1]}",
                 preview=preview,
                 columns=[str(c) for c in df.columns.tolist()],
                 metadata={
@@ -75,6 +124,8 @@ class JsonParser(BaseParser):
                     "dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
                     "json_strategy": meta.get("strategy", ""),
                     "json_root_type": meta.get("root_type", ""),
+                    "json_first_level_schema": schema_meta,
+                    "preview_rows_used": int(min(self.preview_rows, len(df))),
                     "source_format": "json",
                 },
             )
@@ -86,6 +137,7 @@ class JsonParser(BaseParser):
                 "type": type(data).__name__,
                 "json_root_type": type(data).__name__,
                 "json_paths_topk": sorted(list(_collect_json_paths(data)))[:60],
+                "json_first_level_schema": schema_meta,
                 "source_format": "json",
             },
         )

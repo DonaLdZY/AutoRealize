@@ -17,12 +17,18 @@ def build_registry(config: AutoRealizeConfig) -> ParserRegistry:
     registry.register(TextParser(encodings=config.data.text_encodings))
     registry.register(DocxParser())
     registry.register(PdfParser())
-    registry.register(TableParser(preview_rows=config.data.preview_rows))
+    registry.register(
+        TableParser(
+            preview_rows=config.data.preview_rows,
+            sample_rows=config.data.table_profile_sample_rows,
+        )
+    )
     registry.register(
         JsonParser(
             flatten_sep=config.data.json_flatten_sep,
             flatten_max_level=config.data.json_flatten_max_level,
             keep_raw_nested_columns=config.data.json_keep_raw_nested_columns,
+            preview_rows=config.data.preview_rows,
         )
     )
     registry.register(TomlParser())
