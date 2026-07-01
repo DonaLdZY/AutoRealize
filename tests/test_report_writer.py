@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 
 from autorealize.config import AutoRealizeConfig
 from autorealize.models import DescriptionProtocolBundle, EvaluationContractReview, FileRole, FileSummary
@@ -7,6 +7,7 @@ from autorealize.report_writer import (
     apply_evaluation_contract,
     build_automl_context_pack,
     build_data_access_protocol,
+    build_data_schema_contract,
     coverage_defects,
     description_quality_check,
     description_protocol_bundle_defects,
@@ -178,6 +179,74 @@ def test_repeated_structured_files_are_grouped_in_description() -> None:
     assert text.index("## 任务定义") < text.index("## 数据与读取方式")
     assert text.rfind("## 数据与读取方式") > text.rfind("## 关键约束与注意事项")
 
+
+def test_repeated_file_description_lists_common_and_variant_fields() -> None:
+    files = [
+        FileSummary(
+            path="contracts/承运商01成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table A",
+            columns=["lane", "vehicle_type", "cost", "settlement_code"],
+        ),
+        FileSummary(
+            path="contracts/承运商02成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table B",
+            columns=["lane", "vehicle_type", "cost", "carrier_code"],
+        ),
+        FileSummary(
+            path="contracts/承运商03成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table C",
+            columns=["lane", "vehicle_type", "cost", "region_code"],
+        ),
+    ]
+    bundle = DescriptionProtocolBundle(
+        problem_paradigm="static_optimization",
+        overview="assign orders to carriers",
+        data_access=build_data_access_protocol(files),
+        optimization={"objective": "minimize cost", "solution_representation": "assignment table"},
+    )
+
+    text = render_description_protocol_markdown(bundle, files)
+
+    assert "同组共通字段" in text
+    assert "`lane`" in text
+    assert "同组差异字段" in text
+    assert "settlement_code" in text
+    assert "carrier_code" in text
+
+
+def test_schema_contract_marks_group_union_and_variant_fields() -> None:
+    files = [
+        FileSummary(
+            path="contracts/承运商01成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table A",
+            columns=["lane", "vehicle_type", "cost", "settlement_code"],
+        ),
+        FileSummary(
+            path="contracts/承运商02成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table B",
+            columns=["lane", "vehicle_type", "cost", "carrier_code"],
+        ),
+        FileSummary(
+            path="contracts/承运商03成本.csv",
+            role=FileRole.raw_data_table,
+            summary="contract table C",
+            columns=["lane", "vehicle_type", "cost", "region_code"],
+        ),
+    ]
+
+    contract = build_data_schema_contract(files)
+    table = contract["tables"][0]
+    group = table["schema_group"]
+
+    assert "settlement_code" in table["physical_columns_exact"]
+    assert group["shared_physical_columns_exact"] == ["lane", "vehicle_type", "cost"]
+    assert group["column_variant_count"] == 3
+    assert any(row["fields"] == ["settlement_code"] for row in group["variant_fields_by_file"])
 
 def test_repeated_structured_file_fields_are_group_level_not_sample_constants() -> None:
     carrier_ids = ["BZWL01", "fsd", "fy"]
@@ -697,6 +766,49 @@ def test_automl_context_pack_renders_data_access_and_scalar_score() -> None:
     assert "pd.read_excel(path)" in text
 
 
+def test_automl_context_renders_entity_alias_candidates_as_unconfirmed() -> None:
+    files = [
+        FileSummary(
+            path="contracts.xlsx",
+            role=FileRole.raw_data_table,
+            summary="成本合同表。",
+            columns=[],
+            source_metadata={
+                "excel_sheet_profiles": [
+                    {
+                        "sheet_name": "承运商成本合同表",
+                        "shape": [6, 5],
+                        "columns": ["结算方代码", "结算方名称", "起点", "终点", "车型"],
+                    }
+                ]
+            },
+        ),
+        FileSummary(
+            path="vehicles.xlsx",
+            role=FileRole.raw_data_table,
+            summary="每日车辆表。",
+            columns=["承运商代码", "承运商名称", "车型"],
+            source_metadata={"shape": [4, 3]},
+        ),
+    ]
+    bundle = DescriptionProtocolBundle(
+        problem_paradigm="static_optimization",
+        overview="验证合同和车辆可行性。",
+        task_goal="在合同线路覆盖下分配车辆。",
+        data_access=build_data_access_protocol(files),
+    )
+
+    pack = build_automl_context_pack(bundle, files)
+    text = render_automl_context_markdown(pack)
+
+    assert "## Entity Alias Candidates" in text
+    assert "not confirmed equivalent keys" in text
+    assert "candidate_not_equivalent" in text
+    assert "结算方代码" in text
+    assert "承运商代码" in text
+    assert "recommended_qdi_checks" in text
+
+
 def test_apply_evaluation_contract_allows_evidence_gap_with_explicit_fixes() -> None:
     contract = EvaluationContractReview(
         passed=False,
@@ -740,3 +852,5 @@ def test_finalize_description_removes_internal_process_sections() -> None:
     assert "## 输出或提交格式" in cleaned
     assert "Output Layout" not in cleaned
     assert "Contract Status" not in cleaned
+
+

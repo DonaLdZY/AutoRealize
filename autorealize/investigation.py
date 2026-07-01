@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ast
 import json
@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 
 from .config import AutoRealizeConfig
+from .context_compiler import ArtifactStore, build_qdi_context_and_details, compact_detail_table_card_for_prompt
 from .logging_utils import log_event
 from .models import (
     InvestigationStepResult,
@@ -72,6 +73,7 @@ def run_question_investigator(
             constraint_memory=constraint_memory,
             authoritative_memory=authoritative_memory,
             knowledge_base=knowledge_base,
+            report_dir=report_dir,
         )
     except Exception as exc:  # noqa: BLE001
         log_event(logger, "module.data_cognition.investigator", "FAILED", error=str(exc)[:240])
@@ -104,11 +106,13 @@ def _run_question_investigator_inner(
     constraint_memory: dict,
     authoritative_memory: dict,
     knowledge_base: dict,
+    report_dir: Path | None = None,
 ) -> dict[str, Any]:
     log_event(logger, "module.data_cognition.investigator", "ACTIVATED")
     planner_prompt = prompt_mgr.load("system/question_investigator_planner.md")
     answerer_prompt = prompt_mgr.load("system/question_investigator_answerer.md")
-    context = _build_investigation_context(
+    artifact_store = ArtifactStore((report_dir or data_root) / "context_artifacts")
+    context, table_card_details = _build_investigation_context(
         cfg=cfg,
         data_root=data_root,
         task_hint=task_hint,
@@ -117,6 +121,7 @@ def _run_question_investigator_inner(
         constraint_memory=constraint_memory,
         authoritative_memory=authoritative_memory,
         knowledge_base=knowledge_base,
+        artifact_store=artifact_store,
     )
     tools = CrossFileInvestigationTools(
         cfg=cfg,
@@ -165,7 +170,26 @@ def _run_question_investigator_inner(
         static_context_prompt=stable,
         dynamic_user_prompt=dynamic,
     )
-    for q in (plan.questions or [])[:max_total_questions]:
+    for q in _entity_alias_verification_questions(context):
+        qid = _add_question_record(
+            question=q,
+            all_questions=all_questions,
+            question_records=question_records,
+            queue=queue,
+            parent_question_id="",
+            depth=0,
+            max_total_questions=max_total_questions,
+        )
+        if qid:
+            log_event(
+                logger,
+                "module.data_cognition.investigator",
+                "AUTO_ENTITY_ALIAS_QUESTION_QUEUED",
+                question_id=qid,
+                depth=0,
+            )
+
+    for q in (plan.questions or [])[: max(0, max_total_questions - len(question_records))]:
         qid = _add_question_record(
             question=q,
             all_questions=all_questions,
@@ -208,12 +232,15 @@ def _run_question_investigator_inner(
         current_result: InvestigationStepResult | None = None
         current_request: InvestigationToolRequest | None = None
         scripts_for_question = 0
+        context_retrievals_for_question = 0
+        retrieved_context: list[dict[str, Any]] = []
 
         for action_round in range(1, max_actions_per_question + 1):
             available_actions = _available_qdi_actions(
                 question_records=question_records,
                 current_record=record,
                 scripts_for_question=scripts_for_question,
+                context_retrievals_for_question=context_retrievals_for_question,
                 total_scripts=len(all_requests),
                 max_scripts_per_question=max_scripts_per_question,
                 max_scripts_total=max_scripts_total,
@@ -226,7 +253,7 @@ def _run_question_investigator_inner(
                 stable=context,
                 dynamic={
                     "instruction": (
-                        "基于当前证据回答、继续探查或标记未解决。如要提出新脚本继续探查，旧结果将不可见，"
+                        "基于当前证据回答、继续探查或标记未解决。如要提出新脚本继续探查，旧结果将不可见；"
                         f"生成新脚本时请包含旧脚本内容或重新计算所需旧结论，并且注意最大可见输出是 {max_output_chars} 字符，超出会被截断。"
                         "只能基于 current_visible_output 和截断元信息判断脚本结果；不要根据未显示输出做推断。"
                     ),
@@ -238,7 +265,19 @@ def _run_question_investigator_inner(
                     "max_output_len": max_output_chars,
                     "question_records": _question_records_for_prompt(question_records),
                     "current_question": record,
-                    "current_script_evidence": _current_script_evidence(current_request, current_result, max_output_chars),
+                    "retrieved_context": retrieved_context[-2:],
+                    "current_table_card_details": [],
+                    "context_retrieval_policy": (
+                        "Stable table_cards are route-only manifests. If field meanings, field statistics, "
+                        "reading notes, warnings, or sheet details are needed, choose "
+                        "request_context; the retrieved excerpt will appear in retrieved_context on the next turn."
+                    ),
+                    "current_script_evidence": _current_script_evidence(
+                        current_request,
+                        current_result,
+                        max_output_chars,
+                        artifact_store=artifact_store,
+                    ),
                     "action_round": action_round,
                     "action_policy": {
                         "do_not_add_duplicate_questions": True,
@@ -351,6 +390,26 @@ def _run_question_investigator_inner(
                     unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
                 break
 
+            if action_name == "request_context":
+                req_ctx = action.request_context
+                req_ctx.question_id = req_ctx.question_id or qid
+                retrieved = _retrieve_qdi_context_excerpt(
+                    context=context,
+                    table_card_details=table_card_details,
+                    question_record=record,
+                    request=req_ctx,
+                    max_cards=2,
+                )
+                retrieved_context.append(
+                    {
+                        "request": req_ctx.model_dump(),
+                        "cards": retrieved,
+                        "retrieval_policy": "Local deterministic context retrieval; this does not execute data scripts.",
+                    }
+                )
+                context_retrievals_for_question += 1
+                continue
+
             if action_name == "request_script":
                 script_req = action.request_script
                 script_req.question_id = script_req.question_id or qid
@@ -385,7 +444,9 @@ def _run_question_investigator_inner(
                     prompt_mgr=prompt_mgr,
                     cfg=cfg,
                     context=context,
+                    table_card_details=table_card_details,
                     previous_questions=_question_records_for_prompt(question_records),
+                    artifact_store=artifact_store,
                 )
                 current_request = final_req
                 all_results.extend(attempt_results)
@@ -445,7 +506,9 @@ def _execute_request_with_repair(
     prompt_mgr: Any,
     cfg: AutoRealizeConfig,
     context: dict[str, Any],
+    table_card_details: dict[str, dict[str, Any]] | None = None,
     previous_questions: list[dict[str, Any]] | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[list[InvestigationStepResult], InvestigationToolRequest]:
     max_retries = max(0, int(getattr(cfg.investigation, "custom_python_max_retries", 3)))
     results: list[InvestigationStepResult] = []
@@ -463,7 +526,11 @@ def _execute_request_with_repair(
         try:
             stable, dynamic = stable_dynamic_prompt(
                 stable={
-                    "context": context,
+                    "context": _build_script_repair_context(
+                        context=context,
+                        request=current,
+                        table_card_details=table_card_details or {},
+                    ),
                     "script_contract": {
                         "function": "def analyze(input_dir: str, scratch_dir: str) -> dict",
                         "input_dir": "read-only",
@@ -495,7 +562,7 @@ def _execute_request_with_repair(
                     "question_id": current.question_id,
                     "question": _question_text(previous_questions or [], current.question_id),
                     "previous_request": current.custom_python.model_dump(),
-                    "failed_result": result.model_dump(),
+                    "failed_result": _failed_result_for_prompt(result, artifact_store=artifact_store),
                     "repair_instruction": "Return a corrected ReadonlyPythonRequest. Keep the same question_id and only change python_code/input_files/expected_output if needed.",
                 },
                 stable_title="Stable read-only script repair context",
@@ -593,11 +660,95 @@ def _norm_question(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "").strip().lower())
 
 
+def _entity_alias_verification_questions(context: dict[str, Any]) -> list[InvestigationQuestion]:
+    """Queue deterministic QDI checks for candidate entity aliases.
+
+    These questions intentionally ask for evidence instead of asserting that
+    similarly named business fields are interchangeable keys.
+    """
+    groups = context.get("entity_alias_candidates") if isinstance(context, dict) else []
+    if not isinstance(groups, list):
+        return []
+
+    out: list[InvestigationQuestion] = []
+    for group in groups[:6]:
+        if not isinstance(group, dict):
+            continue
+        raw_fields = group.get("candidate_fields")
+        fields = [item for item in raw_fields if isinstance(item, dict)] if isinstance(raw_fields, list) else []
+        alias_families = {
+            str(item.get("alias_family", "")).strip()
+            for item in fields
+            if str(item.get("alias_family", "")).strip()
+        }
+        value_kinds = {
+            str(item.get("value_kind", "")).strip()
+            for item in fields
+            if str(item.get("value_kind", "")).strip()
+        }
+        if len(fields) < 2 or len(alias_families) < 2:
+            continue
+
+        candidate_files = _dedupe_qdi_strings(
+            [str(item.get("source_file", "")) for item in fields],
+            limit=12,
+        )
+        field_refs = []
+        for item in fields[:16]:
+            source = str(item.get("source_file", "") or "").strip()
+            field = str(item.get("field", "") or "").strip()
+            if not source or not field:
+                continue
+            sheet = str(item.get("sheet_name", "") or "").strip()
+            table_ref = f"{source}::{sheet}" if sheet else source
+            field_refs.append(f"{table_ref}.{field}")
+        label = str(group.get("label") or "实体别名候选字段").strip()
+        concept_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(group.get("concept_id") or len(out) + 1)).strip("_")
+        question_id = f"auto_entity_alias_{concept_id or len(out) + 1}"
+        out.append(
+            InvestigationQuestion(
+                question_id=question_id,
+                question=(
+                    f"验证 `{label}` 是否可以作为同一实体键使用：对候选字段 "
+                    f"{'、'.join(field_refs) if field_refs else '见 entity_alias_candidates'} "
+                    "分别统计非空数量、唯一值数量、两两唯一值交集、left/right coverage 和 join coverage。"
+                    "特别检查成本/合同侧字段能否覆盖车辆、订单或资源侧字段；如果存在起点、终点、车型、线路或成本字段，"
+                    "进一步检查线路/车型/成本可行性覆盖率。不要预设这些字段等价；覆盖率不足时记录未确认映射、"
+                    "无可用合同线路或需要人工确认的原因。"
+                ),
+                category="join_key",
+                why_blocking=(
+                    "承运商代码、结算方代码、承运商名称、结算方名称这类字段可能指向同一业务实体，"
+                    "也可能只是承运主体/结算主体的候选别名；错误等价会直接导致合同线路覆盖率、"
+                    "可行车辆池、动作 mask 和优化评分错误。"
+                ),
+                candidate_files=candidate_files,
+                priority="high" if "code" in value_kinds else "medium",
+            )
+        )
+    return out
+
+
+def _dedupe_qdi_strings(values: list[str], *, limit: int = 12) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _available_qdi_actions(
     *,
     question_records: dict[str, dict[str, Any]],
     current_record: dict[str, Any],
     scripts_for_question: int,
+    context_retrievals_for_question: int,
     total_scripts: int,
     max_scripts_per_question: int,
     max_scripts_total: int,
@@ -607,6 +758,8 @@ def _available_qdi_actions(
     allow_custom_readonly_python: bool,
 ) -> list[str]:
     actions = ["answer", "give_up", "refine_current_question", "mark_duplicate"]
+    if context_retrievals_for_question < 2:
+        actions.insert(1, "request_context")
     if allow_custom_readonly_python and scripts_for_question < max_scripts_per_question and total_scripts < max_scripts_total:
         actions.insert(1, "request_script")
     depth = int(current_record.get("depth", 0) or 0)
@@ -648,11 +801,22 @@ def _current_script_evidence(
     request: InvestigationToolRequest | None,
     result: InvestigationStepResult | None,
     max_output_chars: int,
+    *,
+    artifact_store: ArtifactStore | None = None,
 ) -> dict[str, Any]:
     if request is None and result is None:
         return {}
     payload = result.model_dump() if result is not None else {}
     visible = _visible_output_payload(payload.get("result", {}), max_output_chars)
+    artifact_ref = {}
+    if result is not None and artifact_store is not None:
+        artifact_ref = artifact_store.put(
+            "qdi_script_output_full",
+            f"{result.question_id}:{result.request_id}",
+            payload.get("result", {}),
+            visible_excerpt=visible["current_visible_output"],
+            visible_limit=max_output_chars,
+        )
     return {
         "current_script": request.custom_python.model_dump() if request is not None else {},
         "status": payload.get("status", ""),
@@ -662,6 +826,7 @@ def _current_script_evidence(
         "max_output_len": max_output_chars,
         "original_output_chars": visible["original_output_chars"],
         "visible_output_chars": visible["visible_output_chars"],
+        "current_output_artifact": artifact_ref,
         "instruction": "若输出被截断，不能根据未显示内容做反向推断；如需更多证据，必须生成更聚焦的新脚本。",
     }
 
@@ -676,6 +841,280 @@ def _visible_output_payload(value: Any, max_output_chars: int) -> dict[str, Any]
         "original_output_chars": len(text),
         "visible_output_chars": len(visible),
     }
+
+
+def _build_script_repair_context(
+    context: dict[str, Any],
+    request: InvestigationToolRequest,
+    table_card_details: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    files = context.get("table_cards", []) if isinstance(context.get("table_cards"), list) else []
+    relations = context.get("relations", []) if isinstance(context.get("relations"), list) else []
+    wanted_files = {str(x).strip() for x in (request.custom_python.input_files or []) if str(x).strip()}
+    wanted_cols = {str(x).strip() for x in (request.custom_python.focus_columns or []) if str(x).strip()}
+    wanted_sheets = {str(x).strip() for x in (request.custom_python.focus_sheets or []) if str(x).strip()}
+    related_cards = _select_related_table_cards(
+        files,
+        table_card_details or {},
+        wanted_files=wanted_files,
+        wanted_cols=wanted_cols,
+        wanted_sheets=wanted_sheets,
+        question_text="",
+        max_cards=12,
+    )
+    related_relations = []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        if (
+            str(rel.get("left_file", "")) in wanted_files
+            or str(rel.get("right_file", "")) in wanted_files
+            or str(rel.get("left_field", "")) in wanted_cols
+            or str(rel.get("right_field", "")) in wanted_cols
+        ):
+            related_relations.append(rel)
+        if len(related_relations) >= 16:
+            break
+    return {
+        "context_policy": context.get("context_policy", {}),
+        "table_card_details": related_cards[:12],
+        "relation_cards": related_relations[:16],
+        "authoritative_memory": context.get("authoritative_memory", {}),
+        "constraint_memory": context.get("constraint_memory", {}),
+        "script_investigation_policy": context.get("script_investigation_policy", {}),
+    }
+
+
+def _related_table_card_details_for_prompt(
+    *,
+    context: dict[str, Any],
+    table_card_details: dict[str, dict[str, Any]],
+    question_record: dict[str, Any],
+    request: InvestigationToolRequest | None,
+    max_cards: int = 8,
+) -> list[dict[str, Any]]:
+    if max_cards <= 0:
+        return []
+    table_index = context.get("table_cards", []) if isinstance(context.get("table_cards"), list) else []
+    candidate_files = {
+        str(x).strip()
+        for x in (question_record.get("candidate_files", []) or [])
+        if str(x).strip()
+    }
+    wanted_cols: set[str] = set()
+    wanted_sheets: set[str] = set()
+    if request is not None and request.custom_python is not None:
+        candidate_files.update(
+            str(x).strip()
+            for x in (request.custom_python.input_files or [])
+            if str(x).strip()
+        )
+        wanted_cols.update(
+            str(x).strip()
+            for x in (request.custom_python.focus_columns or [])
+            if str(x).strip()
+        )
+        wanted_sheets.update(
+            str(x).strip()
+            for x in (request.custom_python.focus_sheets or [])
+            if str(x).strip()
+        )
+    return _select_related_table_cards(
+        table_index,
+        table_card_details,
+        wanted_files=candidate_files,
+        wanted_cols=wanted_cols,
+        wanted_sheets=wanted_sheets,
+        question_text=str(question_record.get("question", "") or ""),
+        max_cards=max_cards,
+    )
+
+
+def _retrieve_qdi_context_excerpt(
+    *,
+    context: dict[str, Any],
+    table_card_details: dict[str, dict[str, Any]],
+    question_record: dict[str, Any],
+    request: Any,
+    max_cards: int,
+) -> list[dict[str, Any]]:
+    candidate_files = {
+        str(x).strip()
+        for x in (getattr(request, "input_files", []) or [])
+        if str(x).strip()
+    }
+    wanted_cols = {
+        str(x).strip()
+        for x in (getattr(request, "focus_columns", []) or [])
+        if str(x).strip()
+    }
+    wanted_sheets = {
+        str(x).strip()
+        for x in (getattr(request, "focus_sheets", []) or [])
+        if str(x).strip()
+    }
+    explicit_table_ids = [
+        str(x).strip()
+        for x in (getattr(request, "table_ids", []) or [])
+        if str(x).strip()
+    ]
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for table_id in explicit_table_ids:
+        card = table_card_details.get(table_id)
+        if isinstance(card, dict):
+            selected.append(_detail_card_for_prompt(card))
+            seen.add(table_id)
+        if len(selected) >= max_cards:
+            return selected
+    if selected:
+        return selected
+    table_index = context.get("table_cards", []) if isinstance(context.get("table_cards"), list) else []
+    return _select_related_table_cards(
+        table_index,
+        table_card_details,
+        wanted_files=candidate_files,
+        wanted_cols=wanted_cols,
+        wanted_sheets=wanted_sheets,
+        question_text=" ".join(
+            [
+                str(question_record.get("question", "") or ""),
+                str(getattr(request, "query", "") or ""),
+                str(getattr(request, "reason", "") or ""),
+            ]
+        ),
+        max_cards=max_cards,
+    )
+
+
+def _select_related_table_cards(
+    table_index: list[Any],
+    table_card_details: dict[str, dict[str, Any]],
+    *,
+    wanted_files: set[str],
+    wanted_cols: set[str],
+    wanted_sheets: set[str],
+    question_text: str,
+    max_cards: int,
+) -> list[dict[str, Any]]:
+    scored: list[tuple[int, str]] = []
+    qtext = _norm_match_text(question_text)
+    wanted_files_norm = {_norm_match_text(x) for x in wanted_files if x}
+    wanted_cols_norm = {_norm_match_text(x) for x in wanted_cols if x}
+    wanted_sheets_norm = {_norm_match_text(x) for x in wanted_sheets if x}
+
+    def score_item(item: dict[str, Any]) -> tuple[int, str] | None:
+        if not isinstance(item, dict):
+            return None
+        table_id = str(item.get("table_id", "") or item.get("source_file", "") or "")
+        if not table_id or table_id.startswith("__omitted_"):
+            return None
+        source = str(item.get("source_file", "") or "")
+        sheet_name = str(item.get("sheet_name", "") or "")
+        fields = item.get("fields", []) if isinstance(item.get("fields"), list) else []
+        if not fields and isinstance(item.get("field_index"), list):
+            fields = item.get("field_index", [])
+        field_names = [str(x.get("name", "")) for x in fields if isinstance(x, dict)]
+        if isinstance(item.get("field_hints"), list):
+            field_names.extend(str(x) for x in item.get("field_hints", []) if str(x).strip())
+        haystack_parts = [table_id, source, sheet_name, str(item.get("file_cognition", ""))]
+        haystack_parts.extend(field_names)
+        haystack = _norm_match_text(" ".join(haystack_parts))
+        field_norms = {_norm_match_text(x) for x in field_names if x}
+        score = 0
+        for target in wanted_files_norm:
+            if target and (target in haystack or haystack in target):
+                score += 100
+        for target in wanted_sheets_norm:
+            if target and target in _norm_match_text(sheet_name):
+                score += 80
+        for target in wanted_cols_norm:
+            if target and target in field_norms:
+                score += 70
+        if qtext:
+            for token in _match_tokens(qtext):
+                if token in haystack:
+                    score += 6
+        if not wanted_files and not wanted_cols and not wanted_sheets and score == 0:
+            score = 1
+        if score > 0:
+            return score, table_id
+        return None
+
+    indexed_ids: set[str] = set()
+    for item in table_index:
+        if not isinstance(item, dict):
+            continue
+        table_id = str(item.get("table_id", "") or item.get("source_file", "") or "")
+        if table_id:
+            indexed_ids.add(table_id)
+        scored_item = score_item(item)
+        if scored_item is not None:
+            scored.append(scored_item)
+
+    # Stable prompts may intentionally omit many table manifests. Keep retrieval
+    # reversible by searching the local detail map as a second-tier index.
+    for table_id, item in table_card_details.items():
+        if table_id in indexed_ids or not isinstance(item, dict):
+            continue
+        scored_item = score_item(item)
+        if scored_item is not None:
+            scored.append(scored_item)
+
+    related = []
+    seen: set[str] = set()
+    for _score, table_id in sorted(scored, key=lambda x: (-x[0], x[1]))[: max(1, int(max_cards))]:
+        if table_id in seen:
+            continue
+        card = table_card_details.get(table_id)
+        if isinstance(card, dict):
+            related.append(_detail_card_for_prompt(card))
+            seen.add(table_id)
+    return related
+
+
+def _detail_card_for_prompt(card: dict[str, Any]) -> dict[str, Any]:
+    return _json_safe(compact_detail_table_card_for_prompt(card, field_limit=12))
+
+
+def _artifact_ref_index_for_prompt(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: ref.get(k)
+        for k in ["artifact_id", "artifact_type", "source", "truncated", "original_chars", "artifact_path"]
+        if ref.get(k) not in (None, "", [], {})
+    }
+
+
+def _norm_match_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").lower())
+
+
+def _match_tokens(text: str) -> list[str]:
+    return [x for x in re.split(r"[^0-9a-zA-Z_\u4e00-\u9fff]+", text.lower()) if len(x) >= 2][:80]
+
+
+def _failed_result_for_prompt(
+    result: InvestigationStepResult,
+    *,
+    artifact_store: ArtifactStore | None = None,
+) -> dict[str, Any]:
+    payload = result.model_dump()
+    visible = _visible_output_payload(payload.get("result", {}), max(1000, int(result.max_output_chars or 12000)))
+    payload["result"] = {
+        "current_visible_output": visible["current_visible_output"],
+        "output_truncated": visible["output_truncated"],
+        "original_output_chars": visible["original_output_chars"],
+        "visible_output_chars": visible["visible_output_chars"],
+    }
+    if artifact_store is not None:
+        payload["result_artifact"] = artifact_store.put(
+            "qdi_failed_script_result_full",
+            f"{result.question_id}:{result.request_id}",
+            result.result,
+            visible_excerpt=visible["current_visible_output"],
+            visible_limit=max(1000, int(result.max_output_chars or 12000)),
+        )
+    return payload
 
 
 def _compact_action_history(question_id: str, action_name: str, status: str, action: QuestionInvestigationAction) -> dict[str, Any]:
@@ -1480,6 +1919,31 @@ def _build_investigation_context(
     constraint_memory: dict,
     authoritative_memory: dict,
     knowledge_base: dict,
+    artifact_store: ArtifactStore | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    return build_qdi_context_and_details(
+        cfg=cfg,
+        data_root=data_root,
+        task_hint=task_hint,
+        file_summaries=file_summaries,
+        relation_hints=relation_hints,
+        constraint_memory=constraint_memory,
+        authoritative_memory=authoritative_memory,
+        knowledge_base=knowledge_base,
+        artifact_store=artifact_store,
+    )
+
+
+def _legacy_build_investigation_context_unused(
+    *,
+    cfg: AutoRealizeConfig,
+    data_root: Path,
+    task_hint: str,
+    file_summaries: list[Any],
+    relation_hints: list[Any],
+    constraint_memory: dict,
+    authoritative_memory: dict,
+    knowledge_base: dict,
 ) -> dict[str, Any]:
     files = []
     for fs in file_summaries[:120]:
@@ -1754,7 +2218,10 @@ def _compact_filename_sample_groups(groups: Any, *, file_summaries: list[Any]) -
             continue
         files = [str(x) for x in (group.get("files", []) or [])]
         reps = files[:3]
-        shared_columns = _shared_columns_for_files(reps, summary_by_path)
+        column_profile = _filename_group_column_profile(files, summary_by_path)
+        shared_columns = column_profile.get("shared_fields", [])
+        variant_fields_by_file = column_profile.get("variant_fields_by_file", [])
+        field_presence = column_profile.get("field_presence", [])
         out.append(
             {
                 "directory": str(group.get("directory", "")),
@@ -1763,10 +2230,13 @@ def _compact_filename_sample_groups(groups: Any, *, file_summaries: list[Any]) -
                 "representative_files": reps,
                 "data_kinds": {str(k): str(v) for k, v in list((group.get("data_kinds", {}) or {}).items())[:8]},
                 "shared_fields": shared_columns[:40],
-                "structure_consistent": bool(shared_columns),
+                "variant_fields_by_file": variant_fields_by_file[:12],
+                "field_presence": field_presence[:24],
+                "structure_consistent": bool(shared_columns) and not bool(variant_fields_by_file),
                 "short_evidence": (
                     f"文件组 `{group.get('sample_id', '')}` 共 {len(files)} 个文件；"
-                    f"代表文件 {', '.join(reps)}；共享字段 {', '.join(shared_columns[:12]) or '未知'}。"
+                    f"代表文件 {', '.join(reps)}；共享字段 {', '.join(shared_columns[:12]) or '未知'}；"
+                    f"差异字段 {len(field_presence)} 个。"
                 ),
             }
         )
@@ -1783,6 +2253,59 @@ def _shared_columns_for_files(files: list[str], summary_by_path: dict[str, Any])
     if not sets:
         return []
     return sorted(set.intersection(*sets))
+
+
+def _filename_group_column_profile(files: list[str], summary_by_path: dict[str, Any]) -> dict[str, Any]:
+    observed: list[tuple[str, list[str]]] = []
+    for path in files:
+        fs = summary_by_path.get(str(path))
+        cols = [str(x) for x in (getattr(fs, "columns", []) or [])] if fs is not None else []
+        cols = [x for x in cols if x.strip()]
+        if cols:
+            observed.append((str(path), cols))
+    if not observed:
+        return {}
+
+    sets = [set(cols) for _, cols in observed]
+    common_set = set.intersection(*sets) if sets else set()
+    union: list[str] = []
+    for _, cols in observed:
+        for col in cols:
+            if col not in union:
+                union.append(col)
+
+    shared_fields = [col for col in union if col in common_set]
+    variant_fields_by_file: list[dict[str, Any]] = []
+    for path, cols in observed[:16]:
+        only_fields = [col for col in cols if col not in common_set]
+        if only_fields:
+            variant_fields_by_file.append(
+                {
+                    "file": path,
+                    "fields": only_fields[:24],
+                    "omitted": max(0, len(only_fields) - 24),
+                }
+            )
+
+    field_presence: list[dict[str, Any]] = []
+    for col in union:
+        if col in common_set:
+            continue
+        present = [path for path, cols in observed if col in set(cols)]
+        field_presence.append(
+            {
+                "field": col,
+                "present_in_count": len(present),
+                "example_files": present[:3],
+            }
+        )
+
+    return {
+        "observed_file_count": len(observed),
+        "shared_fields": shared_fields,
+        "variant_fields_by_file": variant_fields_by_file,
+        "field_presence": field_presence,
+    }
 
 
 def _compact_field_glossary(glossary: Any) -> list[dict[str, Any]]:

@@ -37,6 +37,10 @@
    - 对多 sheet Excel，必须利用 sheet 名、每个 sheet 的表头/shape/preview/raw_preview 和 sheet_group 信息说明 workbook 结构；同结构 sheet 要概括其共同字段含义，不要只解释第一个 sheet。
    - 多 sheet Excel 的每个 sheet 都要像一个 CSV 一样理解：给出该 sheet 的用途、读取方式、关键字段、字段说明和风险；说明性 sheet 也要提取其中的规则、公式、计费口径或字段释义。
    - Excel 的 raw_preview 是 header=None 读取的前几行原始单元格，可能包含说明、口径、单位或真正表头；如果 raw_preview 与 pandas 表头冲突，必须提醒后续读取代码不要盲信默认 header。
+   - 如果输入提供了 `layout_kind`、`read_strategy_kind`、`detected_header_row`、`recommended_read` 或 `reading_risks`，必须把它们消化成给后续代码看的读取说明：哪些 sheet 可按默认表头读，哪些 sheet 应 `header=None`，哪些 sheet 应使用显式 `header=N`，哪些 sheet 更像说明/规则/键值内容而非普通二维表。
+   - 对 `headerless_table`、`non_default_header`、`document_like_sheet`、`sparse_or_irregular_sheet`，必须在 detailed_report、key_facts 或 risks 中写明“为什么不能盲信 pandas 默认列名”和可执行读取方式；不得把 pandas 默认误读出来的列名当成权威字段。
+   - 如果同一 workbook 或同一文件名模式下的 sheet/文件结构略有差异，可以写明差异和需要覆盖的代表文件；只有证据支持时才说它们结构相同，不要因为文件名相似就断言内容完全同构。
+   - 允许指出语义相近字段需要跨表验证，但不得把名字相近的字段直接断言为同一实体；必须标注为候选、风险或待验证关系。
 3) 如果是表格/JSON 表格候选，还必须猜测关键字段的业务意义：主键、实体、时间、标签、金额/数量/成本/容量、可用资源、决策变量、约束字段等。
    - 必须利用列值切片与统计，不仅看列名；若某列有明显枚举格式，需在输出中明文记录样例值与语义。
    - 必须优先引用探查结果作为证据，例如 top_values、condition_ratio、filter_preview、groupby_agg、time_granularity、uniqueness、functional_dependency。

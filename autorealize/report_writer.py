@@ -15,6 +15,7 @@ from .models import (
     FileRole,
     PipelinePlan,
 )
+from .entity_alias import build_entity_alias_candidates
 from .profiling.relations import RelationHint
 
 
@@ -532,12 +533,35 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
         return "pandas.read_csv", example, notes
     if suffix in {".xlsx", ".xls"}:
         sheet_names = _excel_sheet_names_from_metadata(fs)
+        sheet_profiles = _excel_sheet_profiles(fs)
+        abnormal = [
+            sheet
+            for sheet in sheet_profiles
+            if isinstance(sheet, dict) and str(sheet.get("layout_kind", "") or "") not in {"", "standard_table"}
+        ]
         if len(sheet_names) > 1:
             notes.append("检测到多工作表 Excel，必须显式读取需要的 sheet；不要依赖 `pd.read_excel(path)` 默认读取第一个工作表。")
             shown = sheet_names[:8]
             notes.append("已识别工作表：" + "、".join(f"`{x}`" for x in shown) + (" 等。" if len(sheet_names) > len(shown) else "。"))
             notes.append("建议先用 `sheet_name=None` 读取为 dict，再按 automl_context 中的 sheet_groups 判断是否逐 sheet 使用或合并同结构 sheet。")
+            if abnormal:
+                notes.append(
+                    "存在非标准布局 sheet，需按 sheet 级 read_example/header 策略读取："
+                    + "；".join(
+                        f"`{sheet.get('sheet_name')}`={sheet.get('layout_kind')} read={sheet.get('recommended_read') or 'inspect header=None'}"
+                        for sheet in abnormal[:6]
+                    )
+                    + "。"
+                )
             return "pandas.read_excel", f"pd.read_excel({input_path!r}, sheet_name=None)", notes
+        if abnormal:
+            sheet = abnormal[0]
+            example = str(sheet.get("recommended_read") or f"pd.read_excel({input_path!r}, header=None)")
+            notes.append(
+                f"检测到 sheet `{sheet.get('sheet_name')}` 为 {sheet.get('layout_kind')}，不要盲信默认表头；"
+                f"建议读取方式：{example}。"
+            )
+            return "pandas.read_excel", example, notes
         return "pandas.read_excel", f"pd.read_excel({input_path!r})", notes
     if suffix == ".json":
         json_strategy = str((fs.source_metadata or {}).get("json_strategy", "") or "")
@@ -580,8 +604,12 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
                 target_fields.append(c)
             if c in profiles or c in key_fields or c in target_fields:
                 important_fields.append(c)
-        if not important_fields and fs.columns:
-            important_fields = [str(c) for c in fs.columns[:30]]
+        # Keep a bounded physical-column list so repeated-file groups can show
+        # both shared and variant columns instead of only task-scored fields.
+        for col in fs.columns[:30]:
+            text = str(col)
+            if text and text not in important_fields:
+                important_fields.append(text)
         files.append(
             DataAccessFileProtocol(
                 path=str(fs.path),
@@ -739,6 +767,46 @@ def _group_data_access_items(files: list[DataAccessFileProtocol]) -> list[tuple[
             blocks.append((False, [item]))
             emitted.add(item_id)
     return blocks
+
+
+def _data_access_group_field_profile(items: list[DataAccessFileProtocol]) -> dict[str, Any]:
+    observed: list[tuple[str, list[str]]] = []
+    for item in items:
+        fields: list[str] = []
+        for value in list(item.important_fields or []) + list(item.key_fields or []) + list(item.target_fields or []):
+            text = str(value).strip()
+            if text and text not in fields:
+                fields.append(text)
+        if item.path and fields:
+            observed.append((str(item.path), fields))
+    if not observed:
+        return {}
+
+    sets = [set(fields) for _, fields in observed]
+    common_set = set.intersection(*sets) if sets else set()
+    union: list[str] = []
+    for _, fields in observed:
+        for field in fields:
+            if field not in union:
+                union.append(field)
+
+    shared_fields = [field for field in union if field in common_set]
+    variants: list[dict[str, Any]] = []
+    for path, fields in observed[:12]:
+        only_fields = [field for field in fields if field not in common_set]
+        if only_fields:
+            variants.append(
+                {
+                    "file": path,
+                    "fields": only_fields[:18],
+                    "omitted": max(0, len(only_fields) - 18),
+                }
+            )
+
+    return {
+        "shared_fields": shared_fields,
+        "variant_fields_by_file": variants,
+    }
 
 
 def _dedupe_nonempty(values: list[str], limit: int = 12) -> list[str]:
@@ -939,6 +1007,11 @@ def _compact_excel_sheet_profiles_for_automl(fs: FileSummary, *, max_sheets: int
             "shape_estimated": sheet.get("shape_estimated", False),
             "preview_rows_used": sheet.get("preview_rows_used", 0),
             "columns": [str(x) for x in (sheet.get("columns") or [])[:max_cols]],
+            "layout_kind": sheet.get("layout_kind", ""),
+            "header_confidence": sheet.get("header_confidence", None),
+            "detected_header_row": sheet.get("detected_header_row", None),
+            "read_strategy_kind": sheet.get("read_strategy_kind", ""),
+            "reading_risks": [str(x) for x in (sheet.get("reading_risks") or [])[:4]],
             "is_deep_profiled": sheet.get("is_deep_profiled", False),
             "profile_policy": sheet.get("profile_policy", ""),
             "profile_rows_limit": sheet.get("profile_rows_limit", None),
@@ -946,10 +1019,8 @@ def _compact_excel_sheet_profiles_for_automl(fs: FileSummary, *, max_sheets: int
             "sheet_group_size": sheet.get("sheet_group_size", 1),
             "sheet_group_representative": sheet.get("sheet_group_representative", ""),
             "profiled_column_count": sheet.get("profiled_column_count", 0),
-            "read_example": f"pd.read_excel(path, sheet_name={str(sheet.get('sheet_name', ''))!r})",
-            "raw_preview_note": "header=None top rows; includes opening notes/instructions if present",
-            "raw_preview": _compact_raw_preview_rows(sheet.get("raw_preview", []), max_rows=10, max_cols=12),
-            "preview": _compact_preview_records(sheet.get("preview", []), max_rows=10, max_cols=12),
+            "read_example": sheet.get("recommended_read") or f"pd.read_excel(path, sheet_name={str(sheet.get('sheet_name', ''))!r})",
+            "raw_preview_note": "If opening notes or non-default headers matter, inspect this sheet directly with header=None before modeling.",
             "field_descriptions": descriptions,
             "column_profiles": _sheet_profile_items(sheet, fs, max_cols=max_cols),
         }
@@ -987,10 +1058,12 @@ def _compact_group_excel_sheet_profiles_for_automl(group: list[FileSummary], *, 
             "shape": sheet.get("shape", []),
             "shape_profiled": sheet.get("shape_profiled", sheet.get("shape_sampled", [])),
             "columns": [str(x) for x in (sheet.get("columns") or [])[:max_cols]],
-            "read_example": f"pd.read_excel(path, sheet_name={sheet_title!r})",
-            "raw_preview_note": "header=None top rows from a representative workbook; read every workbook's sheet with this name/purpose",
-            "raw_preview": _compact_raw_preview_rows(sheet.get("raw_preview", []), max_rows=10, max_cols=12),
-            "preview": _compact_preview_records(sheet.get("preview", []), max_rows=10, max_cols=12),
+            "layout_kind": sheet.get("layout_kind", ""),
+            "detected_header_row": sheet.get("detected_header_row", None),
+            "read_strategy_kind": sheet.get("read_strategy_kind", ""),
+            "reading_risks": [str(x) for x in (sheet.get("reading_risks") or [])[:4]],
+            "read_example": sheet.get("recommended_read") or f"pd.read_excel(path, sheet_name={sheet_title!r})",
+            "raw_preview_note": "If opening notes or non-default headers matter, inspect representative workbooks directly with header=None before modeling.",
             "column_profiles": field_profiles[:max_cols],
         }
         out.append({k: v for k, v in item.items() if v not in (None, "", [], {})})
@@ -1060,7 +1133,6 @@ def _compact_file_metadata_for_automl(fs: FileSummary) -> dict[str, Any]:
         "shape_estimated",
         "preview_rows_used",
         "dtypes",
-        "preview",
         "csv_dialect",
         "csv_encoding",
         "json_strategy",
@@ -1086,13 +1158,502 @@ def _compact_file_metadata_for_automl(fs: FileSummary) -> dict[str, Any]:
                     for item in value
                     if isinstance(item, dict)
                 ][:12]
-            elif key == "preview":
-                out[key] = _compact_preview_records(value, max_rows=5, max_cols=12)
-            elif key == "dtypes" and isinstance(value, dict):
+            if key == "dtypes" and isinstance(value, dict):
                 out[key] = {str(k): str(v) for k, v in list(value.items())[:80]}
             else:
                 out[key] = value
     return out
+
+
+def _schema_table_kind(path: str, *, sheet_name: str = "") -> str:
+    suffix = Path(str(path or "")).suffix.lower()
+    if sheet_name:
+        return "excel_sheet"
+    if suffix in {".xlsx", ".xls"}:
+        return "excel_workbook_or_single_sheet"
+    if suffix == ".csv":
+        return "csv_table"
+    if suffix in {".json", ".jsonl"}:
+        return "json_table"
+    if suffix in {".parquet", ".pq"}:
+        return "parquet_table"
+    return "table"
+
+
+def _schema_profile_by_name(profiles: Any) -> dict[str, dict[str, Any]]:
+    return {
+        str(p.get("name", "")): p
+        for p in (profiles or [])
+        if isinstance(p, dict) and str(p.get("name", "")).strip()
+    }
+
+
+def _profile_row_counts(profiles: Any) -> list[int]:
+    out: list[int] = []
+    for profile in profiles or []:
+        if not isinstance(profile, dict):
+            continue
+        value = profile.get("row_count")
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            out.append(int(value))
+    return sorted(set(out))
+
+
+def _shape_warning(shape: Any, row_counts: list[int]) -> str:
+    if not isinstance(shape, (list, tuple)) or not shape or not row_counts:
+        return ""
+    first = shape[0]
+    if isinstance(first, bool) or not isinstance(first, (int, float)):
+        return ""
+    shaped_rows = int(first)
+    if shaped_rows in row_counts:
+        return ""
+    if len(row_counts) == 1:
+        return (
+            f"profiled row_count={row_counts[0]} differs from reported shape rows={shaped_rows}; "
+            "code should inspect the runtime dataframe shape before relying on row counts."
+        )
+    return (
+        f"profiled row_counts={row_counts[:4]} differ from reported shape rows={shaped_rows}; "
+        "code should inspect the runtime dataframe shape before relying on row counts."
+    )
+
+
+def _schema_field_score(name: str, meaning: str, profile: dict[str, Any]) -> int:
+    text = f"{name} {meaning}".lower()
+    score = 0
+    priority_terms = [
+        "id",
+        "key",
+        "target",
+        "label",
+        "score",
+        "metric",
+        "cost",
+        "price",
+        "amount",
+        "fee",
+        "date",
+        "time",
+        "order",
+        "vehicle",
+        "carrier",
+        "capacity",
+        "weight",
+        "volume",
+        "订单",
+        "单号",
+        "编号",
+        "代码",
+        "日期",
+        "时间",
+        "交付",
+        "交货",
+        "提货",
+        "车辆",
+        "车牌",
+        "承运商",
+        "车型",
+        "成本",
+        "费用",
+        "价格",
+        "重量",
+        "体积",
+        "数量",
+        "装载",
+        "容量",
+        "限制",
+        "约束",
+    ]
+    if any(term in text for term in priority_terms):
+        score += 20
+    logical_type = str(profile.get("logical_type") or profile.get("dtype") or "").lower()
+    if logical_type in {"datetime", "date", "numeric", "integer", "float"}:
+        score += 4
+    if profile.get("unique_count") not in (None, "", [], {}):
+        score += 2
+    if profile.get("numeric_stats") or profile.get("datetime_stats"):
+        score += 3
+    return score
+
+
+def _schema_field_summaries(
+    *,
+    columns: list[str],
+    profiles: Any,
+    meanings: dict[str, str],
+    max_fields: int = 18,
+) -> list[dict[str, Any]]:
+    profile_by_name = _schema_profile_by_name(profiles)
+    scored: list[tuple[int, int, str]] = []
+    for idx, col in enumerate(columns):
+        meaning = str(meanings.get(col, "") or "")
+        scored.append((-_schema_field_score(col, meaning, profile_by_name.get(col, {})), idx, col))
+    selected: list[str] = []
+    for _score, _idx, col in sorted(scored):
+        if col not in selected:
+            selected.append(col)
+        if len(selected) >= max(1, int(max_fields)):
+            break
+    out: list[dict[str, Any]] = []
+    for col in selected:
+        profile = profile_by_name.get(col, {})
+        meaning = str(meanings.get(col, "") or "")
+        numeric = profile.get("numeric_stats") if isinstance(profile.get("numeric_stats"), dict) else {}
+        datetime_stats = profile.get("datetime_stats") if isinstance(profile.get("datetime_stats"), dict) else {}
+        item: dict[str, Any] = {
+            "name": col,
+            "meaning": meaning[:160] if meaning else "",
+            "logical_type": profile.get("logical_type") or profile.get("dtype"),
+            "null_ratio": profile.get("null_ratio"),
+            "unique_count": profile.get("unique_count"),
+        }
+        if numeric:
+            item["numeric_range"] = {
+                k: numeric.get(k)
+                for k in ["min", "max"]
+                if numeric.get(k) not in (None, "", [], {})
+            }
+        if datetime_stats:
+            item["datetime_range"] = {
+                k: datetime_stats.get(k)
+                for k in ["min", "max"]
+                if datetime_stats.get(k) not in (None, "", [], {})
+            }
+        out.append({k: v for k, v in item.items() if v not in (None, "", [], {})})
+    return out
+
+
+def _source_schema_entries_from_file(
+    fs: FileSummary,
+    *,
+    max_columns: int = 180,
+    max_field_summaries: int = 18,
+) -> list[dict[str, Any]]:
+    path = str(fs.path or "")
+    role = fs.role.value if isinstance(fs.role, FileRole) else str(fs.role)
+    meta = fs.source_metadata or {}
+    entries: list[dict[str, Any]] = []
+    sheet_profiles = meta.get("excel_sheet_profiles") if isinstance(meta.get("excel_sheet_profiles"), list) else []
+    if sheet_profiles:
+        for sheet in sheet_profiles:
+            if not isinstance(sheet, dict):
+                continue
+            sheet_name = str(sheet.get("sheet_name", "") or "")
+            columns = [str(x) for x in (sheet.get("columns") or []) if str(x).strip()]
+            profiles = sheet.get("column_profiles") if isinstance(sheet.get("column_profiles"), list) else []
+            meanings = _sheet_field_descriptions(fs, sheet_name)
+            shape = sheet.get("shape") or sheet.get("shape_profiled") or sheet.get("shape_sampled")
+            row_counts = _profile_row_counts(profiles)
+            warnings = [x for x in [_shape_warning(shape, row_counts)] if x]
+            entries.append(
+                {
+                    "table_id": f"{path}::{sheet_name}" if sheet_name else path,
+                    "source_file": path,
+                    "sheet_name": sheet_name,
+                    "table_kind": "excel_sheet",
+                    "file_role": role,
+                    "shape": shape,
+                    "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
+                    "column_count": len(columns),
+                    "physical_columns_exact": columns[:max_columns],
+                    "physical_columns_omitted": max(0, len(columns) - max_columns),
+                    "field_summaries": _schema_field_summaries(
+                        columns=columns,
+                        profiles=profiles,
+                        meanings=meanings,
+                        max_fields=max_field_summaries,
+                    ),
+                    "read_example": f"pd.read_excel('./input/{path}', sheet_name={sheet_name!r})",
+                    "warnings": warnings,
+                }
+            )
+        return entries
+
+    columns = [str(x) for x in (fs.columns or []) if str(x).strip()]
+    profiles = fs.column_profiles or []
+    meanings = {str(k): str(v) for k, v in (fs.column_semantics or {}).items() if str(k).strip()}
+    shape = meta.get("shape") or meta.get("shape_estimated")
+    row_counts = _profile_row_counts(profiles)
+    warnings = [x for x in [_shape_warning(shape, row_counts)] if x]
+    entries.append(
+        {
+            "table_id": path,
+            "source_file": path,
+            "sheet_name": "",
+            "table_kind": _schema_table_kind(path),
+            "file_role": role,
+            "shape": shape,
+            "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
+            "column_count": len(columns),
+            "physical_columns_exact": columns[:max_columns],
+            "physical_columns_omitted": max(0, len(columns) - max_columns),
+            "field_summaries": _schema_field_summaries(
+                columns=columns,
+                profiles=profiles,
+                meanings=meanings,
+                max_fields=max_field_summaries,
+            ),
+            "read_example": _default_schema_read_example(path),
+            "warnings": warnings,
+        }
+    )
+    return entries
+
+
+def _default_schema_read_example(path: str) -> str:
+    suffix = Path(str(path or "")).suffix.lower()
+    quoted = f"./input/{path}"
+    if suffix == ".csv":
+        return f"pd.read_csv({quoted!r})"
+    if suffix in {".xlsx", ".xls"}:
+        return f"pd.read_excel({quoted!r})"
+    if suffix in {".json", ".jsonl"}:
+        return f"pd.read_json({quoted!r})"
+    if suffix in {".parquet", ".pq"}:
+        return f"pd.read_parquet({quoted!r})"
+    return f"# inspect and load {quoted!r} with the appropriate reader"
+
+
+def _schema_entry_pattern_signature(entry: dict[str, Any]) -> tuple[Any, ...] | None:
+    sig = _filename_pattern_signature(str(entry.get("source_file") or ""))
+    if sig is None:
+        return None
+    parent, suffix, pattern = sig
+    return (
+        parent,
+        suffix,
+        pattern,
+        entry.get("table_kind"),
+        entry.get("sheet_name"),
+        entry.get("file_role"),
+    )
+
+
+def _schema_group_column_profile(items: list[dict[str, Any]]) -> dict[str, Any]:
+    observed: list[tuple[str, list[str]]] = []
+    for item in items:
+        source_file = str(item.get("source_file") or item.get("table_id") or "").strip()
+        cols = [str(x) for x in (item.get("physical_columns_exact") or []) if str(x).strip()]
+        if source_file and cols:
+            observed.append((source_file, cols))
+    if not observed:
+        return {}
+
+    sets = [set(cols) for _, cols in observed]
+    common_set = set.intersection(*sets) if sets else set()
+    union: list[str] = []
+    for _, cols in observed:
+        for col in cols:
+            if col not in union:
+                union.append(col)
+
+    shared_fields = [col for col in union if col in common_set]
+    variant_fields_by_file: list[dict[str, Any]] = []
+    for source_file, cols in observed[:16]:
+        only_fields = [col for col in cols if col not in common_set]
+        if only_fields:
+            variant_fields_by_file.append(
+                {
+                    "file": source_file,
+                    "fields": only_fields[:24],
+                    "omitted": max(0, len(only_fields) - 24),
+                }
+            )
+
+    field_presence: list[dict[str, Any]] = []
+    for col in union:
+        if col in common_set:
+            continue
+        present = [source_file for source_file, cols in observed if col in set(cols)]
+        field_presence.append(
+            {
+                "field": col,
+                "present_in_count": len(present),
+                "example_files": present[:3],
+            }
+        )
+
+    return {
+        "observed_file_count": len(observed),
+        "shared_fields": shared_fields,
+        "variant_fields_by_file": variant_fields_by_file,
+        "field_presence": field_presence,
+    }
+
+
+def _merge_schema_group_entries(items: list[dict[str, Any]]) -> dict[str, Any]:
+    rep = dict(items[0])
+    paths = [str(x.get("source_file", "")) for x in items if str(x.get("source_file", "")).strip()]
+    pattern = _common_path_pattern(paths)
+    columns: list[str] = []
+    for item in items:
+        for col in item.get("physical_columns_exact") or []:
+            text = str(col).strip()
+            if text and text not in columns:
+                columns.append(text)
+    field_by_name: dict[str, dict[str, Any]] = {}
+    for item in items:
+        for field in item.get("field_summaries") or []:
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name") or "").strip()
+            if name and name not in field_by_name:
+                field_by_name[name] = dict(field)
+    column_variants = {
+        tuple(str(x) for x in (item.get("physical_columns_exact") or []))
+        for item in items
+    }
+    column_profile = _schema_group_column_profile(items)
+    rep.update(
+        {
+            "table_id": f"{pattern}::{rep.get('sheet_name')}" if rep.get("sheet_name") else pattern,
+            "column_count": len(columns),
+            "physical_columns_exact": columns,
+            "physical_columns_omitted": 0,
+            "field_summaries": list(field_by_name.values())[:18],
+            "schema_group": {
+                "file_count": len(items),
+                "schema_consistent": len(column_variants) == 1,
+                "column_variant_count": len(column_variants),
+                "representative_files": paths[:5],
+                "shared_physical_columns_exact": column_profile.get("shared_fields", [])[:80],
+                "variant_fields_by_file": column_profile.get("variant_fields_by_file", [])[:12],
+                "field_presence": column_profile.get("field_presence", [])[:24],
+                "note": (
+                    "Repeated filename-pattern group; physical_columns_exact is the union of observed "
+                    "columns, not a guarantee that every file has every column. Use shared_physical_columns_exact "
+                    "and variant_fields_by_file before per-file dataframe access."
+                ),
+            },
+            "read_example": (
+                "For each file matching this filename pattern, use the same reader, "
+                "then concatenate and keep a source_file column."
+            ),
+        }
+    )
+    rep.pop("source_file", None)
+    return {k: v for k, v in rep.items() if v not in (None, "", [], {})}
+
+
+def _group_schema_entries(entries: list[dict[str, Any]], *, max_tables: int = 80) -> list[dict[str, Any]]:
+    pattern_grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for entry in entries:
+        sig = _schema_entry_pattern_signature(entry)
+        if sig is not None:
+            pattern_grouped.setdefault(sig, []).append(entry)
+
+    emitted_ids: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        sig = _schema_entry_pattern_signature(entry)
+        items = pattern_grouped.get(sig, []) if sig is not None else []
+        if len(items) >= 3 and id(entry) not in emitted_ids:
+            out.append(_merge_schema_group_entries(items))
+            emitted_ids.update(id(x) for x in items)
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for entry in entries:
+        if id(entry) in emitted_ids:
+            continue
+        columns = tuple(str(x) for x in (entry.get("physical_columns_exact") or []))
+        key = (
+            entry.get("table_kind"),
+            entry.get("sheet_name"),
+            entry.get("file_role"),
+            entry.get("column_count"),
+            columns,
+        )
+        grouped.setdefault(key, []).append(entry)
+
+    for items in grouped.values():
+        rep = dict(items[0])
+        paths = [str(x.get("source_file", "")) for x in items if str(x.get("source_file", "")).strip()]
+        if len(items) > 1:
+            column_profile = _schema_group_column_profile(items)
+            rep["table_id"] = (
+                f"{_common_path_pattern(paths)}::{rep.get('sheet_name')}"
+                if rep.get("sheet_name")
+                else _common_path_pattern(paths)
+            )
+            rep["schema_group"] = {
+                "file_count": len(items),
+                "representative_files": paths[:3],
+                "schema_consistent": True,
+                "column_variant_count": 1,
+                "shared_physical_columns_exact": column_profile.get("shared_fields", [])[:80],
+                "variant_fields_by_file": column_profile.get("variant_fields_by_file", [])[:12],
+                "field_presence": column_profile.get("field_presence", [])[:24],
+            }
+            rep.pop("source_file", None)
+            read = rep.get("read_example")
+            if read:
+                rep["read_example"] = (
+                    "For each matching file, use the same reader as the representative example, "
+                    "then concatenate and keep a source_file column."
+                )
+        out.append({k: v for k, v in rep.items() if v not in (None, "", [], {})})
+
+    out.sort(
+        key=lambda item: (
+            0 if str(item.get("file_role", "")) == "raw_data_table" else 1,
+            str(item.get("table_id", "")),
+        )
+    )
+    return out[: max(1, int(max_tables))]
+
+
+def _build_data_schema_contract(file_summaries: list[FileSummary], *, max_tables: int = 80) -> dict[str, Any]:
+    raw_entries: list[dict[str, Any]] = []
+    workbook_sheets: list[dict[str, Any]] = []
+    structured_files = [
+        fs
+        for fs in file_summaries or []
+        if str(fs.path or "").lower().endswith((".csv", ".xlsx", ".xls", ".json", ".jsonl", ".parquet", ".pq"))
+    ]
+    data_files = [fs for fs in structured_files if not _is_document_like(fs)] or structured_files
+    for fs in data_files:
+        meta = fs.source_metadata or {}
+        sheet_names = meta.get("excel_sheet_names") if isinstance(meta.get("excel_sheet_names"), list) else []
+        if sheet_names:
+            workbook_sheets.append(
+                {
+                    "source_file": str(fs.path or ""),
+                    "valid_sheet_names_exact": [str(x) for x in sheet_names if str(x).strip()],
+                    "rule": "Only these exact strings are valid for pandas.read_excel(..., sheet_name=...). File roles or business labels are not sheet names.",
+                }
+            )
+        raw_entries.extend(_source_schema_entries_from_file(fs))
+
+    tables = _group_schema_entries(raw_entries, max_tables=max_tables)
+    return {
+        "purpose": "Authoritative physical schema map for downstream code. Use this before writing pandas column or sheet access.",
+        "rules": [
+            "Physical source column names are exactly the strings in `physical_columns_exact`; do not normalize, translate, or silently rename them before checking they exist.",
+            "For repeated filename-pattern groups, `physical_columns_exact` may be the union of observed columns; use `shared_physical_columns_exact`, `variant_fields_by_file`, and runtime `df.columns` checks before assuming a column exists in every file.",
+            "Business concepts such as delivery day, target, capacity, route, vehicle, or cost are derived/code-local variables unless the exact same string appears in `physical_columns_exact`.",
+            "For Excel files, only `valid_sheet_names_exact` / table `sheet_name` values are legal sheet names. Do not use table roles such as cost contract or daily vehicle pool as sheet names unless they are listed exactly.",
+            "If code wants English variable names such as `delivery_day`, `max_weight_kg`, or `carrier_code`, create them by explicit mapping from exact source columns and keep the mapping near the load code.",
+            "Before hard-coding a rename or merge key, inspect `pd.ExcelFile(path).sheet_names` and `df.columns.tolist()` at runtime and fail with a diagnostic listing available names if the expected exact name is absent.",
+            "Natural-language field meanings in description.md or field_summaries are explanatory only; they are not dataframe column names.",
+        ],
+        "runtime_inspection_snippet": (
+            "For Excel: xls = pd.ExcelFile(path); print(xls.sheet_names); "
+            "df = pd.read_excel(path, sheet_name=exact_sheet); print(df.columns.tolist()). "
+            "For CSV/JSON/parquet: load once, then print(df.columns.tolist()) before renaming."
+        ),
+        "workbooks": workbook_sheets[:40],
+        "tables": tables,
+        "omitted_table_count": max(0, len(raw_entries) - len(tables)),
+    }
+
+
+def build_data_schema_contract(file_summaries: list[FileSummary], *, max_tables: int = 80) -> dict[str, Any]:
+    """Build the downstream code-facing exact source schema contract."""
+
+    return _build_data_schema_contract(file_summaries, max_tables=max_tables)
 
 
 def _paradigm_label(paradigm: str) -> str:
@@ -1135,6 +1696,26 @@ def _render_data_access_section(protocol: DataAccessProtocol) -> str:
             key_fields = _dedupe_nonempty([x for item in items for x in item.key_fields], limit=12)
             if key_fields:
                 lines.append("- 关键实体键：" + "、".join(f"`{x}`" for x in key_fields))
+            field_profile = _data_access_group_field_profile(items)
+            shared_fields = _dedupe_nonempty([str(x) for x in field_profile.get("shared_fields", [])], limit=24)
+            if shared_fields:
+                lines.append("- 同组共通字段：" + "、".join(f"`{x}`" for x in shared_fields))
+            variants = field_profile.get("variant_fields_by_file") if isinstance(field_profile.get("variant_fields_by_file"), list) else []
+            if variants:
+                lines.append("- 同组差异字段（读取时不要假设每个文件都有 union 中的全部字段）：")
+                for idx, variant in enumerate(variants[:8], start=1):
+                    if not isinstance(variant, dict):
+                        continue
+                    fields = _dedupe_nonempty([str(x) for x in (variant.get("fields") or [])], limit=18)
+                    omitted = int(variant.get("omitted") or 0)
+                    suffix = f"；另有 {omitted} 个字段省略" if omitted else ""
+                    lines.append(
+                        f"  - 变体 {idx} 独有/非共通字段："
+                        + ("、".join(f"`{x}`" for x in fields) if fields else "（未识别）")
+                        + suffix
+                    )
+            elif shared_fields:
+                lines.append("- 同组差异字段：未在已观测字段中发现差异。")
             notes = _dedupe_nonempty([x for item in items for x in item.parsing_notes], limit=8)
             if notes:
                 lines.append("- 读取注意事项：")
@@ -1176,78 +1757,153 @@ def build_automl_context_pack(
     file_summaries: list[FileSummary],
     downstream_context: dict | None = None,
     evaluation_contract: EvaluationContractReview | dict[str, Any] | None = None,
+    compiled_context: dict[str, Any] | None = None,
 ) -> AutoMLContextPack:
-    """Build a compact source-of-truth package for downstream AutoML/AutoRL.
+    """Build concise supplemental facts for the downstream fixed context.
 
-    This is intentionally more operational than description.md: it tells code
-    agents exactly which contracts to obey and how to read non-standard files,
-    while preserving MLEvolve's own lightweight data preview as a supplement.
+    `description.md` remains the primary task document. This pack records
+    important constraints, contracts, table facts, and data notes that would
+    be too detailed or too machine-oriented for the human-facing description.
+    It intentionally avoids retrieval mechanics: downstream code is generated
+    as a whole solution, so important facts must be present here or in
+    `description.md` rather than hidden behind an interactive fetch step.
     """
     ctx = downstream_context or {}
     if not isinstance(bundle, DescriptionProtocolBundle):
         bundle = DescriptionProtocolBundle.model_validate(bundle)
     contract = _as_evaluation_contract(evaluation_contract) if evaluation_contract is not None else None
     paradigm = str(bundle.problem_paradigm or ctx.get("problem_paradigm", "unknown_but_executable")).strip()
+    problem_review = ctx.get("problem_paradigm_review") if isinstance(ctx.get("problem_paradigm_review"), dict) else {}
+    explicit_rl_requested = bool(problem_review.get("explicit_rl_requested"))
+    rl_as_required_paradigm = bool(problem_review.get("rl_as_required_paradigm")) or paradigm == "reinforcement_learning"
+    recommended_solver_families = _dedupe_any(problem_review.get("recommended_solver_families", []), limit=10)
+    method_routing_notes = _dedupe_any(problem_review.get("method_routing_notes", []), limit=10)
     summaries_by_path = {str(fs.path): fs for fs in file_summaries}
+    compact_ctx = compiled_context if isinstance(compiled_context, dict) else {}
+    compact_table_cards = compact_ctx.get("table_cards") if isinstance(compact_ctx.get("table_cards"), list) else []
+    compact_relations = compact_ctx.get("relations") if isinstance(compact_ctx.get("relations"), list) else []
+    compact_filename_groups = (
+        compact_ctx.get("filename_sample_groups")
+        if isinstance(compact_ctx.get("filename_sample_groups"), list)
+        else []
+    )
+    data_schema_contract = build_data_schema_contract(file_summaries)
 
     data_entries: list[dict[str, Any]] = []
-    for is_group, items in _group_data_access_items(list(bundle.data_access.files or [])):
-        if not items:
-            continue
-        representative = items[0]
-        paths = [str(x.path) for x in items]
-        grouped_summaries = [summaries_by_path[p] for p in paths if p in summaries_by_path]
-        if is_group:
-            pattern = _common_path_pattern(paths)
-            read_example = "\n".join(_render_group_read_code(pattern, representative))
+    entity_alias_source_aliases: dict[str, str] = {}
+    if compact_table_cards:
+        protocol_by_path = {str(item.path): item for item in list(bundle.data_access.files or [])}
+        for card in compact_table_cards[:40]:
+            if not isinstance(card, dict):
+                continue
+            path = str(card.get("source_file") or card.get("table_id") or "")
+            protocol = protocol_by_path.get(path)
+            raw_fields = card.get("fields") if isinstance(card.get("fields"), list) else None
+            fields = [f for f in (raw_fields or card.get("field_index") or []) if isinstance(f, dict)]
+            field_hints = [str(x) for x in (card.get("field_hints") or []) if str(x).strip()]
+            fs = summaries_by_path.get(path)
+            if fs is None and str(card.get("source_file", "")):
+                fs = summaries_by_path.get(str(card.get("source_file", "")))
+            if not fields and fs is not None:
+                sheet_name = str(card.get("sheet_name", "") or "")
+                if sheet_name:
+                    sheet = _find_excel_sheet_profile(fs, sheet_name)
+                    if sheet is not None:
+                        fields = _sheet_profile_items(sheet, fs, max_cols=24)
+                else:
+                    fields = _compact_file_profiles_for_automl(fs, limit=24)
+            columns = [str(f.get("name", "")) for f in fields if str(f.get("name", "")).strip()]
+            if not columns:
+                columns = field_hints or ([str(x) for x in (fs.columns or [])[:80]] if fs is not None else [])
             entry = {
-                "kind": "repeated_file_group",
-                "pattern": pattern,
-                "file_count": len(items),
-                "read_method": representative.read_method,
-                "read_example": read_example,
-                "columns": _merged_group_columns(grouped_summaries, limit=80),
-                "row_grain": "; ".join(_dedupe_any([x.row_grain for x in items], limit=4)),
-                "key_fields": _dedupe_any([v for item in items for v in item.key_fields], limit=16),
-                "relation_keys": _dedupe_any([v for item in items for v in item.relation_keys], limit=16),
-                "important_fields": _dedupe_any([v for item in items for v in item.important_fields], limit=30),
-                "parsing_notes": _dedupe_any([v for item in items for v in item.parsing_notes], limit=12),
-                "orchestration_note": "Read every file matching the pattern, concatenate rows, and keep a `source_file` column to preserve file-level identity.",
+                "kind": card.get("table_kind") or "table_card",
+                "path": path,
+                "table_id": card.get("table_id"),
+                "sheet_name": card.get("sheet_name"),
+                "file_role": card.get("role"),
+                "summary": (card.get("file_cognition") or (str(fs.summary or "")[:400] if fs is not None else "")),
+                "shape": card.get("shape"),
+                "read_method": protocol.read_method if protocol is not None else "",
+                "read_example": protocol.read_example if protocol is not None else "",
+                "columns": columns[:80],
+                "fields": fields[:24],
+                "key_fields": protocol.key_fields if protocol is not None else [],
+                "relation_keys": protocol.relation_keys if protocol is not None else [],
+                "important_fields": protocol.important_fields if protocol is not None else [],
+                "parsing_notes": _dedupe_any(
+                    list(card.get("reading_notes") or [])
+                    + (list(protocol.parsing_notes) if protocol is not None else []),
+                    limit=16,
+                ),
+                "warnings": card.get("warnings", []),
             }
-            group_profiles = _compact_group_profiles_for_automl(grouped_summaries)
-            if group_profiles:
-                entry["field_profiles"] = group_profiles
-            group_sheet_profiles = _compact_group_excel_sheet_profiles_for_automl(grouped_summaries)
-            if group_sheet_profiles:
-                entry["excel_sheet_profiles"] = group_sheet_profiles
-        else:
-            entry = {
-                "kind": "single_file",
-                "path": representative.path,
-                "read_method": representative.read_method,
-                "read_example": representative.read_example,
-                "columns": [],
-                "row_grain": representative.row_grain,
-                "key_fields": _dedupe_any(representative.key_fields, limit=16),
-                "relation_keys": _dedupe_any(representative.relation_keys, limit=16),
-                "important_fields": _dedupe_any(representative.important_fields, limit=30),
-                "parsing_notes": _dedupe_any(representative.parsing_notes, limit=12),
-            }
-            fs = summaries_by_path.get(str(representative.path))
-            if fs is not None:
-                entry["file_role"] = fs.role.value if isinstance(fs.role, FileRole) else str(fs.role)
-                entry["summary"] = str(fs.summary or "")[:600]
-                entry["columns"] = [str(x) for x in (fs.columns or [])[:120]]
-                metadata = _compact_file_metadata_for_automl(fs)
-                if metadata:
-                    entry["source_metadata"] = metadata
-                profiles = _compact_file_profiles_for_automl(fs)
-                if profiles:
-                    entry["field_profiles"] = profiles
-                sheet_profiles = _compact_excel_sheet_profiles_for_automl(fs)
-                if sheet_profiles:
-                    entry["excel_sheet_profiles"] = sheet_profiles
-        data_entries.append(entry)
+            data_entries.append({k: v for k, v in entry.items() if v not in (None, "", [], {})})
+    else:
+        for is_group, items in _group_data_access_items(list(bundle.data_access.files or [])):
+            if not items:
+                continue
+            representative = items[0]
+            paths = [str(x.path) for x in items]
+            grouped_summaries = [summaries_by_path[p] for p in paths if p in summaries_by_path]
+            if is_group:
+                pattern = _common_path_pattern(paths)
+                for path in paths:
+                    entity_alias_source_aliases[path] = pattern
+                read_example = "\n".join(_render_group_read_code(pattern, representative))
+                entry = {
+                    "kind": "repeated_file_group",
+                    "pattern": pattern,
+                    "file_count": len(items),
+                    "read_method": representative.read_method,
+                    "read_example": read_example,
+                    "columns": _merged_group_columns(grouped_summaries, limit=80),
+                    "row_grain": "; ".join(_dedupe_any([x.row_grain for x in items], limit=4)),
+                    "key_fields": _dedupe_any([v for item in items for v in item.key_fields], limit=16),
+                    "relation_keys": _dedupe_any([v for item in items for v in item.relation_keys], limit=16),
+                    "important_fields": _dedupe_any([v for item in items for v in item.important_fields], limit=30),
+                    "parsing_notes": _dedupe_any([v for item in items for v in item.parsing_notes], limit=12),
+                    "orchestration_note": "Read every file matching the pattern, concatenate rows, and keep a `source_file` column to preserve file-level identity.",
+                }
+                group_profiles = _compact_group_profiles_for_automl(grouped_summaries)
+                if group_profiles:
+                    entry["field_profiles"] = group_profiles
+                group_sheet_profiles = _compact_group_excel_sheet_profiles_for_automl(grouped_summaries)
+                if group_sheet_profiles:
+                    entry["excel_sheet_profiles"] = group_sheet_profiles
+            else:
+                entry = {
+                    "kind": "single_file",
+                    "path": representative.path,
+                    "read_method": representative.read_method,
+                    "read_example": representative.read_example,
+                    "columns": [],
+                    "row_grain": representative.row_grain,
+                    "key_fields": _dedupe_any(representative.key_fields, limit=16),
+                    "relation_keys": _dedupe_any(representative.relation_keys, limit=16),
+                    "important_fields": _dedupe_any(representative.important_fields, limit=30),
+                    "parsing_notes": _dedupe_any(representative.parsing_notes, limit=12),
+                }
+                fs = summaries_by_path.get(str(representative.path))
+                if fs is not None:
+                    entry["file_role"] = fs.role.value if isinstance(fs.role, FileRole) else str(fs.role)
+                    entry["summary"] = str(fs.summary or "")[:600]
+                    entry["columns"] = [str(x) for x in (fs.columns or [])[:120]]
+                    metadata = _compact_file_metadata_for_automl(fs)
+                    if metadata:
+                        entry["source_metadata"] = metadata
+                    profiles = _compact_file_profiles_for_automl(fs)
+                    if profiles:
+                        entry["field_profiles"] = profiles
+                    sheet_profiles = _compact_excel_sheet_profiles_for_automl(fs)
+                    if sheet_profiles:
+                        entry["excel_sheet_profiles"] = sheet_profiles
+            data_entries.append(entry)
+
+    entity_alias_candidates = build_entity_alias_candidates(
+        file_summaries,
+        filename_sample_groups=compact_filename_groups,
+        source_aliases=entity_alias_source_aliases,
+    )
 
     output = bundle.output
     output_contract = {
@@ -1263,6 +1919,7 @@ def build_automl_context_pack(
         "sample_submission_available": bool(ctx.get("sample_submission_available", False)),
         "sample_submission_generation_status": ctx.get("sample_submission_generation_status", ""),
         "sample_submission_generation_issues": ctx.get("sample_submission_generation_issues", []),
+        "sample_submission_source_field_corrections": ctx.get("sample_submission_source_field_corrections", []),
         "generated_submission_path": ctx.get("generated_submission_path", ""),
         "generated_submission_columns": ctx.get("generated_submission_columns", []),
     }
@@ -1288,6 +1945,29 @@ def build_automl_context_pack(
             "final_score_formula": bundle.evaluation_summary,
             "final_validation_score_rule": "Metric must evaluate to one numeric scalar.",
         }
+
+    method_strategy: dict[str, Any] = {
+        "problem_paradigm": paradigm or "unknown_but_executable",
+        "explicit_rl_requested": explicit_rl_requested,
+        "rl_as_required_paradigm": rl_as_required_paradigm,
+        "recommended_solver_families": recommended_solver_families,
+        "method_routing_notes": method_routing_notes,
+    }
+    if paradigm in {"static_optimization", "hybrid_ml_optimization"}:
+        method_strategy["first_draft_policy"] = (
+            "Build a deterministic evaluator plus a greedy/repair/local-search or OR baseline first. "
+            "The first runnable node should produce a real, possibly partial, solution and a penalized scalar score."
+        )
+        method_strategy["rl_branch_policy"] = (
+            "If RL is requested, treat it as a later comparable branch. It must reuse the same load_problem_data, "
+            "validate_solution, score_solution, output schema, hard constraints, and final scalar score."
+        )
+    elif paradigm == "reinforcement_learning":
+        method_strategy["first_draft_policy"] = (
+            "Build the environment/evaluator contract first, then compare a simple policy or heuristic rollout before expensive RL training."
+        )
+    else:
+        method_strategy["first_draft_policy"] = "Follow the task paradigm, but keep the first runnable solution simple and fully evaluable."
 
     modeling_boundary: list[str] = []
     if paradigm == "ml_dl_prediction":
@@ -1315,11 +1995,17 @@ def build_automl_context_pack(
                     f"Solution representation: {p.solution_representation}",
                     *p.decision_variables,
                     *p.feasibility_checks,
-                    "If using RL voluntarily, define partial solution or environment state as `state`, feasible decisions or repair operations as `action`, deterministic/simulated updates as `transition`, and scalarized objective/penalty as `reward`; consider curriculum learning. This is non-binding advice, not a task requirement.",
                 ],
                 limit=24,
             )
         )
+        if explicit_rl_requested:
+            modeling_boundary.extend(
+                [
+                    "RL is a requested/allowed solver branch, not the task paradigm; do not replace the deterministic evaluator with a reward-only metric.",
+                    "First implement a scorable static optimization baseline, then compare any RL policy against that same score_solution contract.",
+                ]
+            )
     elif paradigm == "reinforcement_learning":
         p = bundle.rl
         modeling_boundary.extend(
@@ -1348,17 +2034,20 @@ def build_automl_context_pack(
                     f"Handoff: {p.handoff}",
                     f"Final objective: {p.final_objective}",
                     f"Validation design: {p.validation_design}",
-                    "If using RL voluntarily for the decision stage, define state/action/transition/reward/terminal from the optimization protocol and keep hard constraints authoritative. This is non-binding advice, not a task requirement.",
                 ],
                 limit=20,
             )
         )
 
     data_orchestration = [
-        "Use `./input` as the data root inside MLEvolve workspaces.",
-        "Prefer the read examples below over generic pandas guesses, especially for non-standard CSV dialects or repeated-file groups.",
-        "When this AutoRealize context is present, do not regenerate or append a separate MLEvolve data preview; this file is the stable task/data context for provider-cache efficiency.",
+        "Runtime data root fact: input files are available under `./input` in downstream workspaces.",
+        "Non-default CSV dialects, repeated-file groups, multi-sheet Excel, and JSON table extraction notes are recorded only when detected.",
+        "This file is fixed-context supplemental facts; `description.md` remains the primary task statement.",
     ]
+    if explicit_rl_requested and paradigm in {"static_optimization", "hybrid_ml_optimization"}:
+        data_orchestration.append(
+            "RL was requested in the task text, but AutoRealize classified the executable contract as static optimization because evaluation consumes a complete solution table/plan."
+        )
     evidence_levels = ctx.get("evidence_levels") if isinstance(ctx.get("evidence_levels"), dict) else {}
     heuristic_fields = [str(x) for x in (ctx.get("heuristic_fields") or []) if str(x).strip()]
     if evidence_levels:
@@ -1373,9 +2062,13 @@ def build_automl_context_pack(
         )
     if len(data_entries) > 1:
         data_orchestration.append("Join/merge tables only through documented key fields, relation keys, filename IDs, or authoritative task descriptions.")
-    if paradigm in {"static_optimization", "hybrid_ml_optimization"}:
+    if compact_table_cards:
         data_orchestration.append(
-            "Optional modeling note: AutoML may choose RL for optimization, but RL state/action/transition/reward/terminal/episode/policy are modeling choices unless the official task defines them."
+            "Large previews and raw source metadata are intentionally omitted from this fixed context."
+        )
+    if compact_relations:
+        data_orchestration.append(
+            "relation_cards are non-authoritative join hints unless confirmed by task requirements."
         )
 
     constraints = _dedupe_any(
@@ -1396,6 +2089,7 @@ def build_automl_context_pack(
             "Do not use future information or validation/test labels during training, preprocessing, feature engineering, policy construction, or optimization.",
             "Do not force `id,target` or `submission.csv` for optimization/RL tasks unless an authoritative contract requires it.",
             "The final search metric must be one scalar number so tree search can compare nodes consistently.",
+            "If original requirements or description prose uses a business synonym that is not an exact source column, resolve it against the Exact Source Schema Contract before pandas access; prose aliases are never raw dataframe names.",
             *list(bundle.warnings or []),
         ],
         limit=24,
@@ -1403,16 +2097,26 @@ def build_automl_context_pack(
 
     return AutoMLContextPack(
         priority_rules=[
+            "Exact Source Schema Contract is authoritative for pandas sheet/column access; natural-language aliases are not raw dataframe names.",
+            "Read the Source Alias Guard before coding: aliases listed there are business concepts or corrected names, not safe raw dataframe columns unless an exact_physical_column is provided.",
             "Authority priority: user task hint > existing input description.md > README/official/spec/other task documents > data statistics and LLM inference.",
+            "If AutoRealize records source-field corrections, downstream code must use the corrected exact physical column names for pandas access.",
             "AutoRealize evaluation/output/data-access contracts override generic Kaggle templates and MLEvolve preview heuristics.",
-            "Runtime path facts still apply: code runs with input files under `./input`, scratch files under `./working`, and configured outputs under `./submission` only when required.",
+            "Runtime path facts: input files under `./input`; configured outputs under `./submission` only when required.",
+            "For static optimization/dispatch tasks, first produce a deterministic scorable baseline; RL is a later comparable branch unless the problem paradigm is explicitly reinforcement_learning.",
         ],
         problem_paradigm=paradigm or "unknown_but_executable",
         task_goal=bundle.task_goal or bundle.overview or str(ctx.get("task_hint", "")),
         data_orchestration=data_orchestration,
         data_access=data_entries,
+        data_schema_contract=data_schema_contract,
+        source_alias_guard=list(ctx.get("source_alias_guard", []) or []),
+        entity_alias_candidates=entity_alias_candidates,
         output_contract=output_contract,
         evaluation_contract=evaluation,
+        method_strategy=method_strategy,
+        relation_cards=compact_relations[:80],
+        filename_sample_groups=compact_filename_groups[:40],
         modeling_boundary=modeling_boundary,
         constraints=constraints,
         leakage_guards=leakage_guards,
@@ -1433,19 +2137,195 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     if not isinstance(pack, AutoMLContextPack):
         pack = AutoMLContextPack.model_validate(pack)
     lines: list[str] = [
-        "# AutoRealize Context For AutoML",
+        "## AutoRealize Structured Context",
         "",
-        "This file is the data-and-execution supplement for downstream AutoML/AutoRL agents.",
-        "Task definition, problem framing, and human-facing requirements remain in `description.md`; do not repeat them here unless needed as a one-line reference.",
+        "This file is a concise fixed-context supplement to `description.md`.",
+        "It records important contracts, constraints, table facts, and data caveats that may be too detailed for the human-facing description.",
+        "It must not rely on interactive retrieval: important supplemental facts should be visible here or in `description.md`.",
         "",
         "## Priority Rules",
     ]
     for item in _dedupe_any(pack.priority_rules, limit=12):
         lines.append(f"- {item}")
 
+    schema_contract = pack.data_schema_contract or {}
+    if schema_contract:
+        lines.extend(["", "## Exact Source Schema Contract"])
+        purpose = str(schema_contract.get("purpose", "") or "").strip()
+        if purpose:
+            lines.append(f"- purpose: {purpose}")
+        rules = _dedupe_any(schema_contract.get("rules", []), limit=12)
+        if rules:
+            lines.append("- hard_rules:")
+            lines.extend(f"  - {x}" for x in rules)
+        snippet = str(schema_contract.get("runtime_inspection_snippet", "") or "").strip()
+        if snippet:
+            lines.append(f"- runtime_inspection_snippet: {snippet}")
+        workbooks = schema_contract.get("workbooks") if isinstance(schema_contract.get("workbooks"), list) else []
+        if workbooks:
+            lines.append("- excel_workbook_sheet_names:")
+            for item in workbooks[:24]:
+                if not isinstance(item, dict):
+                    continue
+                sheets = [str(x) for x in (item.get("valid_sheet_names_exact") or [])[:24]]
+                lines.append(
+                    f"  - source_file={item.get('source_file')}; "
+                    f"valid_sheet_names_exact={sheets}"
+                )
+        tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
+        if tables:
+            lines.append("- tables:")
+            for table in tables[:40]:
+                if not isinstance(table, dict):
+                    continue
+                lines.append(
+                    f"  - table_id={table.get('table_id')}; "
+                    f"kind={table.get('table_kind')}; "
+                    f"source_file={table.get('source_file')}; "
+                    f"sheet_name={table.get('sheet_name')}; "
+                    f"shape={table.get('shape')}; "
+                    f"row_count_from_profiles={table.get('row_count_from_profiles')}; "
+                    f"column_count={table.get('column_count')}"
+                )
+                group = table.get("schema_group") if isinstance(table.get("schema_group"), dict) else {}
+                if group:
+                    representative_count = len(group.get("representative_files") or [])
+                    lines.append(
+                        f"    schema_group: file_count={group.get('file_count')}; "
+                        f"representative_count={representative_count}; "
+                        f"schema_consistent={group.get('schema_consistent')}; "
+                        f"column_variant_count={group.get('column_variant_count')}"
+                    )
+                    shared = [str(x) for x in (group.get("shared_physical_columns_exact") or [])]
+                    if shared:
+                        lines.append(
+                            "    shared_physical_columns_exact: "
+                            + ", ".join(f"`{x}`" for x in shared[:80])
+                        )
+                    variants = group.get("variant_fields_by_file") if isinstance(group.get("variant_fields_by_file"), list) else []
+                    if variants:
+                        lines.append("    variant_fields_by_file:")
+                        for idx, variant in enumerate(variants[:12], start=1):
+                            if not isinstance(variant, dict):
+                                continue
+                            fields = [str(x) for x in (variant.get("fields") or [])]
+                            suffix = f"; omitted={variant.get('omitted')}" if variant.get("omitted") else ""
+                            lines.append(
+                                f"      - variant=variant_{idx}; "
+                                f"fields={fields[:24]}{suffix}"
+                            )
+                    presence = group.get("field_presence") if isinstance(group.get("field_presence"), list) else []
+                    if presence:
+                        lines.append("    non_shared_field_presence:")
+                        for item in presence[:16]:
+                            if not isinstance(item, dict):
+                                continue
+                            examples = item.get("example_files") if isinstance(item.get("example_files"), list) else []
+                            lines.append(
+                                f"      - field={item.get('field')}; "
+                                f"present_in_count={item.get('present_in_count')}; "
+                                f"example_file_count={len(examples)}"
+                            )
+                columns = [str(x) for x in (table.get("physical_columns_exact") or [])]
+                if columns:
+                    lines.append("    physical_columns_exact: " + ", ".join(f"`{x}`" for x in columns[:120]))
+                    omitted = int(table.get("physical_columns_omitted") or 0)
+                    if omitted:
+                        lines.append(f"    physical_columns_omitted: {omitted}")
+                fields = table.get("field_summaries") if isinstance(table.get("field_summaries"), list) else []
+                if fields:
+                    lines.append("    key_field_summaries:")
+                    for field in fields[:16]:
+                        if not isinstance(field, dict):
+                            continue
+                        parts = [
+                            f"name={field.get('name')}",
+                            f"meaning={field.get('meaning')}" if field.get("meaning") else "",
+                            f"type={field.get('logical_type')}" if field.get("logical_type") else "",
+                            f"null_ratio={field.get('null_ratio')}" if field.get("null_ratio") is not None else "",
+                            f"unique={field.get('unique_count')}" if field.get("unique_count") is not None else "",
+                        ]
+                        if field.get("numeric_range"):
+                            parts.append(f"numeric_range={field.get('numeric_range')}")
+                        if field.get("datetime_range"):
+                            parts.append(f"datetime_range={field.get('datetime_range')}")
+                        lines.append("      - " + "; ".join(str(x) for x in parts if str(x).strip()))
+                warnings = _dedupe_any(table.get("warnings", []), limit=4)
+                if warnings:
+                    lines.append("    warnings: " + "; ".join(warnings))
+
+    if pack.source_alias_guard:
+        lines.extend(["", "## Source Alias Guard"])
+        lines.append("- purpose: Business/source-field aliases below appeared in requirements, description, constraints, or output specs, but they must be resolved before pandas access.")
+        lines.append("- hard_rule: Never use an alias as `df[alias]`, `groupby(alias)`, `merge(on=alias)`, or `sheet_name=alias` unless `status=exact_physical_column` or `exact_physical_column` is provided.")
+        lines.append("- hard_rule: If `status=unresolved_business_concept`, implement a conservative derived rule, mark the constraint unresolved in validation details, or avoid using it for raw filtering; do not invent a same-named column.")
+        for item in pack.source_alias_guard[:40]:
+            if not isinstance(item, dict):
+                continue
+            parts = [
+                f"alias={item.get('alias')}",
+                f"status={item.get('status')}",
+                f"exact_physical_column={item.get('exact_physical_column')}" if item.get("exact_physical_column") else "",
+                f"candidate_exact_columns={item.get('candidate_exact_columns')}" if item.get("candidate_exact_columns") else "",
+                f"source={item.get('source')}" if item.get("source") else "",
+                f"rule={item.get('rule')}" if item.get("rule") else "",
+            ]
+            lines.append("  - " + "; ".join(str(x) for x in parts if str(x).strip()))
+
+    if pack.entity_alias_candidates:
+        lines.extend(["", "## Entity Alias Candidates"])
+        lines.append("- purpose: Candidate business-entity aliases for data investigation. These are not confirmed equivalent keys.")
+        for group in pack.entity_alias_candidates[:12]:
+            if not isinstance(group, dict):
+                continue
+            lines.append(
+                f"- concept_id={group.get('concept_id')}; "
+                f"label={group.get('label')}; "
+                f"status={group.get('status')}; "
+                f"alias_families={group.get('alias_families')}; "
+                f"value_kinds={group.get('value_kinds')}"
+            )
+            fields = group.get("candidate_fields") if isinstance(group.get("candidate_fields"), list) else []
+            if fields:
+                lines.append("  candidate_fields:")
+                for item in fields[:24]:
+                    if not isinstance(item, dict):
+                        continue
+                    parts = [
+                        f"source_file={item.get('source_file')}",
+                        f"sheet_name={item.get('sheet_name')}" if item.get("sheet_name") else "",
+                        f"field={item.get('field')}",
+                        f"alias_family={item.get('alias_family')}",
+                        f"value_kind={item.get('value_kind')}",
+                        f"status={item.get('status')}",
+                    ]
+                    lines.append("    - " + "; ".join(str(x) for x in parts if str(x).strip()))
+            checks = group.get("recommended_qdi_checks") if isinstance(group.get("recommended_qdi_checks"), list) else []
+            if checks:
+                lines.append("  recommended_qdi_checks:")
+                lines.extend(f"    - {x}" for x in checks[:8])
+
     lines.extend(["", "## Minimal Task Reference", f"- Problem paradigm: `{pack.problem_paradigm}`"])
     if pack.task_goal:
         lines.append(f"- Task goal reference: {pack.task_goal}")
+
+    method = pack.method_strategy or {}
+    if method:
+        lines.extend(["", "## Method Strategy"])
+        for key in ["problem_paradigm", "explicit_rl_requested", "rl_as_required_paradigm"]:
+            if key in method:
+                lines.append(f"- {key}: `{method.get(key)}`")
+        families = _dedupe_any(method.get("recommended_solver_families", []), limit=10)
+        if families:
+            lines.append("- recommended_solver_families: " + ", ".join(f"`{x}`" for x in families))
+        for key in ["first_draft_policy", "rl_branch_policy"]:
+            value = str(method.get(key, "") or "").strip()
+            if value:
+                lines.append(f"- {key}: {value}")
+        notes = _dedupe_any(method.get("method_routing_notes", []), limit=8)
+        if notes:
+            lines.append("- method_routing_notes:")
+            lines.extend(f"  - {x}" for x in notes)
 
     lines.extend(["", "## Evaluation Contract Reference"])
     evaluation = pack.evaluation_contract or {}
@@ -1463,7 +2343,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
             lines.append(f"- {key}: {value}")
     if final_formula:
         lines.append(f"- final_score_formula: {final_formula}")
-    lines.append("- final_validation_score_rule: print exactly one numeric `Final Validation Score` using `final_score_formula`; do not create or optimize another metric.")
+    lines.append("- final_validation_score_rule: validation should be comparable by exactly one numeric `Final Validation Score` derived from `final_score_formula`.")
     for key in ["submission_checks", "invalid_solution_rules", "tie_break_rules", "audit_metrics"]:
         values = _dedupe_any(evaluation.get(key, []), limit=12)
         if values:
@@ -1479,40 +2359,102 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     columns = _dedupe_any(output.get("columns", []), limit=60)
     if columns:
         lines.append("- columns: " + ", ".join(f"`{x}`" for x in columns))
+        lines.extend(
+            [
+                "- output_schema_rules:",
+                "  - Output/submission columns are generated result fields, not raw input dataframe columns.",
+                "  - Do not select these columns from source tables unless an exact physical column with the same name is listed in `physical_columns_exact`.",
+                "  - Define a code constant such as `OUTPUT_COLUMNS` from this column order.",
+                "  - Build generated result tables with `pd.DataFrame(rows, columns=OUTPUT_COLUMNS)` so zero-row/no-feasible solutions still keep the required schema.",
+                "  - Empty, all-unassigned, or no-feasible solutions must be handled by validation/scoring and reported in `Decision Validation Summary`; do not let output CSV construction fail with pandas `KeyError`.",
+            ]
+        )
     rules = _dedupe_any(output.get("format_rules", []), limit=16)
     if rules:
         lines.append("- format_rules:")
         lines.extend(f"  - {x}" for x in rules)
+    sample_spec = output.get("sample_submission_spec") if isinstance(output.get("sample_submission_spec"), dict) else {}
+    sample_source_fields = sample_spec.get("source_fields") if isinstance(sample_spec.get("source_fields"), dict) else {}
+    if sample_source_fields:
+        lines.append("- sample_submission_source_fields:")
+        for col, source in list(sample_source_fields.items())[:20]:
+            lines.append(f"  - `{col}`: {source}")
+    sample_validation_rules = _dedupe_any(sample_spec.get("validation_rules", []), limit=16) if sample_spec else []
+    if sample_validation_rules:
+        lines.append("- sample_submission_validation_rules:")
+        lines.extend(f"  - {x}" for x in sample_validation_rules)
+    corrections = output.get("sample_submission_source_field_corrections")
+    if isinstance(corrections, list) and corrections:
+        lines.append("- source_field_corrections:")
+        for item in corrections[:12]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "  - "
+                + "; ".join(
+                    str(x)
+                    for x in [
+                        f"output_column={item.get('output_column')}",
+                        f"from_alias={item.get('from')}",
+                        f"to_physical_column={item.get('to')}",
+                        f"reason={item.get('reason')}",
+                    ]
+                    if str(x).strip() and not str(x).endswith("=None")
+                )
+            )
 
-    lines.extend(["", "## Data Inventory And Orchestration"])
+    lines.extend(["", "## Supplemental Data Facts"])
     for item in _dedupe_any(pack.data_orchestration, limit=12):
         lines.append(f"- {item}")
     if pack.data_access:
-        lines.append("- This section is intentionally more detailed than `description.md`; it merges parser metadata, field profiles, workbook sheet inventories, and sample rows for downstream modeling.")
-    for entry in pack.data_access[:30]:
-        title = entry.get("pattern") or entry.get("path") or "data file"
+        lines.append("- This section is intentionally more detailed than `description.md`, but remains bounded for fixed-context use.")
+    for entry in pack.data_access[:20]:
+        title = entry.get("pattern") or entry.get("table_id") or entry.get("path") or "data file"
         lines.extend(["", f"### {title}"])
-        for key in ["kind", "file_count", "file_role", "summary", "read_method", "row_grain", "orchestration_note"]:
+        for key in ["kind", "file_count", "file_role", "sheet_name", "shape", "summary", "read_method", "row_grain", "orchestration_note"]:
             value = entry.get(key)
             if value not in (None, "", []):
                 lines.append(f"- {key}: {value}")
         columns = _dedupe_any(entry.get("columns", []), limit=80)
         if columns:
             lines.append("- columns: " + ", ".join(f"`{x}`" for x in columns[:40]))
+        fields = entry.get("fields") if isinstance(entry.get("fields"), list) else []
+        if fields:
+            lines.append("- fields:")
+            for field in fields[:16]:
+                if not isinstance(field, dict):
+                    continue
+                parts = [
+                    f"name={field.get('name')}",
+                    f"meaning={field.get('meaning')}" if field.get("meaning") else "",
+                    f"role={field.get('role')}" if field.get("role") else "",
+                    f"type={field.get('logical_type')}" if field.get("logical_type") else "",
+                    f"row_count={field.get('row_count')}" if field.get("row_count") is not None else "",
+                    f"non_null={field.get('non_null_count')}" if field.get("non_null_count") is not None else "",
+                    f"null_ratio={field.get('null_ratio')}" if field.get("null_ratio") is not None else "",
+                    f"unique={field.get('unique_count')}" if field.get("unique_count") is not None else "",
+                ]
+                numeric = field.get("numeric_stats") if isinstance(field.get("numeric_stats"), dict) else {}
+                datetime_stats = field.get("datetime_stats") if isinstance(field.get("datetime_stats"), dict) else {}
+                if numeric:
+                    parts.append(f"numeric_stats={numeric}")
+                if datetime_stats:
+                    parts.append(f"datetime_stats={datetime_stats}")
+                if field.get("top_values"):
+                    parts.append(f"top_values={field.get('top_values')}")
+                lines.append("  - " + "; ".join(str(x) for x in parts if str(x).strip()))
         source_metadata = entry.get("source_metadata") if isinstance(entry.get("source_metadata"), dict) else {}
         if source_metadata:
             shape = source_metadata.get("shape")
             if shape not in (None, "", []):
                 lines.append(f"- shape: {shape}")
-            if source_metadata.get("preview"):
-                lines.append("- preview:")
-                for row in (source_metadata.get("preview") or [])[:3]:
-                    if isinstance(row, dict):
-                        lines.append("  - " + json.dumps(row, ensure_ascii=False, default=str)[:1000])
         for key in ["key_fields", "relation_keys", "important_fields", "parsing_notes"]:
             values = _dedupe_any(entry.get(key, []), limit=16)
             if values:
                 lines.append(f"- {key}: " + ", ".join(f"`{x}`" for x in values))
+        warnings = _dedupe_any(entry.get("warnings", []), limit=8)
+        if warnings:
+            lines.append("- warnings: " + "; ".join(str(x) for x in warnings))
         metadata = source_metadata
         sampling = metadata.get("profile_sampling") if isinstance(metadata.get("profile_sampling"), dict) else {}
         if sampling:
@@ -1543,7 +2485,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         field_profiles = entry.get("field_profiles") if isinstance(entry.get("field_profiles"), list) else []
         if field_profiles:
             lines.append("- field_profiles:")
-            for profile in field_profiles[:20]:
+            for profile in field_profiles[:16]:
                 if not isinstance(profile, dict):
                     continue
                 parts = [
@@ -1564,7 +2506,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         sheet_profiles = entry.get("excel_sheet_profiles") if isinstance(entry.get("excel_sheet_profiles"), list) else []
         if sheet_profiles:
             lines.append("- excel_sheet_profiles:")
-            for sheet in sheet_profiles[:20]:
+            for sheet in sheet_profiles[:12]:
                 if not isinstance(sheet, dict):
                     continue
                 cols = [str(x) for x in (sheet.get("columns") or [])[:12]]
@@ -1576,24 +2518,24 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                     f"deep_profiled={sheet.get('is_deep_profiled')}; "
                     f"group={sheet.get('sheet_group_id')}; "
                     f"representative={sheet.get('sheet_group_representative')}; "
+                    f"layout={sheet.get('layout_kind')}; "
+                    f"detected_header_row={sheet.get('detected_header_row')}; "
+                    f"read_strategy={sheet.get('read_strategy_kind')}; "
                     f"columns={cols}; "
                     f"read={sheet.get('read_example')}"
                 )
-                raw_preview = sheet.get("raw_preview") if isinstance(sheet.get("raw_preview"), list) else []
-                if raw_preview:
-                    lines.append(f"    raw_preview_header_none={raw_preview[:10]}")
-                preview = sheet.get("preview") if isinstance(sheet.get("preview"), list) else []
-                if preview:
-                    lines.append(f"    preview={preview[:10]}")
+                risks = [str(x) for x in (sheet.get("reading_risks") or [])[:4]]
+                if risks:
+                    lines.append("    reading_risks: " + " | ".join(risks))
                 sheet_desc = sheet.get("field_descriptions") if isinstance(sheet.get("field_descriptions"), dict) else {}
                 if sheet_desc:
                     lines.append("    field_descriptions:")
-                    for name, meaning in list(sheet_desc.items())[:16]:
+                    for name, meaning in list(sheet_desc.items())[:12]:
                         lines.append(f"      - `{name}`: {meaning}")
                 sheet_profiles = sheet.get("column_profiles") if isinstance(sheet.get("column_profiles"), list) else []
                 if sheet_profiles:
                     lines.append("    column_profiles:")
-                    for profile in sheet_profiles[:16]:
+                    for profile in sheet_profiles[:10]:
                         if not isinstance(profile, dict):
                             continue
                         parts = [f"name={profile.get('name')}"]
@@ -1621,8 +2563,45 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                 lines.append(f"df = {read_example}")
                 lines.append("```")
 
+    if pack.relation_cards:
+        lines.extend(["", "## Relation Cards"])
+        for rel in pack.relation_cards[:40]:
+            if not isinstance(rel, dict):
+                continue
+            parts = [
+                f"{rel.get('left_file')}.{rel.get('left_field')}",
+                f"-> {rel.get('right_file')}.{rel.get('right_field')}",
+                f"type={rel.get('relation_type')}",
+                f"confidence={rel.get('confidence')}",
+                f"evidence={rel.get('short_evidence')}",
+            ]
+            lines.append("- " + "; ".join(str(x) for x in parts if str(x).strip()))
+
+    if pack.filename_sample_groups:
+        lines.extend(["", "## Filename Sample Groups"])
+        for group in pack.filename_sample_groups[:30]:
+            if not isinstance(group, dict):
+                continue
+            lines.append(
+                "- "
+                + "; ".join(
+                    str(x)
+                    for x in [
+                        f"template={group.get('template_path_or_sample_id') or group.get('template_path')}",
+                        f"count={group.get('file_count') or group.get('count')}",
+                        f"role={group.get('role')}",
+                        f"representatives={group.get('representative_files')}",
+                        f"shared_fields={group.get('shared_fields')}",
+                        f"variant_fields_by_file={group.get('variant_fields_by_file')}",
+                        f"field_presence={group.get('field_presence')}",
+                        f"evidence={group.get('short_evidence')}",
+                    ]
+                    if str(x).strip() and not str(x).endswith("=None")
+                )
+            )
+
     if pack.modeling_boundary:
-        lines.extend(["", "## Modeling Boundary Reference"])
+        lines.extend(["", "## Problem Boundary Reference"])
         lines.extend(f"- {x}" for x in _dedupe_any(pack.modeling_boundary, limit=30))
     if pack.constraints:
         lines.extend(["", "## Constraints Reference"])
@@ -1838,6 +2817,16 @@ def _excel_sheet_profiles(fs: FileSummary) -> list[dict[str, Any]]:
     return [x for x in sheets if isinstance(x, dict)]
 
 
+def _find_excel_sheet_profile(fs: FileSummary, sheet_name: str) -> dict[str, Any] | None:
+    wanted = str(sheet_name or "").strip()
+    if not wanted:
+        return None
+    for sheet in _excel_sheet_profiles(fs):
+        if str(sheet.get("sheet_name", "") or "").strip() == wanted:
+            return sheet
+    return None
+
+
 def _has_multi_sheet_profiles(fs: FileSummary) -> bool:
     return len(_excel_sheet_profiles(fs)) > 1
 
@@ -1983,7 +2972,13 @@ def _render_field_section(file_summaries: list[FileSummary], protocol: DataAcces
                 source_count = sheet.get("source_file_count") or len(members)
                 lines.append("")
                 lines.append(f"#### sheet: {sheet_title}")
-                lines.append(f"- sheet用途：来自该重复 workbook 组的 `{sheet_title}` sheet，覆盖 {source_count} 个文件；shape 示例={shape}。")
+                read_hint = str(sheet.get("recommended_read", "") or sheet.get("read_example", "") or "").strip()
+                layout = str(sheet.get("layout_kind", "") or "standard_table")
+                lines.append(
+                    f"- sheet用途：来自该重复 workbook 组的 `{sheet_title}` sheet，覆盖 {source_count} 个文件；"
+                    f"shape 示例={shape}；layout={layout}"
+                    + (f"；建议读取：`{read_hint}`。" if read_hint else "。")
+                )
                 lines.extend(_render_group_sheet_field_lines(group, sheet_title, sheet, members))
             continue
         if (not is_group) and _has_multi_sheet_profiles(fs):
@@ -1991,7 +2986,12 @@ def _render_field_section(file_summaries: list[FileSummary], protocol: DataAcces
                 sheet_title = str(sheet.get("sheet_name", "") or "sheet")
                 lines.append("")
                 lines.append(f"#### sheet: {sheet_title}")
-                lines.append(f"- sheet用途：`{fs.path}` 中的 `{sheet_title}` sheet；shape={sheet.get('shape')}。")
+                read_hint = str(sheet.get("recommended_read", "") or "").strip()
+                layout = str(sheet.get("layout_kind", "") or "standard_table")
+                lines.append(
+                    f"- sheet用途：`{fs.path}` 中的 `{sheet_title}` sheet；shape={sheet.get('shape')}；layout={layout}"
+                    + (f"；建议读取：`{read_hint}`。" if read_hint else "。")
+                )
                 lines.extend(_render_sheet_field_lines(fs, sheet))
             continue
         profiles = _profile_map(fs)

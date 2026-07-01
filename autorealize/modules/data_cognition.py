@@ -19,6 +19,7 @@ from ..models import AuthoritativeTaskMemory, FileGroupingRegexPlan, FileRole, F
 from ..prompt_cache import stable_dynamic_prompt
 from ..profiling.csv_utils import read_csv_auto
 from ..profiling.relations import detect_relations
+from ..profiling.stats import infer_excel_sheet_layout
 from ..report_writer import append_constraint_memory_section, format_column_profile_inline, write_data_description
 from ..utils.filesystem import rel, walk_dirs, walk_files
 from ..utils.safe_json import dumps_json_safe, write_json_safe
@@ -457,6 +458,10 @@ class DataCognitionModule:
                         "columns_preview": schema_info.get("columns_preview", []),
                         "column_count": schema_info.get("column_count"),
                         "schema_error": schema_info.get("error"),
+                        "sheet_count": schema_info.get("sheet_count"),
+                        "sheet_names_preview": schema_info.get("sheet_names_preview", []),
+                        "layout_summary": schema_info.get("layout_summary", []),
+                        "schema_basis": schema_info.get("schema_basis", ""),
                     },
                 )
                 if match_info:
@@ -697,6 +702,10 @@ class DataCognitionModule:
                     "columns_preview": schema_info.get("columns_preview", []),
                     "column_count": schema_info.get("column_count"),
                     "schema_error": schema_info.get("error"),
+                    "sheet_count": schema_info.get("sheet_count"),
+                    "sheet_names_preview": schema_info.get("sheet_names_preview", []),
+                    "layout_summary": schema_info.get("layout_summary", []),
+                    "schema_basis": schema_info.get("schema_basis", ""),
                     "regex_name": match_info.get("regex_name", ""),
                     "regex": match_info.get("regex", ""),
                     "regex_reason": match_info.get("regex_reason", ""),
@@ -1603,9 +1612,15 @@ def _sampling_review_payload(item: dict[str, Any]) -> dict[str, Any]:
         "total": item.get("total"),
         "sampling_reason": item.get("sampling_reason"),
         "schema_signature": item.get("schema_signature"),
+        "schema_basis": item.get("schema_basis"),
+        "same_regex_schema_variant_count": item.get("same_regex_schema_variant_count"),
+        "same_regex_schema_variant_signatures": item.get("same_regex_schema_variant_signatures") or [],
         "columns_preview": item.get("columns_preview") or [],
         "column_count": item.get("column_count"),
         "schema_error": item.get("schema_error"),
+        "sheet_count": item.get("sheet_count"),
+        "sheet_names_preview": item.get("sheet_names_preview") or [],
+        "layout_summary": item.get("layout_summary") or [],
         "will_read": item.get("sampled", [])[:30],
         "will_skip": item.get("skipped", [])[:120],
         "will_skip_count": len(item.get("skipped", []) or []),
@@ -1816,6 +1831,11 @@ def _build_sampling_candidates_from_pattern_groups(
     reason_prefix: str,
 ) -> list[dict[str, Any]]:
     sampling_candidates: list[dict[str, Any]] = []
+    variant_signatures_by_pattern: dict[tuple[str, str], list[str]] = {}
+    for (pattern, suffix, schema_sig) in pattern_groups:
+        variant_signatures_by_pattern.setdefault((pattern, suffix), [])
+        if schema_sig not in variant_signatures_by_pattern[(pattern, suffix)]:
+            variant_signatures_by_pattern[(pattern, suffix)].append(schema_sig)
     for (pattern, suffix, schema_sig), files in pattern_groups.items():
         files_sorted = sorted(files)
         min_group = tabular_min_group if suffix in tabular_ext else generic_min_group
@@ -1850,6 +1870,12 @@ def _build_sampling_candidates_from_pattern_groups(
                 "columns_preview": meta.get("columns_preview") or [],
                 "column_count": meta.get("column_count"),
                 "schema_error": meta.get("schema_error"),
+                "sheet_count": meta.get("sheet_count"),
+                "sheet_names_preview": meta.get("sheet_names_preview") or [],
+                "layout_summary": meta.get("layout_summary") or [],
+                "schema_basis": meta.get("schema_basis") or "",
+                "same_regex_schema_variant_count": len(variant_signatures_by_pattern.get((pattern, suffix), [])),
+                "same_regex_schema_variant_signatures": variant_signatures_by_pattern.get((pattern, suffix), [])[:12],
                 "_files": files_sorted,
                 "_sample_paths": samples,
                 "_skipped_paths": skipped,
@@ -1954,19 +1980,20 @@ def _table_schema_signature(path: Path) -> dict[str, Any]:
     try:
         if suffix == ".csv":
             df = read_csv_auto(path, nrows=0)
+            columns = [str(c) for c in df.columns]
+            normalized = [re.sub(r"\s+", " ", c).strip().lower() for c in columns]
+            payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+            digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+            return {
+                "signature": f"cols:{len(columns)}:{digest}",
+                "columns_preview": columns[:30],
+                "column_count": len(columns),
+                "schema_basis": "csv_header",
+            }
         elif suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(path, nrows=0)
+            return _excel_schema_signature(path)
         else:
             return {"signature": "", "columns_preview": [], "column_count": None}
-        columns = [str(c) for c in df.columns]
-        normalized = [re.sub(r"\s+", " ", c).strip().lower() for c in columns]
-        payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-        digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
-        return {
-            "signature": f"cols:{len(columns)}:{digest}",
-            "columns_preview": columns[:30],
-            "column_count": len(columns),
-        }
     except Exception as exc:
         return {
             "signature": f"schema_error:{type(exc).__name__}",
@@ -1974,4 +2001,161 @@ def _table_schema_signature(path: Path) -> dict[str, Any]:
             "column_count": None,
             "error": str(exc)[:300],
         }
+
+
+def _excel_schema_signature(path: Path) -> dict[str, Any]:
+    xls = pd.ExcelFile(path)
+    try:
+        sheet_names = [str(x) for x in xls.sheet_names if str(x).strip()]
+        sheet_items: list[dict[str, Any]] = []
+        layout_summary: list[dict[str, Any]] = []
+        first_columns: list[str] = []
+        total_columns = 0
+        for sheet in sheet_names[:80]:
+            raw_preview: list[list[Any]] = []
+            try:
+                raw_df = xls.parse(sheet_name=sheet, header=None, nrows=8)
+                raw_preview = _raw_preview_rows_for_schema(raw_df)
+            except Exception:
+                raw_preview = []
+            try:
+                default_df = xls.parse(sheet_name=sheet, nrows=0)
+                columns = [str(c) for c in default_df.columns]
+            except Exception:
+                columns = []
+            layout = infer_excel_sheet_layout(
+                raw_preview=raw_preview,
+                default_columns=columns,
+                sheet_name=sheet,
+            )
+            schema_columns = _schema_columns_for_excel_sheet(raw_preview, columns, layout)
+            if not first_columns and schema_columns:
+                first_columns = schema_columns
+            total_columns += len(schema_columns)
+            sheet_items.append(
+                {
+                    "sheet_name": _normalize_schema_text(sheet),
+                    "layout_kind": layout.get("layout_kind", ""),
+                    "read_strategy_kind": layout.get("read_strategy_kind", ""),
+                    "detected_header_row": layout.get("detected_header_row"),
+                    "columns": [_normalize_schema_text(x) for x in schema_columns],
+                    "column_count": len(schema_columns),
+                    "raw_shape": [
+                        len(raw_preview),
+                        max([len(row) for row in raw_preview] + [len(columns), 0]),
+                    ],
+                }
+            )
+            layout_summary.append(
+                {
+                    "sheet_name": sheet,
+                    "layout_kind": layout.get("layout_kind", ""),
+                    "read_strategy_kind": layout.get("read_strategy_kind", ""),
+                    "detected_header_row": layout.get("detected_header_row"),
+                    "recommended_read": layout.get("recommended_read", ""),
+                    "columns_preview": schema_columns[:20],
+                    "default_columns_preview": columns[:20],
+                }
+            )
+        payload = json.dumps(sheet_items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+        return {
+            "signature": f"excel:{len(sheet_items)}:{digest}",
+            "columns_preview": first_columns[:30],
+            "column_count": total_columns if sheet_items else None,
+            "sheet_count": len(sheet_names),
+            "sheet_names_preview": sheet_names[:30],
+            "layout_summary": layout_summary[:20],
+            "schema_basis": "excel_sheet_layout_and_header_strategy",
+        }
+    finally:
+        xls.close()
+
+
+def _schema_columns_for_excel_sheet(
+    raw_preview: list[list[Any]],
+    default_columns: list[str],
+    layout: dict[str, Any],
+) -> list[str]:
+    layout_kind = str(layout.get("layout_kind", "") or "")
+    if layout_kind == "non_default_header":
+        try:
+            idx = int(layout.get("detected_header_row"))
+        except Exception:
+            idx = -1
+        if 0 <= idx < len(raw_preview):
+            header = [_schema_cell_text(x) for x in raw_preview[idx]]
+            return [x for x in header if x]
+    if layout_kind in {"headerless_table", "document_like_sheet", "sparse_or_irregular_sheet"}:
+        ncols = max([len(row) for row in raw_preview] + [len(default_columns), 0])
+        type_cols = []
+        for col_idx in range(ncols):
+            observed = []
+            for row in raw_preview[:8]:
+                value = row[col_idx] if col_idx < len(row) else None
+                observed.append(_schema_cell_kind(value))
+            dominant = _dominant_schema_kind(observed)
+            type_cols.append(f"col{col_idx + 1}:{dominant}")
+        return type_cols
+    return [str(c) for c in default_columns]
+
+
+def _raw_preview_rows_for_schema(df: pd.DataFrame) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for values in df.itertuples(index=False, name=None):
+        row: list[Any] = []
+        for value in values:
+            try:
+                if pd.isna(value):
+                    row.append(None)
+                    continue
+            except Exception:
+                pass
+            if hasattr(value, "item"):
+                try:
+                    value = value.item()
+                except Exception:
+                    pass
+            row.append(value)
+        rows.append(row)
+    return rows
+
+
+def _schema_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def _schema_cell_kind(value: Any) -> str:
+    text = _schema_cell_text(value)
+    if not text:
+        return "empty"
+    if re.fullmatch(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:%?)", text):
+        return "number"
+    if re.search(r"\d{4}[-/年]\d{1,2}", text):
+        return "date"
+    if len(text) >= 50:
+        return "long_text"
+    return "text"
+
+
+def _dominant_schema_kind(values: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        if value == "empty":
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return "empty"
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _normalize_schema_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
 

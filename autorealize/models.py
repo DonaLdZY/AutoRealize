@@ -82,6 +82,10 @@ class ProblemParadigmReview(BaseModel):
     key_signals: list[str] = Field(default_factory=list)
     requires_sample_submission: bool = False
     output_contract_source: str = ""
+    explicit_rl_requested: bool = False
+    rl_as_required_paradigm: bool = False
+    recommended_solver_families: list[str] = Field(default_factory=list)
+    method_routing_notes: list[str] = Field(default_factory=list)
 
 
 class DataAccessFileProtocol(BaseModel):
@@ -360,10 +364,27 @@ class QuestionInvestigationFollowupQuestion(BaseModel):
     candidate_files: list[str] = Field(default_factory=list)
 
 
+class ContextRetrievalRequest(BaseModel):
+    """Request a small local context excerpt by table/card id.
+
+    This is the QDI equivalent of Headroom CCR retrieval: the stable prompt
+    carries light card indexes and artifact ids, while detailed field/table
+    evidence is only injected into the next turn when the model asks for it.
+    """
+
+    question_id: str = ""
+    table_ids: list[str] = Field(default_factory=list)
+    input_files: list[str] = Field(default_factory=list)
+    focus_sheets: list[str] = Field(default_factory=list)
+    focus_columns: list[str] = Field(default_factory=list)
+    query: str = ""
+    reason: str = ""
+
+
 class QuestionInvestigationAction(BaseModel):
     """Tool-call style action for the single-question QDI loop."""
 
-    action: str = "give_up"  # answer/request_script/add_followup_questions/give_up/refine_current_question/mark_duplicate
+    action: str = "give_up"  # answer/request_script/request_context/add_followup_questions/give_up/refine_current_question/mark_duplicate
     question_id: str = ""
     answer: str = ""
     confidence: str = "medium"
@@ -376,6 +397,7 @@ class QuestionInvestigationAction(BaseModel):
     duplicate_of_question_id: str = ""
     refined_question: str = ""
     request_script: ReadonlyPythonRequest = Field(default_factory=ReadonlyPythonRequest)
+    request_context: ContextRetrievalRequest = Field(default_factory=ContextRetrievalRequest)
     followup_questions: list[QuestionInvestigationFollowupQuestion] = Field(default_factory=list)
     notes: str = ""
 
@@ -602,17 +624,24 @@ class TaskClassification(BaseModel):
 
 
 class AutoMLContextPack(BaseModel):
-    """Compact, downstream-facing context that AutoML/AutoRL agents should consume."""
+    """Compact supplemental facts for downstream fixed context."""
 
     schema_version: str = "autorealize.automl_context_pack.v1"
-    purpose: str = "High-priority task, data access, output and evaluation contract for downstream AutoML/AutoRL."
+    purpose: str = "Concise facts that supplement description.md without prescribing an AutoML strategy."
     priority_rules: list[str] = Field(default_factory=list)
     problem_paradigm: str = "unknown_but_executable"
     task_goal: str = ""
     data_orchestration: list[str] = Field(default_factory=list)
     data_access: list[dict[str, Any]] = Field(default_factory=list)
+    data_schema_contract: dict[str, Any] = Field(default_factory=dict)
+    source_alias_guard: list[dict[str, Any]] = Field(default_factory=list)
+    entity_alias_candidates: list[dict[str, Any]] = Field(default_factory=list)
     output_contract: dict[str, Any] = Field(default_factory=dict)
     evaluation_contract: dict[str, Any] = Field(default_factory=dict)
+    method_strategy: dict[str, Any] = Field(default_factory=dict)
+    relation_cards: list[dict[str, Any]] = Field(default_factory=list)
+    filename_sample_groups: list[dict[str, Any]] = Field(default_factory=list)
+    context_shape: dict[str, Any] = Field(default_factory=dict)
     modeling_boundary: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     leakage_guards: list[str] = Field(default_factory=list)

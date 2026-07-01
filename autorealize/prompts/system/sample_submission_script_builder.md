@@ -9,6 +9,8 @@
 - 不要修改输入数据，不要删除文件，不要写除 `out_df` 外的输出文件。
 - 优先使用 spec 中指定的 source_fields 和 input_files；没有可靠来源时生成少量占位行，但必须保持列顺序和格式。
 - 如果有官方或权威列顺序，`submission_columns` 必须完全一致。
+- 如果 data_access_minipack 中包含 `exact_source_schema_contract`，它对 pandas 读取拥有最高优先级：只能把 `physical_columns_exact` 中的字符串当作原始 DataFrame 列名，只能把 `valid_sheet_names_exact`/`sheet_name` 中的字符串当作 Excel sheet_name。
+- 若 spec/source_fields 使用业务别名、英文规范名或派生变量名，脚本必须先映射到 exact schema 中存在的源字段；找不到精确源字段时用占位值或让 validator 拒绝，不要直接访问不存在的列。
 - 不要把所有任务套成固定 `id,target`。
 - 对优化/方案类任务，sample_submission.csv 是格式样例，不是最优方案。
 - 代码应能在数据目录作为工作目录时执行；相对路径必须指向真实输入文件。

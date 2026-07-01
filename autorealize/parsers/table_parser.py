@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from ..profiling.csv_utils import detect_csv_encoding, infer_csv_dialect, read_csv_auto
+from ..profiling.stats import infer_excel_sheet_layout
 from .base import BaseParser, ParsedFile
 
 
@@ -134,6 +135,13 @@ class TableParser(BaseParser):
                 if not shape:
                     shape = [int(len(df)), int(df.shape[1])]
                     shape_estimated = True
+                columns = [str(c) for c in df.columns.tolist()]
+                layout = infer_excel_sheet_layout(
+                    raw_preview=raw_preview,
+                    default_columns=columns,
+                    sheet_name=sheet,
+                    shape=shape,
+                )
                 sheets.append(
                     {
                         "sheet_name": sheet,
@@ -141,14 +149,15 @@ class TableParser(BaseParser):
                         "shape_estimated": shape_estimated,
                         "preview_rows_used": int(len(df)),
                         "raw_preview_rows_used": raw_preview_rows_used,
-                        "columns": [str(c) for c in df.columns.tolist()],
+                        "columns": columns,
                         "dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
                         "preview": self._records(df),
                         "raw_preview": raw_preview,
+                        **layout,
                         **({"raw_preview_error": raw_preview_error} if raw_preview_error else {}),
                     }
                 )
-                for col in [str(c) for c in df.columns.tolist()]:
+                for col in columns:
                     if col not in union_columns:
                         union_columns.append(col)
             if primary_df.empty and sheet_names:

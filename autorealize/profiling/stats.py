@@ -182,6 +182,12 @@ def profile_excel_sheets(
                 shape = [int(preview_df.shape[0]), int(preview_df.shape[1])]
                 shape_estimated = True
             columns = [str(c) for c in preview_df.columns.tolist()]
+            layout = infer_excel_sheet_layout(
+                raw_preview=raw_preview,
+                default_columns=columns,
+                sheet_name=sheet,
+                shape=shape,
+            )
             inventories.append(
                 {
                     "sheet_name": sheet,
@@ -196,6 +202,7 @@ def profile_excel_sheets(
                     **({"raw_preview_error": raw_preview_error} if raw_preview_error else {}),
                     "sheet_name_pattern": _normalize_sheet_name(sheet),
                     "header_signature": _header_signature(columns),
+                    **layout,
                 }
             )
 
@@ -258,6 +265,262 @@ def profile_excel_sheets(
 def excel_sheet_groups_from_profiles(sheet_profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return workbook-level sheet groups from per-sheet profiles."""
     return _group_excel_sheet_inventories(sheet_profiles)
+
+
+def infer_excel_sheet_layout(
+    *,
+    raw_preview: list[list[Any]] | None,
+    default_columns: list[str] | None,
+    sheet_name: str = "",
+    shape: list[int] | tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Infer a conservative Excel sheet read strategy from top-left cells.
+
+    The goal is not to fully understand the sheet. It is to prevent downstream
+    code from blindly trusting pandas' default header when the opening rows look
+    like raw data, notes, key-value documentation, or a non-zero header row.
+    """
+
+    rows = raw_preview if isinstance(raw_preview, list) else []
+    rows = [row for row in rows if isinstance(row, list)]
+    columns = [str(c) for c in (default_columns or [])]
+    ncols = max([len(row) for row in rows] + [len(columns), 0])
+    if shape and len(shape) >= 2:
+        try:
+            ncols = max(ncols, int(shape[1]))
+        except Exception:
+            pass
+    if not rows and not columns:
+        return {
+            "layout_kind": "empty_or_unreadable",
+            "read_strategy_kind": "inspect_manually",
+            "header_confidence": 0.0,
+            "detected_header_row": None,
+            "recommended_read": _excel_read_example(sheet_name, header="inspect"),
+            "reading_risks": ["Sheet could not be previewed; inspect manually before modeling."],
+        }
+
+    row_infos = [_row_layout_info(row, ncols=ncols) for row in rows[:12]]
+    non_empty_rows = [info for info in row_infos if info["non_empty"] > 0]
+    dense_rows = [info for info in row_infos if info["density"] >= 0.5 and info["non_empty"] >= 2]
+    sparse_ratio = 1.0 - (sum(info["non_empty"] for info in row_infos) / max(1, len(row_infos) * max(1, ncols)))
+    long_or_note_rows = sum(1 for info in non_empty_rows if info["long_text_count"] > 0 or info["note_marker_count"] > 0)
+    one_or_two_cell_rows = sum(1 for info in non_empty_rows if info["non_empty"] <= 2)
+    default_suspicious = _default_columns_look_suspicious(columns)
+
+    best_idx: int | None = None
+    best_score = -999.0
+    for idx, info in enumerate(row_infos[:8]):
+        score = _header_candidate_score(info)
+        if idx + 1 < len(row_infos):
+            score -= 1.25 * _type_pattern_similarity(info["type_pattern"], row_infos[idx + 1]["type_pattern"])
+        if idx + 2 < len(row_infos):
+            score -= 0.50 * _type_pattern_similarity(info["type_pattern"], row_infos[idx + 2]["type_pattern"])
+        if info["note_marker_count"]:
+            score -= 0.75
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+
+    first_score = _header_candidate_score(row_infos[0]) if row_infos else -999.0
+    best_conf = round(max(0.0, min(0.99, (best_score - 1.0) / 4.5)), 3)
+    risks: list[str] = []
+    if default_suspicious:
+        risks.append("Pandas default columns look suspicious; verify header handling before modeling.")
+    if rows:
+        risks.append("Use header=None preview when validating sheet layout; opening rows may contain notes or raw data.")
+
+    layout_kind = "standard_table"
+    detected_header_row: int | None = 0
+    read_strategy_kind = "default_header"
+
+    best_info = row_infos[best_idx] if best_idx is not None and 0 <= best_idx < len(row_infos) else {}
+    best_is_strong_header = (
+        best_idx is not None
+        and best_idx > 0
+        and best_score >= 2.4
+        and float(best_info.get("text_ratio") or 0.0) >= 0.75
+        and float(best_info.get("numeric_ratio") or 0.0) <= 0.25
+        and int(best_info.get("note_marker_count") or 0) == 0
+    )
+
+    if not non_empty_rows:
+        layout_kind = "empty_or_unreadable"
+        detected_header_row = None
+        read_strategy_kind = "inspect_manually"
+    elif best_is_strong_header:
+        layout_kind = "non_default_header"
+        detected_header_row = int(best_idx)
+        read_strategy_kind = "explicit_header_row"
+        risks.append(f"Likely header row is {best_idx}, not the first row.")
+    elif (
+        long_or_note_rows >= max(1, len(non_empty_rows) // 2)
+        and one_or_two_cell_rows >= max(1, int(len(non_empty_rows) * 0.6))
+    ):
+        layout_kind = "document_like_sheet"
+        detected_header_row = None
+        read_strategy_kind = "header_none_document"
+        risks.append("Sheet looks like notes/rules/key-value text, not an ordinary dataframe.")
+    elif sparse_ratio >= 0.72 and len(dense_rows) <= 1:
+        layout_kind = "sparse_or_irregular_sheet"
+        detected_header_row = None
+        read_strategy_kind = "header_none_inspect"
+        risks.append("Sheet is sparse or irregular; do not assume rectangular tabular semantics.")
+    elif default_suspicious or first_score < 2.2 or _first_row_matches_data_pattern(row_infos):
+        layout_kind = "headerless_table"
+        detected_header_row = None
+        read_strategy_kind = "header_none_table"
+        risks.append("First row looks like data rather than field names; use header=None or assign columns explicitly.")
+    else:
+        detected_header_row = 0
+        read_strategy_kind = "default_header"
+
+    if layout_kind == "standard_table":
+        risks = [risk for risk in risks if "suspicious" not in risk and "header=None preview" not in risk][:3]
+
+    return {
+        "layout_kind": layout_kind,
+        "read_strategy_kind": read_strategy_kind,
+        "header_confidence": best_conf if layout_kind in {"standard_table", "non_default_header"} else round(1.0 - best_conf, 3),
+        "detected_header_row": detected_header_row,
+        "recommended_read": _excel_read_example(sheet_name, header=detected_header_row if detected_header_row is not None else None, layout_kind=layout_kind),
+        "reading_risks": list(dict.fromkeys(risks))[:6],
+    }
+
+
+def _excel_read_example(sheet_name: str, *, header: int | str | None = 0, layout_kind: str = "") -> str:
+    sheet_part = f", sheet_name={sheet_name!r}" if sheet_name else ", sheet_name=<sheet_name>"
+    if header == "inspect":
+        return f"pd.read_excel(path{sheet_part}, header=None)  # inspect layout first"
+    if header is None:
+        suffix = "  # document-like sheet" if layout_kind == "document_like_sheet" else ""
+        return f"pd.read_excel(path{sheet_part}, header=None){suffix}"
+    if int(header) == 0:
+        return f"pd.read_excel(path{sheet_part})"
+    return f"pd.read_excel(path{sheet_part}, header={int(header)})"
+
+
+def _row_layout_info(row: list[Any], *, ncols: int) -> dict[str, Any]:
+    cells = [_cell_text(v) for v in row]
+    if len(cells) < ncols:
+        cells.extend([""] * (ncols - len(cells)))
+    non_empty = [c for c in cells if c]
+    type_pattern = [_cell_kind(c) for c in cells]
+    text_count = sum(1 for c in non_empty if _cell_kind(c) == "text")
+    numeric_count = sum(1 for c in non_empty if _cell_kind(c) == "number")
+    long_text_count = sum(1 for c in non_empty if len(c) >= 50)
+    note_marker_count = sum(1 for c in non_empty if _looks_like_note_marker(c))
+    avg_len = sum(len(c) for c in non_empty) / max(1, len(non_empty))
+    return {
+        "non_empty": len(non_empty),
+        "density": len(non_empty) / max(1, ncols),
+        "text_ratio": text_count / max(1, len(non_empty)),
+        "numeric_ratio": numeric_count / max(1, len(non_empty)),
+        "unique_ratio": len(set(non_empty)) / max(1, len(non_empty)),
+        "long_text_count": long_text_count,
+        "note_marker_count": note_marker_count,
+        "avg_len": avg_len,
+        "type_pattern": type_pattern,
+    }
+
+
+def _header_candidate_score(info: dict[str, Any]) -> float:
+    non_empty = int(info.get("non_empty") or 0)
+    if non_empty < 2:
+        return -4.0
+    score = 0.0
+    score += float(info.get("density") or 0.0) * 1.8
+    score += float(info.get("text_ratio") or 0.0) * 2.2
+    score += float(info.get("unique_ratio") or 0.0) * 1.2
+    score -= float(info.get("numeric_ratio") or 0.0) * 1.7
+    score -= min(2.0, float(info.get("long_text_count") or 0.0) * 0.8)
+    score -= min(2.0, float(info.get("note_marker_count") or 0.0) * 0.9)
+    if float(info.get("avg_len") or 0.0) > 32:
+        score -= 0.8
+    return score
+
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _cell_kind(text: str) -> str:
+    if not text:
+        return "empty"
+    if re.fullmatch(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:%?)", text):
+        return "number"
+    if re.search(r"\d{4}[-/年]\d{1,2}", text):
+        return "date"
+    return "text"
+
+
+def _looks_like_note_marker(text: str) -> bool:
+    low = text.lower().strip()
+    markers = [
+        "note",
+        "notes",
+        "remark",
+        "remarks",
+        "description",
+        "instruction",
+        "instructions",
+        "readme",
+        "说明",
+        "备注",
+        "注释",
+        "规则",
+        "口径",
+        "注意",
+    ]
+    return any(marker in low for marker in markers)
+
+
+def _default_columns_look_suspicious(columns: list[str]) -> bool:
+    if not columns:
+        return True
+    cleaned = [str(c).strip() for c in columns if str(c).strip()]
+    if not cleaned:
+        return True
+    unnamed = sum(1 for c in cleaned if c.lower().startswith("unnamed"))
+    numeric = sum(1 for c in cleaned if _cell_kind(c) in {"number", "date"})
+    long_text = sum(1 for c in cleaned if len(c) >= 50)
+    return (
+        unnamed / max(1, len(cleaned)) >= 0.25
+        or numeric / max(1, len(cleaned)) >= 0.5
+        or long_text / max(1, len(cleaned)) >= 0.25
+    )
+
+
+def _type_pattern_similarity(a: list[str], b: list[str]) -> float:
+    length = max(len(a), len(b), 1)
+    aa = list(a) + ["empty"] * (length - len(a))
+    bb = list(b) + ["empty"] * (length - len(b))
+    comparable = [(x, y) for x, y in zip(aa, bb) if x != "empty" or y != "empty"]
+    if not comparable:
+        return 0.0
+    return sum(1 for x, y in comparable if x == y) / max(1, len(comparable))
+
+
+def _first_row_matches_data_pattern(row_infos: list[dict[str, Any]]) -> bool:
+    if len(row_infos) < 2:
+        return False
+    first = row_infos[0]
+    if int(first.get("non_empty") or 0) < 2:
+        return False
+    sim = _type_pattern_similarity(first["type_pattern"], row_infos[1]["type_pattern"])
+    if len(row_infos) >= 3:
+        sim = max(sim, _type_pattern_similarity(first["type_pattern"], row_infos[2]["type_pattern"]))
+    return sim >= 0.82 and float(first.get("numeric_ratio") or 0.0) >= 0.25
 
 
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:

@@ -2,13 +2,27 @@
 
 import csv
 import ast
+import difflib
+import hashlib
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 
 from ..agents.architect import Architect
 from ..config import AutoRealizeConfig
+from ..context_compiler import (
+    ArtifactStore,
+    build_filename_group_cards,
+    build_relation_cards,
+    build_table_cards,
+    compact_authoritative_memory,
+    compact_constraint_memory,
+    compact_detail_table_card_for_prompt,
+    compact_table_cards_for_prompt,
+    context_telemetry,
+)
 from ..logging_utils import log_event
 from ..prompt_cache import stable_dynamic_prompt
 from ..report_writer import (
@@ -17,6 +31,7 @@ from ..report_writer import (
     apply_evaluation_contract,
     build_automl_context_pack,
     build_data_access_protocol,
+    build_data_schema_contract,
     build_description_markdown,
     coverage_defects,
     description_quality_check,
@@ -262,24 +277,36 @@ class TaskDefinitionModule:
         original_text: str,
         data_digest: str,
         downstream_context: dict,
+        file_summaries: list | None = None,
+        relations: list | None = None,
+        data_description_text: str = "",
     ) -> ProblemParadigmReview:
         system = self.services.prompt_mgr.load("system/problem_paradigm_classifier.md")
+        problem_paradigm_pack = self._build_problem_paradigm_pack(
+            downstream_context=downstream_context,
+            file_summaries=file_summaries or [],
+            relations=relations or [],
+        )
+        artifact_refs = self._task_definition_artifact_refs(
+            original_text=original_text,
+            data_description_text=data_description_text or data_digest,
+            downstream_context=downstream_context,
+        )
         payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
             "task_hint": task_hint,
-            "original_requirements": original_text[:12000],
-            "data_cognition_digest": data_digest[:12000],
-            "downstream_context": {
-                "task_type_hint": downstream_context.get("task_type_hint", ""),
-                "train_table": downstream_context.get("train_table", ""),
-                "predict_table": downstream_context.get("predict_table", ""),
-                "target_column": downstream_context.get("target_column", ""),
-                "submission_columns": downstream_context.get("submission_columns", []),
-                "authoritative_memory": downstream_context.get("authoritative_memory", {}),
-                "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
-                "constraint_memory": downstream_context.get("constraint_memory", {}),
-                "retrieved_knowledge": downstream_context.get("retrieved_knowledge", [])[:10],
-            },
+            "original_requirements_full": original_text,
+            "problem_paradigm_pack": problem_paradigm_pack,
         }
+        self._record_headroom_pack_telemetry(
+            "problem_paradigm_classifier",
+            {
+                "original_requirements_full": original_text,
+                "problem_paradigm_pack": problem_paradigm_pack,
+                "artifact_refs": artifact_refs,
+            },
+        )
         stable, dynamic = stable_dynamic_prompt(
             stable=payload,
             dynamic={"instruction": "Classify the executable problem paradigm from the evidence above."},
@@ -303,7 +330,186 @@ class TaskDefinitionModule:
         }
         if review.problem_paradigm not in allowed:
             review.problem_paradigm = "unknown_but_executable"
+        self._normalize_method_only_rl_review(
+            review,
+            original_text="\n".join([task_hint or "", original_text or ""]),
+            downstream_context=downstream_context,
+        )
         return review
+
+    @staticmethod
+    def _contains_any(text: str, keywords: list[str] | tuple[str, ...]) -> bool:
+        lowered = (text or "").lower()
+        return any(str(k).lower() in lowered for k in keywords if str(k).strip())
+
+    @staticmethod
+    def _dedupe_strings(values: list[str], *, limit: int = 20) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _normalize_method_only_rl_review(
+        self,
+        review: ProblemParadigmReview,
+        *,
+        original_text: str,
+        downstream_context: dict,
+    ) -> None:
+        """Keep static decision tasks from being routed into a mandatory-RL template.
+
+        A user may request RL as a modeling method for a dispatch/assignment
+        problem, but downstream code still needs one deterministic solution
+        table, evaluator, and scalar objective. In that case the task paradigm is
+        static optimization and RL is a candidate solver family.
+        """
+        text_parts = [
+            original_text or "",
+            review.reasoning or "",
+            "\n".join(str(x) for x in review.evidence or []),
+            "\n".join(str(x) for x in review.key_signals or []),
+            str(downstream_context.get("task_hint", "") or ""),
+        ]
+        text = "\n".join(text_parts)
+        rl_signal = self._contains_any(
+            text,
+            (
+                "reinforcement learning",
+                "offline rl",
+                "online rl",
+                "dqn",
+                "ppo",
+                "policy",
+                "reward",
+                "强化学习",
+                "状态",
+                "动作",
+                "奖励",
+                "策略",
+                "轨迹",
+                "课程学习",
+            ),
+        )
+        static_decision_signal = self._contains_any(
+            text,
+            (
+                "static_optimization",
+                "assignment",
+                "dispatch",
+                "routing",
+                "scheduling",
+                "vehicle",
+                "order",
+                "cost",
+                "constraint",
+                "feasible solution",
+                "solution table",
+                "分配",
+                "调度",
+                "派单",
+                "订单",
+                "车辆",
+                "车型",
+                "承运商",
+                "运输成本",
+                "总成本",
+                "约束",
+                "可行",
+                "方案",
+                "发车",
+                "未分配",
+            ),
+        )
+        official_env_signal = self._contains_any(
+            text,
+            (
+                "gym",
+                "gymnasium",
+                "env.step",
+                "reset(",
+                "step(action",
+                "official simulator",
+                "provided simulator",
+                "benchmark environment",
+                "官方环境",
+                "官方仿真器",
+                "交互式评估接口",
+                "回放评估接口",
+                "评估服务器执行策略",
+                "提交 policy",
+                "提交策略",
+            ),
+        )
+        solution_output_signal = self._contains_any(
+            text,
+            (
+                "assignment 明细",
+                "assignment",
+                "solution",
+                "dispatch plan",
+                "完整方案",
+                "方案输出",
+                "发车记录",
+                "订单号列表",
+                "score_solution",
+                "total_penalized_cost",
+                "transport_cost",
+                "unassigned",
+                "未分配",
+                "运输成本",
+            ),
+        )
+
+        if rl_signal:
+            review.explicit_rl_requested = True
+
+        recommended = list(review.recommended_solver_families or [])
+        if static_decision_signal:
+            recommended.extend(["greedy_baseline", "repair_heuristic", "local_search"])
+        if rl_signal:
+            recommended.append("rl_candidate")
+        review.recommended_solver_families = self._dedupe_strings(recommended, limit=8)
+
+        if (
+            review.problem_paradigm == "reinforcement_learning"
+            and static_decision_signal
+            and solution_output_signal
+            and not official_env_signal
+        ):
+            review.problem_paradigm = "static_optimization"
+            review.rl_as_required_paradigm = False
+            note = (
+                "AutoRealize normalized this as static_optimization: the authoritative deliverable/evaluator "
+                "is a complete dispatch/assignment solution with deterministic constraints and scalar cost. "
+                "RL is recorded as a requested candidate method, not as the problem paradigm."
+            )
+            if note not in review.method_routing_notes:
+                review.method_routing_notes.append(note)
+            review.key_signals = self._dedupe_strings(
+                list(review.key_signals or []) + ["method_only_rl_request", "static_solution_output"],
+                limit=20,
+            )
+            review.evidence = self._dedupe_strings(
+                list(review.evidence or []) + ["Static assignment/dispatch output and deterministic cost/constraint evaluation dominate the executable contract."],
+                limit=20,
+            )
+        elif review.problem_paradigm == "reinforcement_learning":
+            review.rl_as_required_paradigm = True
+
+        if static_decision_signal and rl_signal:
+            baseline_note = (
+                "Downstream first solution should implement the deterministic evaluator plus a greedy/repair/local-search baseline; "
+                "if RL is attempted, it must reuse the same score_solution/validate_solution contract and be compared against the baseline."
+            )
+            if baseline_note not in review.method_routing_notes:
+                review.method_routing_notes.append(baseline_note)
 
     def _protocol_prompt_for_paradigm(self, paradigm: str) -> str:
         mapping = {
@@ -434,34 +640,42 @@ class TaskDefinitionModule:
         data_digest: str,
         downstream_context: dict,
         deterministic_data_access: object,
+        file_summaries: list | None = None,
+        relations: list | None = None,
+        data_description_text: str = "",
     ) -> DescriptionProtocolBundle:
         paradigm = problem_review.problem_paradigm or "unknown_but_executable"
         system = self.services.prompt_mgr.load(self._protocol_prompt_for_paradigm(paradigm))
-        original_limit = max(2000, int(getattr(self.config.prompt, "description_protocol_original_chars", 10000)))
-        digest_limit = max(2000, int(getattr(self.config.prompt, "description_protocol_data_digest_chars", 8000)))
+        description_protocol_pack = self._build_description_protocol_pack(
+            problem_review=problem_review,
+            downstream_context=downstream_context,
+            deterministic_data_access=deterministic_data_access,
+            file_summaries=file_summaries or [],
+            relations=relations or [],
+        )
+        artifact_refs = self._task_definition_artifact_refs(
+            original_text=original_text,
+            data_description_text=data_description_text or data_digest,
+            downstream_context=downstream_context,
+        )
         payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
             "instruction": (
                 "Generate only the task/evaluation/output protocol draft. "
                 "Do not enumerate all files or fields. Do not output data_access; it is generated by code."
             ),
-            "problem_paradigm_review": problem_review.model_dump(),
-            "authoritative_context": self._compact_protocol_agent_context(downstream_context),
-            "original_requirements": original_text[:original_limit],
-            "data_cognition_digest": data_digest[:digest_limit],
-            "data_access_inventory": self._compact_data_access_inventory(deterministic_data_access),
-            "downstream_context": {
-                "task_hint": downstream_context.get("task_hint", ""),
-                "task_type_hint": downstream_context.get("task_type_hint", ""),
-                "target_column": downstream_context.get("target_column", ""),
-                "id_column": downstream_context.get("id_column", ""),
-                "train_table": downstream_context.get("train_table", ""),
-                "predict_table": downstream_context.get("predict_table", ""),
-                "submission_columns": downstream_context.get("submission_columns", []),
-                "generated_submission_columns": downstream_context.get("generated_submission_columns", []),
-                "generate_sample_submission": downstream_context.get("generate_sample_submission", True),
-                "sample_submission_available": downstream_context.get("sample_submission_available", False),
-            },
+            "original_requirements_full": original_text,
+            "description_protocol_pack": description_protocol_pack,
         }
+        self._record_headroom_pack_telemetry(
+            f"description_protocol_{paradigm}",
+            {
+                "original_requirements_full": original_text,
+                "description_protocol_pack": description_protocol_pack,
+                "artifact_refs": artifact_refs,
+            },
+        )
         max_retries = max(3, int(getattr(self.config.prompt, "description_quality_max_retries", 3)))
         bundle: DescriptionProtocolBundle | None = None
         defects: list[str] = []
@@ -870,6 +1084,280 @@ class TaskDefinitionModule:
             )
         return [{k: v for k, v in item.items() if v not in (None, "", [], {})} for item in out]
 
+    def _context_artifact_store(self) -> ArtifactStore:
+        return ArtifactStore(self.report_dir / "context_artifacts")
+
+    def _ranked_file_summaries_for_sections(self, file_summaries: list, *, limit: int | None = None) -> list:
+        max_files = limit or max(1, int(getattr(self.config.prompt, "description_protocol_file_limit", 16)))
+        scored = []
+        for fs in file_summaries or []:
+            role = str(getattr(getattr(fs, "role", ""), "value", getattr(fs, "role", "")))
+            path = str(getattr(fs, "path", ""))
+            meta = getattr(fs, "source_metadata", {}) or {}
+            score = 0
+            if role in {"task_requirement", "data_description"}:
+                score += 8
+            if meta.get("downstream_role_hint"):
+                score += 6
+            if path.lower().endswith((".csv", ".xlsx", ".xls", ".json")):
+                score += 4
+            if meta.get("excel_sheet_profiles"):
+                score += 4
+            if getattr(fs, "column_semantics", None):
+                score += 3
+            if getattr(fs, "column_profiles", None):
+                score += 2
+            scored.append((score, path, fs))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [fs for _, _, fs in scored[:max_files]]
+
+    def _filename_group_source(self, downstream_context: dict) -> list[dict]:
+        groups: list[dict] = []
+        pack = downstream_context.get("agent_context_pack") if isinstance(downstream_context.get("agent_context_pack"), dict) else {}
+        data_memory = pack.get("data_memory") if isinstance(pack.get("data_memory"), dict) else {}
+        if isinstance(data_memory.get("filename_sample_groups"), list):
+            groups.extend([x for x in data_memory.get("filename_sample_groups", []) if isinstance(x, dict)])
+        kb = downstream_context.get("knowledge_base") if isinstance(downstream_context.get("knowledge_base"), dict) else {}
+        if isinstance(kb.get("filename_sample_groups"), list):
+            groups.extend([x for x in kb.get("filename_sample_groups", []) if isinstance(x, dict)])
+        return groups
+
+    def _filename_group_cards_for_sections(
+        self,
+        downstream_context: dict,
+        *,
+        file_summaries: list,
+        limit: int = 20,
+    ) -> list[dict]:
+        return build_filename_group_cards(
+            self._filename_group_source(downstream_context),
+            file_summaries=file_summaries,
+            limit=limit,
+        )
+
+    def _table_cards_for_sections(
+        self,
+        file_summaries: list,
+        *,
+        limit: int | None = None,
+        field_limit: int | None = None,
+    ) -> list[dict]:
+        ranked = self._ranked_file_summaries_for_sections(file_summaries, limit=limit)
+        return build_table_cards(
+            ranked,
+            artifact_store=self._context_artifact_store(),
+            file_limit=len(ranked) or 1,
+            sheet_limit=80,
+            field_limit=field_limit or max(1, int(getattr(self.config.prompt, "description_protocol_fields_per_file", 12))),
+        )
+
+    def _select_relevant_table_cards(
+        self,
+        table_cards: list[dict],
+        *,
+        terms: list[str],
+        limit: int,
+    ) -> list[dict]:
+        wanted = [str(x).lower() for x in terms if str(x).strip()]
+        if not wanted:
+            return table_cards[:limit]
+        scored: list[tuple[int, str, dict]] = []
+        for card in table_cards:
+            if not isinstance(card, dict):
+                continue
+            field_text = " ".join(
+                f"{f.get('name', '')} {f.get('meaning', '')} {f.get('role', '')} {f.get('logical_type', '')}"
+                for f in self._table_card_fields(card)
+            )
+            text = " ".join(
+                [
+                    str(card.get("table_id", "")),
+                    str(card.get("source_file", "")),
+                    str(card.get("sheet_name", "")),
+                    str(card.get("role", "")),
+                    str(card.get("file_cognition", "")),
+                    field_text,
+                ]
+            ).lower()
+            score = sum(1 for term in wanted if term in text)
+            if score:
+                scored.append((score, str(card.get("table_id", "")), card))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        selected = [card for _, _, card in scored[:limit]]
+        return selected or table_cards[:limit]
+
+    def _table_cards_as_file_index(self, table_cards: list[dict], *, limit: int | None = None) -> list[dict]:
+        """Tiny compatibility index for prompt fields still named `files`.
+
+        Headroom-style prompts should not receive a second copy of table cards.
+        This keeps only lookup metadata; field details must come from table_cards'
+        tiny manifest or a dynamic retrieval.
+        """
+
+        out: list[dict] = []
+        for card in list(table_cards or [])[: limit or len(table_cards or [])]:
+            if not isinstance(card, dict):
+                continue
+            out.append(
+                {
+                    k: v
+                    for k, v in {
+                        "table_id": card.get("table_id"),
+                        "source_file": card.get("source_file"),
+                        "sheet_name": card.get("sheet_name"),
+                        "table_kind": card.get("table_kind"),
+                        "role": card.get("role"),
+                        "shape": card.get("shape"),
+                        "field_count": card.get("field_count"),
+                    }.items()
+                    if v not in (None, "", [], {})
+                }
+            )
+        return out
+
+    @staticmethod
+    def _table_card_fields(card: dict) -> list[dict]:
+        """Return prompt-visible field handles from either detail cards or manifests.
+
+        Headroom-style stable cards use `field_index`; retrieved/detail cards may
+        still use `fields`. Consumers should not assume full statistics exist.
+        """
+
+        raw_fields = card.get("fields")
+        if not isinstance(raw_fields, list) or not raw_fields:
+            raw_fields = card.get("field_index")
+        return [field for field in (raw_fields or []) if isinstance(field, dict)]
+
+    def _compiled_context_for_sections(
+        self,
+        *,
+        file_summaries: list,
+        downstream_context: dict,
+        relations: list,
+        table_limit: int | None = None,
+        relation_limit: int = 60,
+    ) -> dict:
+        detailed_table_cards = self._table_cards_for_sections(file_summaries, limit=table_limit)
+        table_cards = compact_table_cards_for_prompt(
+            detailed_table_cards,
+            field_limit=max(2, min(5, int(getattr(self.config.prompt, "description_protocol_fields_per_file", 12)))),
+        )
+        relation_cards = build_relation_cards(relations, limit=relation_limit)
+        filename_group_cards = self._filename_group_cards_for_sections(
+            downstream_context,
+            file_summaries=file_summaries,
+            limit=30,
+        )
+        payload = {
+            "schema_version": "autorealize.compiled_context.headroom.v1",
+            "context_policy": {
+                "files_are_table_cards": True,
+                "large_objects_local_only": True,
+                "authoritative_facts_source": "authoritative_memory",
+                "constraint_facts_source": "constraint_memory",
+            },
+            "table_cards": table_cards,
+            "relations": relation_cards,
+            "filename_sample_groups": filename_group_cards,
+        }
+        return payload
+
+    def _field_detail_cards_for_sections(
+        self,
+        *,
+        file_summaries: list,
+        downstream_context: dict,
+        relations: list,
+        table_limit: int,
+        field_limit: int,
+    ) -> list[dict]:
+        """Return bounded field-detail evidence for the field section only.
+
+        Most description stages should see route-only table manifests. The
+        `关键字段说明` section is the exception: it needs actual field meanings and
+        lightweight statistics, but still not full previews or source metadata.
+        """
+
+        detailed_cards = self._table_cards_for_sections(
+            file_summaries,
+            limit=max(1, int(table_limit)),
+            field_limit=max(1, int(field_limit)),
+        )
+        auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
+        constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
+        authority_terms: list[str] = []
+        for key in ["task_goal", "input_requirements", "output_requirements", "evaluation_requirements", "constraints"]:
+            value = auth.get(key)
+            if isinstance(value, list):
+                authority_terms.extend(str(x) for x in value[:12])
+            elif value:
+                authority_terms.append(str(value))
+        if isinstance(constraint_memory, dict):
+            authority_terms.append(str(constraint_memory.get("summary", "")))
+            authority_terms.extend(str(x) for x in (constraint_memory.get("items") or [])[:12])
+
+        relation_terms: list[str] = []
+        for rel in build_relation_cards(relations, limit=40):
+            relation_terms.extend(
+                str(rel.get(k, ""))
+                for k in ["left_file", "left_field", "right_file", "right_field", "short_evidence"]
+            )
+
+        default_terms = [
+            "id",
+            "key",
+            "target",
+            "label",
+            "score",
+            "metric",
+            "cost",
+            "price",
+            "amount",
+            "quantity",
+            "capacity",
+            "date",
+            "time",
+            "output",
+            "submission",
+            "订单",
+            "单号",
+            "客户",
+            "车辆",
+            "车牌",
+            "承运商",
+            "车型",
+            "成本",
+            "费用",
+            "合同",
+            "线路",
+            "路线",
+            "地址",
+            "省份",
+            "城市",
+            "区县",
+            "日期",
+            "时间",
+            "交付",
+            "提货",
+            "体积",
+            "重量",
+            "数量",
+            "容量",
+            "装载",
+            "限制",
+            "约束",
+            "目标",
+            "提交",
+            "输出",
+        ]
+        terms = default_terms + authority_terms + relation_terms
+        selected = self._select_relevant_table_cards(detailed_cards, terms=terms, limit=max(1, int(table_limit)))
+        return [
+            compact_detail_table_card_for_prompt(card, field_limit=max(1, int(field_limit)))
+            for card in selected
+            if isinstance(card, dict)
+        ]
+
     def _question_memory_pack(self, downstream_context: dict) -> dict:
         pack = downstream_context.get("agent_context_pack") if isinstance(downstream_context.get("agent_context_pack"), dict) else {}
         qmem = pack.get("question_memory") if isinstance(pack.get("question_memory"), dict) else {}
@@ -952,20 +1440,18 @@ class TaskDefinitionModule:
     ) -> dict:
         auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
         constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
-        files = []
-        for fs in file_summaries:
-            text = " ".join(
-                [
-                    str(getattr(fs, "path", "")),
-                    str(getattr(fs, "summary", "")),
-                    " ".join(getattr(fs, "columns", []) or []),
-                    " ".join((getattr(fs, "column_semantics", {}) or {}).values()),
-                ]
-            ).lower()
-            if any(k in text for k in ["eval", "metric", "score", "评分", "评估", "目标", "成本", "费用", "label", "target", "提交"]):
-                files.append(self._compact_file_for_sections(fs, include_profiles=False))
-            if len(files) >= 8:
-                break
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=20,
+            relation_limit=30,
+        )
+        table_cards = self._select_relevant_table_cards(
+            compiled["table_cards"],
+            terms=["eval", "metric", "score", "评分", "评估", "目标", "成本", "费用", "label", "target", "提交", "output", "submission"],
+            limit=10,
+        )
         return {
             "problem_paradigm": problem_review.model_dump(),
             "evaluation_requirements": [str(x)[:500] for x in (auth.get("evaluation_requirements") or [])[:12]],
@@ -981,8 +1467,11 @@ class TaskDefinitionModule:
                 "items": (constraint_memory.get("items") or [])[:16],
             },
             "leakage_facts": [str(x)[:360] for x in (auth.get("leakage_guards") or [])[:12]],
-            "evaluation_related_files": files,
-            "relations": self._compact_relations_for_sections(relations, limit=20),
+            # Compatibility key: tiny file/table handles only, not a full metadata bundle.
+            "evaluation_related_files": self._table_cards_as_file_index(table_cards),
+            "table_index": table_cards,
+            "relations": compiled["relations"][:20],
+            "filename_sample_groups": compiled["filename_sample_groups"][:12],
             "qdi_evaluation_output_constraint_conclusions": self._question_memory_pack(downstream_context),
             "protocol_evaluation_summary": (
                 protocol_bundle.evaluation_summary if protocol_bundle is not None else ""
@@ -996,9 +1485,29 @@ class TaskDefinitionModule:
         downstream_context: dict,
         problem_review: ProblemParadigmReview,
         official_sample_probe: dict,
+        file_summaries: list | None = None,
+        relations: list | None = None,
         evaluation_contract: EvaluationContractReview | None = None,
     ) -> dict:
         auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
+        table_cards: list[dict] = []
+        relation_cards: list[dict] = []
+        filename_group_cards: list[dict] = []
+        if file_summaries is not None:
+            compiled = self._compiled_context_for_sections(
+                file_summaries=file_summaries,
+                downstream_context=downstream_context,
+                relations=relations or [],
+                table_limit=20,
+                relation_limit=30,
+            )
+            table_cards = self._select_relevant_table_cards(
+                compiled["table_cards"],
+                terms=["submission", "submit", "output", "result", "预测", "提交", "输出", "订单", "id", "target", "score"],
+                limit=10,
+            )
+            relation_cards = compiled["relations"][:20]
+            filename_group_cards = compiled["filename_sample_groups"][:12]
         return {
             "configured_generate_sample_submission": bool(getattr(self.config.switches, "generate_sample_submission", True)),
             "problem_paradigm": problem_review.model_dump(),
@@ -1009,6 +1518,9 @@ class TaskDefinitionModule:
             "output_requirements": [str(x)[:500] for x in (auth.get("output_requirements") or [])[:12]],
             "evaluation_contract": evaluation_contract.model_dump() if evaluation_contract else {},
             "qdi_output_conclusions": self._question_memory_pack(downstream_context),
+            "table_index": table_cards,
+            "relations": relation_cards,
+            "filename_sample_groups": filename_group_cards,
             "known_output_like_files": [
                 str(p.relative_to(data_root)).replace("\\", "/")
                 for p in data_root.rglob("*")
@@ -1017,9 +1529,17 @@ class TaskDefinitionModule:
         }
 
     def _build_data_section_pack(self, *, file_summaries: list, downstream_context: dict) -> dict:
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=[],
+            table_limit=max(1, int(getattr(self.config.prompt, "description_protocol_file_limit", 16))),
+            relation_limit=1,
+        )
         return {
-            "files": self._compact_files_for_sections(file_summaries, include_profiles=False),
-            "filename_sample_groups": self._compact_filename_groups_for_sections(downstream_context),
+            # Compatibility key: tiny file/table handles only.
+            "files": self._table_cards_as_file_index(compiled["table_cards"]),
+            "filename_sample_groups": compiled["filename_sample_groups"],
             "global_reading_policy": [
                 "description.md 只写必要读取方式；详细读取代码进入 automl_context。",
                 "普通默认 CSV 不冗余展开读取代码；非默认 CSV、多 sheet Excel、JSON 等需要提示读取方式。",
@@ -1027,15 +1547,43 @@ class TaskDefinitionModule:
         }
 
     def _build_field_section_pack(self, *, file_summaries: list, downstream_context: dict, relations: list) -> dict:
+        table_limit = max(1, int(getattr(self.config.prompt, "description_protocol_file_limit", 16)))
+        field_limit = max(1, int(getattr(self.config.prompt, "description_protocol_fields_per_file", 12)))
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=table_limit,
+            relation_limit=50,
+        )
+        table_field_details = self._field_detail_cards_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=table_limit,
+            field_limit=field_limit,
+        )
         return {
-            "files": self._compact_files_for_sections(file_summaries, include_profiles=True),
-            "relations": self._compact_relations_for_sections(relations, limit=40),
-            "field_selection_policy": "只写任务相关关键字段；不要求罗列所有列。",
+            "context_policy": {
+                "table_index_is_route_only": True,
+                "table_field_details_are_bounded_prompt_visible_evidence": True,
+                "full_profiles_previews_and_source_metadata_are_local_only": True,
+            },
+            "table_index": compiled["table_cards"],
+            "table_field_details": table_field_details,
+            "relations": compiled["relations"][:40],
+            "filename_sample_groups": compiled["filename_sample_groups"],
+            "field_selection_policy": (
+                "只写任务相关关键字段；不要求罗列所有列。字段含义优先来自 "
+                "table_field_details[].fields[].meaning；若 meaning 为空，只能基于字段名、角色、"
+                "类型和统计做保守说明，并标注含义未确认。"
+            ),
         }
 
     def _build_constraint_section_pack(self, *, downstream_context: dict, relations: list) -> dict:
         auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
         constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
+        relation_cards = build_relation_cards(relations, limit=30)
         return {
             "authoritative_constraints": [str(x)[:500] for x in (auth.get("constraints") or [])[:20]],
             "leakage_guards": [str(x)[:500] for x in (auth.get("leakage_guards") or [])[:12]],
@@ -1043,7 +1591,7 @@ class TaskDefinitionModule:
                 "summary": str(constraint_memory.get("summary", ""))[:1200],
                 "items": (constraint_memory.get("items") or [])[:24],
             },
-            "relations": self._compact_relations_for_sections(relations, limit=20),
+            "relations": relation_cards[:20],
             "qdi_constraint_conclusions": self._question_memory_pack(downstream_context),
         }
 
@@ -1072,21 +1620,38 @@ class TaskDefinitionModule:
             return "\n".join(lines).strip()
         return f"## {title}\n{text}"
 
-    def _generate_overview_task_definition_sections(self, *, task_authority_pack: dict) -> OverviewTaskDefinitionDraft:
+    def _generate_overview_task_definition_sections(
+        self,
+        *,
+        task_authority_pack: dict,
+        original_text: str,
+        artifact_refs: dict | None = None,
+    ) -> OverviewTaskDefinitionDraft:
         system = self.services.prompt_mgr.load("system/description_overview_task_definition.md")
-        stable, dynamic = stable_dynamic_prompt(
-            stable={
-                "fixed_rules": [
-                    "Generate exactly two reader-facing sections.",
-                    "Do not include data field details or modeling advice in the overview.",
-                    "Do not invent metrics, target columns, or RL requirements.",
-                ],
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
+            "fixed_rules": [
+                "Generate exactly two reader-facing sections.",
+                "Do not include data field details or modeling advice in the overview.",
+                "Do not invent metrics, target columns, or RL requirements.",
+            ],
+            "original_requirements_full": original_text,
+            "task_authority_pack": task_authority_pack,
+        }
+        self._record_headroom_pack_telemetry(
+            "description_sections_overview_task_definition",
+            {
+                "original_requirements_full": original_text,
                 "task_authority_pack": task_authority_pack,
+                "artifact_refs": artifact_refs or {},
             },
+        )
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_payload,
             dynamic={"instruction": "Generate frozen overview and task-definition sections."},
             stable_title="Stable overview/task-definition evidence",
             dynamic_title="Dynamic section request",
-            stable_limit=30000,
         )
         draft = self.services.llm_client.ask_structured(
             model_cls=OverviewTaskDefinitionDraft,
@@ -1159,26 +1724,44 @@ class TaskDefinitionModule:
         output_evidence_pack: dict,
         frozen_sections: dict,
         evaluation_contract: EvaluationContractReview,
+        original_text: str,
+        artifact_refs: dict | None = None,
     ) -> OutputSectionDraft:
         system = self.services.prompt_mgr.load("system/description_output_section.md")
-        stable, dynamic = stable_dynamic_prompt(
-            stable={
-                "fixed_rules": [
-                    "Official sample/output contract has priority.",
-                    "Do not invent id,target if the task needs a custom solution format.",
-                    "Do not invent submission columns for input entities that do not exist in data or authoritative documents.",
-                    "Do not state unverified operational capabilities as hard rules; put them in open_issues or assumptions.",
-                    "Every submission column must have a source: official sample, input field, deterministic derivation, or explicit decision placeholder.",
-                    "Only output the output/submission section and sample_submission_spec.",
-                ],
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
+            "fixed_rules": [
+                "Official sample/output contract has priority.",
+                "Do not invent id,target if the task needs a custom solution format.",
+                "Do not invent submission columns for input entities that do not exist in data or authoritative documents.",
+                "Do not state unverified operational capabilities as hard rules; put them in open_issues or assumptions.",
+                "Every submission column must have a source: official sample, input field, deterministic derivation, or explicit decision placeholder.",
+                "Submission/output columns are generated result schema, not raw input dataframe columns; state this when the task output is a solution table.",
+                "For generated tabular outputs, include a rule that downstream code should build result tables as pd.DataFrame(rows, columns=OUTPUT_COLUMNS) so empty/no-feasible solutions keep schema.",
+                "Empty/all-unassigned/no-feasible solutions should be validation/scoring outcomes with counts and reasons, not pandas construction errors.",
+                "Only output the output/submission section and sample_submission_spec.",
+            ],
+            "original_requirements_full": original_text,
+            "output_evidence_pack": output_evidence_pack,
+            "frozen_task_context": frozen_sections,
+            "evaluation_contract": evaluation_contract.model_dump(),
+        }
+        self._record_headroom_pack_telemetry(
+            "description_section_output_spec",
+            {
+                "original_requirements_full": original_text,
                 "output_evidence_pack": output_evidence_pack,
                 "frozen_task_context": frozen_sections,
                 "evaluation_contract": evaluation_contract.model_dump(),
+                "artifact_refs": artifact_refs or {},
             },
+        )
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_payload,
             dynamic={"instruction": "Generate output/submission section and sample_submission_spec."},
             stable_title="Stable output section evidence",
             dynamic_title="Dynamic output section request",
-            stable_limit=28000,
         )
         draft = self.services.llm_client.ask_structured(
             model_cls=OutputSectionDraft,
@@ -1208,21 +1791,35 @@ class TaskDefinitionModule:
         section_title: str,
         evidence_pack: dict,
         frozen_sections: dict,
+        original_text: str,
+        artifact_refs: dict | None = None,
         extra_rules: list[str] | None = None,
     ) -> DescriptionSectionDraft:
         system = self.services.prompt_mgr.load("system/description_generic_section.md").replace("{section_title}", section_title)
-        stable, dynamic = stable_dynamic_prompt(
-            stable={
-                "section_id": section_id,
-                "section_title": section_title,
-                "fixed_rules": extra_rules or [],
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
+            "section_id": section_id,
+            "section_title": section_title,
+            "fixed_rules": extra_rules or [],
+            "original_requirements_full": original_text,
+            "evidence_pack": evidence_pack,
+            "frozen_previous_sections": frozen_sections,
+        }
+        self._record_headroom_pack_telemetry(
+            f"description_section_{section_id}",
+            {
+                "original_requirements_full": original_text,
                 "evidence_pack": evidence_pack,
                 "frozen_previous_sections": frozen_sections,
+                "artifact_refs": artifact_refs or {},
             },
+        )
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_payload,
             dynamic={"instruction": f"Generate only the `{section_title}` section."},
             stable_title=f"Stable {section_id} section evidence",
             dynamic_title=f"Dynamic {section_id} section request",
-            stable_limit=32000,
         )
         draft = self.services.llm_client.ask_structured(
             model_cls=DescriptionSectionDraft,
@@ -1341,17 +1938,47 @@ class TaskDefinitionModule:
             for part in text.replace("\\", "/").split():
                 if "." in part or "/" in part:
                     wanted.add(part.strip("`'\",:;()[]{}"))
-        files = []
-        for fs in file_summaries:
-            path = str(getattr(fs, "path", ""))
-            combined = f"{path} {getattr(fs, 'summary', '')} {' '.join(getattr(fs, 'columns', []) or [])}"
-            if not wanted or any(w in combined for w in wanted) or any(c in combined for c in sample_spec.columns):
-                files.append(self._compact_file_for_sections(fs, include_profiles=True))
-            if len(files) >= 8:
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=24,
+            relation_limit=30,
+        )
+        terms = list(wanted) + [str(x) for x in (sample_spec.columns or []) if str(x).strip()]
+        table_cards = self._select_relevant_table_cards(compiled["table_cards"], terms=terms, limit=12)
+        selected_files = {
+            str(card.get("source_file", "") or "")
+            for card in table_cards
+            if isinstance(card, dict) and str(card.get("source_file", "") or "").strip()
+        }
+        selected_fields = {
+            str(field.get("name", "") or "")
+            for card in table_cards
+            if isinstance(card, dict)
+            for field in self._table_card_fields(card)
+            if str(field.get("name", "") or "").strip()
+        }
+        relation_cards = []
+        for rel in compiled["relations"]:
+            if not isinstance(rel, dict):
+                continue
+            if (
+                str(rel.get("left_file", "")) in selected_files
+                or str(rel.get("right_file", "")) in selected_files
+                or str(rel.get("left_field", "")) in selected_fields
+                or str(rel.get("right_field", "")) in selected_fields
+            ):
+                relation_cards.append(rel)
+            if len(relation_cards) >= 20:
                 break
         return {
-            "files": files,
-            "relations": self._compact_relations_for_sections(relations, limit=20),
+            # Compatibility key: tiny file/table handles only.
+            "files": self._table_cards_as_file_index(table_cards),
+            "table_index": table_cards,
+            "exact_source_schema_contract": build_data_schema_contract(file_summaries, max_tables=24),
+            "relations": relation_cards,
+            "filename_sample_groups": compiled["filename_sample_groups"][:12],
             "downstream_context": {
                 "train_table": downstream_context.get("train_table", ""),
                 "predict_table": downstream_context.get("predict_table", ""),
@@ -1359,6 +1986,751 @@ class TaskDefinitionModule:
                 "target_column": downstream_context.get("target_column", ""),
             },
         }
+
+    @staticmethod
+    def _exact_schema_columns(schema_contract: dict) -> set[str]:
+        columns: set[str] = set()
+        tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            for col in table.get("physical_columns_exact") or []:
+                text = str(col or "").strip()
+                if text:
+                    columns.add(text)
+        return columns
+
+    @staticmethod
+    def _exact_schema_non_column_names(schema_contract: dict) -> set[str]:
+        names: set[str] = set()
+        tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            for key in ["table_id", "source_file", "sheet_name", "table_kind"]:
+                text = str(table.get(key, "") or "").strip()
+                if text:
+                    names.add(text)
+        workbooks = schema_contract.get("workbooks") if isinstance(schema_contract.get("workbooks"), list) else []
+        for workbook in workbooks:
+            if not isinstance(workbook, dict):
+                continue
+            text = str(workbook.get("source_file", "") or "").strip()
+            if text:
+                names.add(text)
+            for sheet in workbook.get("valid_sheet_names_exact") or []:
+                text = str(sheet or "").strip()
+                if text:
+                    names.add(text)
+        return names
+
+    @staticmethod
+    def _source_field_alias_tokens(text: str) -> list[str]:
+        tokens: list[str] = []
+        for pattern in [r"`([^`]+)`", r"“([^”]+)”", r'"([^"]+)"']:
+            for match in re.findall(pattern, text or ""):
+                token = str(match or "").strip()
+                if token and token not in tokens:
+                    tokens.append(token)
+        # Machine-facing source fields are often rendered as
+        # file.xlsx::sheet::column without quotes.  The final segment is the
+        # dangerous one for pandas access, so inspect every :: segment and let
+        # the schema-name filter below discard file/sheet names.
+        for match in re.findall(r"::([^:\s`'\"，,。；;、\)\]）】]+)", text or ""):
+            token = str(match or "").strip()
+            token = re.split(r"[（(]", token, maxsplit=1)[0].strip()
+            if token and token not in tokens:
+                tokens.append(token)
+        # Also catch common source references such as "订单明细信息.标准箱数（汇总）".
+        # File/sheet/table names are later discarded by the schema-name filter.
+        for raw_part in re.split(r"[\s,，;；、]+", text or ""):
+            part = str(raw_part or "").strip("`'\"“”‘’()（）[]【】{}<>")
+            if "." not in part and "：" not in part and ":" not in part:
+                continue
+            for segment in re.split(r"[.。:：/\\]+", part):
+                token = re.split(r"[（(]", segment, maxsplit=1)[0].strip("`'\"“”‘’()（）[]【】{}<>")
+                token = re.sub(r"^(从|来自|源自|派生自|由|按|以|和|与|或)+", "", token).strip()
+                if token and token not in tokens:
+                    tokens.append(token)
+        return tokens
+
+    @staticmethod
+    def _source_field_candidate_columns(alias: str, schema_contract: dict, *, limit: int = 6) -> list[str]:
+        alias_text = str(alias or "").strip()
+        if not alias_text:
+            return []
+        alias_norm = re.sub(r"[\s_`'\"“”‘’（）()\[\]【】{}<>:：,，.。;；、/\\\-]+", "", alias_text).lower()
+        if not alias_norm:
+            return []
+        candidates: list[tuple[float, int, str]] = []
+        tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
+        seen: set[str] = set()
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            meanings: dict[str, str] = {}
+            for field in table.get("field_summaries") or []:
+                if isinstance(field, dict):
+                    name = str(field.get("name", "") or "")
+                    if name:
+                        meanings[name] = str(field.get("meaning", "") or "")
+            for idx, raw_col in enumerate(table.get("physical_columns_exact") or []):
+                col = str(raw_col or "").strip()
+                if not col or col in seen:
+                    continue
+                col_norm = re.sub(r"[\s_`'\"“”‘’（）()\[\]【】{}<>:：,，.。;；、/\\\-]+", "", col).lower()
+                meaning_norm = re.sub(
+                    r"[\s_`'\"“”‘’（）()\[\]【】{}<>:：,，.。;；、/\\\-]+",
+                    "",
+                    meanings.get(col, ""),
+                ).lower()
+                score = difflib.SequenceMatcher(None, alias_norm, col_norm).ratio()
+                direct_signal = False
+                if "标准箱" in alias_text and "标箱" in col:
+                    score = max(score, 0.88)
+                    direct_signal = True
+                if alias_norm in col_norm or col_norm in alias_norm:
+                    score = max(score, 0.82)
+                    direct_signal = True
+                if alias_norm and alias_norm in meaning_norm:
+                    score = max(score, 0.78)
+                    direct_signal = True
+                if alias_norm.endswith("日") and alias_norm[:-1] and alias_norm[:-1] in col_norm and (
+                    "时间" in col or "日期" in col or "日" in col
+                ):
+                    score = max(score, 0.74)
+                    direct_signal = True
+                if len(alias_norm) <= 2:
+                    short_signal = direct_signal and alias_norm in col_norm
+                    if alias_norm == "重量" and any(term in col for term in ["重量", "载重", "毛重"]):
+                        short_signal = True
+                    if alias_norm == "体积" and "体积" in col:
+                        short_signal = True
+                    if not short_signal:
+                        continue
+                if score >= 0.45 and (direct_signal or len(alias_norm) > 2):
+                    candidates.append((-score, idx, col))
+                    seen.add(col)
+        candidates.sort()
+        return [col for _score, _idx, col in candidates[: max(1, int(limit))]]
+
+    @staticmethod
+    def _resolve_exact_source_field_alias(
+        alias: str,
+        *,
+        schema_contract: dict,
+        physical_columns: list[str],
+        non_column_names: set[str],
+    ) -> tuple[str | None, list[str]]:
+        field = str(alias or "").strip()
+        if not field or field in physical_columns or field in non_column_names:
+            return None, []
+        # Very short business words such as "重量" or "体积" are commonly
+        # ambiguous across order, line-item, vehicle, and contract tables. Keep
+        # them as unresolved with candidates instead of silently choosing one.
+        if len(field) <= 2:
+            return None, TaskDefinitionModule._source_field_candidate_columns(field, schema_contract)
+        matches = difflib.get_close_matches(field, physical_columns, n=1, cutoff=0.72)
+        if matches:
+            return matches[0], []
+        candidates = TaskDefinitionModule._source_field_candidate_columns(field, schema_contract)
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            ratio = difflib.SequenceMatcher(None, field, candidate).ratio()
+            if ratio >= 0.72:
+                return candidate, []
+        return None, candidates
+
+    @staticmethod
+    def _replace_source_field_alias(text: str, old: str, new: str) -> str:
+        out = str(text or "")
+        old = str(old or "").strip()
+        new = str(new or "").strip()
+        if not old or not new or old == new:
+            return out
+        for left, right in [("`", "`"), ("“", "”"), ('"', '"')]:
+            out = out.replace(f"{left}{old}{right}", f"{left}{new}{right}")
+        out = re.sub(rf"(?<=::){re.escape(old)}(?=($|[（(\s`'\"，,。；;、\)\]）】]))", new, out)
+        # Safe bare-word replacement for Chinese aliases in source-field prose.
+        # The negative CJK/word boundaries avoid changing generated output
+        # columns such as "总标准箱数".
+        out = re.sub(
+            rf"(?<![\w\u4e00-\u9fff]){re.escape(old)}(?![\w\u4e00-\u9fff])",
+            new,
+            out,
+        )
+        return out
+
+    @staticmethod
+    def _apply_source_field_alias_corrections_to_text(text: str, corrections: list[dict]) -> str:
+        out = str(text or "")
+        for item in corrections or []:
+            out = TaskDefinitionModule._replace_source_field_alias(
+                out,
+                str(item.get("from", "") or ""),
+                str(item.get("to", "") or ""),
+            )
+        return out
+
+    @staticmethod
+    def _apply_source_field_alias_corrections_to_contract(
+        contract: EvaluationContractReview,
+        corrections: list[dict],
+    ) -> EvaluationContractReview:
+        if not corrections:
+            return contract
+        for attr in [
+            "metric_formula",
+            "scalar_score_formula",
+            "prediction_unit",
+            "y_true_source",
+            "y_pred_source",
+            "computation_scope",
+            "aggregation_rule",
+            "validation_protocol",
+            "rationale",
+        ]:
+            value = getattr(contract, attr, "")
+            if isinstance(value, str) and value:
+                setattr(contract, attr, TaskDefinitionModule._apply_source_field_alias_corrections_to_text(value, corrections))
+        for attr in [
+            "submission_checks",
+            "leakage_guards",
+            "invalid_solution_rules",
+            "tie_break_rules",
+            "audit_metrics",
+            "issues",
+            "fixes",
+            "evidence",
+        ]:
+            values = getattr(contract, attr, None)
+            if isinstance(values, list):
+                setattr(
+                    contract,
+                    attr,
+                    [
+                        TaskDefinitionModule._apply_source_field_alias_corrections_to_text(str(value), corrections)
+                        for value in values
+                    ],
+                )
+        existing = list(contract.evidence or [])
+        for item in corrections[:8]:
+            note = (
+                "AutoRealize corrected source field alias "
+                f"`{item.get('from')}` -> `{item.get('to')}` using the exact source schema contract."
+            )
+            if note not in existing:
+                existing.append(note)
+        contract.evidence = existing
+        return contract
+
+    @staticmethod
+    def _correct_sample_spec_source_fields(
+        sample_spec: SampleSubmissionSpec,
+        *,
+        schema_contract: dict,
+    ) -> list[dict]:
+        """Repair source_fields that use a prose alias instead of an exact column.
+
+        The LLM may correctly understand a business concept but spell it as a
+        semantic alias. Downstream code needs exact physical column names, so we
+        conservatively rewrite backticked aliases only when there is a strong
+        fuzzy match in the deterministic schema contract.
+        """
+
+        physical_columns = sorted(TaskDefinitionModule._exact_schema_columns(schema_contract))
+        physical_column_set = set(physical_columns)
+        non_column_names = TaskDefinitionModule._exact_schema_non_column_names(schema_contract)
+        if not physical_columns or not sample_spec.source_fields:
+            return []
+
+        corrections: list[dict] = []
+        unresolved: list[dict] = []
+        updated: dict[str, str] = {}
+        for output_col, raw in sample_spec.source_fields.items():
+            text = str(raw or "")
+            new_text = text
+            for token in TaskDefinitionModule._source_field_alias_tokens(text):
+                field = str(token or "").strip()
+                if not field or field in physical_column_set or field in non_column_names:
+                    continue
+                replacement, candidates = TaskDefinitionModule._resolve_exact_source_field_alias(
+                    field,
+                    schema_contract=schema_contract,
+                    physical_columns=physical_columns,
+                    non_column_names=non_column_names,
+                )
+                if not replacement:
+                    unresolved.append(
+                        {
+                            "output_column": str(output_col),
+                            "alias": field,
+                            "reason": "source_fields alias is not an exact physical column and no safe schema correction was found",
+                            "candidate_exact_columns": candidates[:6],
+                        }
+                    )
+                    continue
+                if replacement == field:
+                    continue
+                new_text = TaskDefinitionModule._replace_source_field_alias(new_text, field, replacement)
+                corrections.append(
+                    {
+                        "output_column": str(output_col),
+                        "from": field,
+                        "to": replacement,
+                        "reason": "source_fields alias was not an exact physical column; corrected using exact schema contract",
+                    }
+                )
+            updated[str(output_col)] = new_text
+        if corrections or unresolved:
+            sample_spec.source_fields = updated
+            existing_rules = list(sample_spec.validation_rules or [])
+            for item in corrections[:8]:
+                existing_rules.append(
+                    "AutoRealize corrected source field alias "
+                    f"`{item['from']}` -> `{item['to']}` for output column `{item['output_column']}`."
+                )
+            for item in unresolved[:8]:
+                existing_rules.append(
+                    "AutoRealize could not resolve source field alias "
+                    f"`{item['alias']}` for output column `{item['output_column']}` to an exact physical column; "
+                    + (
+                        "candidate exact columns: "
+                        + ", ".join(f"`{x}`" for x in item.get("candidate_exact_columns", [])[:6])
+                        + "; "
+                        if item.get("candidate_exact_columns")
+                        else ""
+                    )
+                    + "do not access it as a raw dataframe column. Derive it from exact source fields, provide an evaluation/config rule, or define an explicit exclusion rule."
+                )
+            sample_spec.validation_rules = list(dict.fromkeys(existing_rules))
+        return corrections
+
+    @staticmethod
+    def _apply_source_field_corrections_to_output_markdown(
+        markdown: str,
+        sample_spec: SampleSubmissionSpec,
+        corrections: list[dict],
+    ) -> str:
+        """Keep the reader-facing output section aligned with corrected source fields."""
+
+        text = str(markdown or "")
+        for item in corrections or []:
+            old = str(item.get("from", "") or "").strip()
+            new = str(item.get("to", "") or "").strip()
+            if not old or not new or old == new:
+                continue
+            text = TaskDefinitionModule._replace_source_field_alias(text, old, new)
+
+        correction_rules = [
+            str(rule)
+            for rule in (sample_spec.validation_rules or [])
+            if str(rule).startswith("AutoRealize corrected source field alias")
+            or str(rule).startswith("AutoRealize could not resolve source field alias")
+        ]
+        if correction_rules and "### 源字段精确性修正" not in text:
+            lines = [
+                text.rstrip(),
+                "",
+                "### 源字段精确性修正",
+                "- 本节中的输出列是生成结果 schema，不是输入 DataFrame 原始列；下游读取源数据时必须使用精确物理字段名。",
+            ]
+            lines.extend(f"- {rule}" for rule in correction_rules[:12])
+            return "\n".join(lines).strip()
+        return text.strip()
+
+    @staticmethod
+    def _collect_source_alias_guard(
+        *,
+        sample_spec: SampleSubmissionSpec,
+        schema_contract: dict,
+        downstream_context: dict,
+    ) -> list[dict]:
+        physical_columns = sorted(TaskDefinitionModule._exact_schema_columns(schema_contract))
+        physical_column_set = set(physical_columns)
+        non_column_names = TaskDefinitionModule._exact_schema_non_column_names(schema_contract)
+        if not physical_columns:
+            return []
+
+        alias_sources: dict[str, set[str]] = {}
+
+        def add(alias: str, source: str) -> None:
+            field = str(alias or "").strip().strip("`'\"“”‘’")
+            if not field or field in physical_column_set or field in non_column_names:
+                return
+            if len(field) <= 1:
+                return
+            alias_sources.setdefault(field, set()).add(source)
+
+        for output_col, raw in (sample_spec.source_fields or {}).items():
+            for token in TaskDefinitionModule._source_field_alias_tokens(str(raw or "")):
+                add(token, f"sample_submission_spec.source_fields.{output_col}")
+
+        constraint_memory = downstream_context.get("constraint_memory")
+        items = constraint_memory.get("items", []) if isinstance(constraint_memory, dict) else []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            for field in item.get("related_fields") or []:
+                add(str(field), f"constraint_memory.items[{idx}].related_fields")
+
+        authoritative = downstream_context.get("authoritative_memory")
+        if isinstance(authoritative, dict):
+            for key in ["output_requirements", "evaluation_requirements", "constraints"]:
+                for text in authoritative.get(key, []) if isinstance(authoritative.get(key), list) else []:
+                    for token in TaskDefinitionModule._source_field_alias_tokens(str(text or "")):
+                        add(token, f"authoritative_memory.{key}")
+
+        guard: list[dict] = []
+        for alias in sorted(alias_sources):
+            replacement, candidates = TaskDefinitionModule._resolve_exact_source_field_alias(
+                alias,
+                schema_contract=schema_contract,
+                physical_columns=physical_columns,
+                non_column_names=non_column_names,
+            )
+            entry: dict[str, object] = {
+                "alias": alias,
+                "source": sorted(alias_sources[alias])[:6],
+            }
+            if replacement:
+                entry.update(
+                    {
+                        "status": "corrected_to_exact_physical_column",
+                        "exact_physical_column": replacement,
+                        "rule": "Use the exact physical column for raw pandas access; keep the alias only as business wording or a derived/output name.",
+                    }
+                )
+            else:
+                entry.update(
+                    {
+                        "status": "unresolved_business_concept",
+                        "candidate_exact_columns": candidates[:8],
+                        "rule": "Do not access this alias as a raw column. Derive it from exact fields if the derivation is specified; otherwise treat it as unresolved/optional and report the assumption in validation details.",
+                    }
+                )
+            guard.append(entry)
+        return guard
+
+    @staticmethod
+    def _apply_source_alias_guard_to_description(desc: str, guard: list[dict]) -> str:
+        text = str(desc or "")
+        aliases = {str(item.get("alias", "")): item for item in guard if isinstance(item, dict)}
+        if "标准箱数" in aliases and aliases["标准箱数"].get("exact_physical_column"):
+            exact = str(aliases["标准箱数"].get("exact_physical_column"))
+            text = text.replace("`标准箱数` 列", f"`{exact}` 列（业务含义为标准箱数量）")
+            text = text.replace("订单明细信息.标准箱数", f"订单明细信息.{exact}")
+        if "交付日" in aliases:
+            text = text.replace(
+                "由求解器根据订单的交付日字段（`订单表信息` 或 `订单明细信息` 中的 `交付日` 列）确定",
+                "由求解器从订单时间字段派生；当前 exact schema 未发现名为 `交付日` 的物理列，优先从 `要求交付时间` 取日期部分，并在缺失时按评估规则记录不可确认/未分配原因",
+            )
+            text = text.replace(
+                "`交付日` 列",
+                "`要求交付时间` 等精确时间字段派生出的交付日（源表不存在同名 `交付日` 物理列）",
+            )
+        if "是否可合并" in aliases:
+            text = text.replace(
+                "被标记为不能合并的订单不能与其他订单合并（对应字段 `是否可合并`）。",
+                "被标记为不能合并的订单不能与其他订单合并；当前 exact schema 未发现同名物理列 `是否可合并`，不得直接读取该列，无法从权威字段确认时应保守单独成车或在验证摘要中记录待确认假设。",
+            )
+        if guard and "## Source Alias Guard" not in text and "## 源字段别名警戒" not in text:
+            lines = [
+                text.rstrip(),
+                "",
+                "## 源字段别名警戒",
+                "- 下列名称在业务说明中出现，但不一定是输入表的物理列；下游代码必须先查 Exact Source Schema Contract，不得直接 `df[业务名]`。",
+            ]
+            for item in guard[:12]:
+                alias = item.get("alias")
+                status = item.get("status")
+                exact = item.get("exact_physical_column")
+                candidates = item.get("candidate_exact_columns")
+                if exact:
+                    lines.append(f"- `{alias}`: 使用精确物理列 `{exact}` 读取；业务词只作解释或派生名。")
+                elif candidates:
+                    lines.append(f"- `{alias}`: 未确认同名物理列；候选精确字段 {candidates}，需显式派生或保守记录假设。")
+                else:
+                    lines.append(f"- `{alias}`: 未找到可安全映射的物理列；不得直接读取，需作为业务规则/待确认事项处理。")
+            text = "\n".join(lines).strip()
+        return text
+
+    def _artifact_ref_index(self, ref: dict) -> dict:
+        if not isinstance(ref, dict):
+            return {}
+        return {
+            k: ref.get(k)
+            for k in [
+                "artifact_id",
+                "artifact_type",
+                "source",
+                "truncated",
+                "original_chars",
+                "visible_chars",
+                "artifact_path",
+            ]
+            if ref.get(k) not in (None, "", [], {})
+        }
+
+    def _put_context_artifact(self, artifact_type: str, source: str, payload: object) -> dict:
+        if payload in (None, "", [], {}):
+            return {}
+        ref = self._context_artifact_store().put(
+            artifact_type,
+            source,
+            payload,
+            visible_excerpt="",
+            visible_limit=1,
+        )
+        return self._artifact_ref_index(ref)
+
+    def _task_definition_artifact_refs(
+        self,
+        *,
+        original_text: str = "",
+        data_description_text: str = "",
+        current_description: str = "",
+        protocol_bundle: DescriptionProtocolBundle | dict | None = None,
+        downstream_context: dict | None = None,
+    ) -> dict:
+        refs: dict[str, dict] = {}
+        original_ref = self._put_context_artifact("original_requirements_full", "realize_report/original_requirements.txt", original_text)
+        if original_ref:
+            refs["original_requirements"] = original_ref
+        data_ref = self._put_context_artifact("data_description_full", "realize_report/data_description.md", data_description_text)
+        if data_ref:
+            refs["data_description"] = data_ref
+        if current_description:
+            desc_ref = self._put_context_artifact("description_draft_full", "description.md/current_draft", current_description)
+            if desc_ref:
+                refs["current_description"] = desc_ref
+        if protocol_bundle:
+            payload = protocol_bundle.model_dump() if hasattr(protocol_bundle, "model_dump") else protocol_bundle
+            proto_ref = self._put_context_artifact(
+                "description_protocol_bundle_full",
+                "realize_report/description_protocol_bundle.json",
+                payload,
+            )
+            if proto_ref:
+                refs["description_protocol_bundle"] = proto_ref
+        if isinstance(downstream_context, dict):
+            for key, artifact_type, source in [
+                ("agent_context_pack", "agent_context_pack_full", "data_cognition.agent_context_pack"),
+                ("automl_context_pack", "automl_context_pack_full", "realize_report/automl_context_pack.json"),
+                ("main_task_protocol", "main_task_protocol_ref", "realize_report/main_task_protocol.json"),
+            ]:
+                value = downstream_context.get(key)
+                if value not in (None, "", [], {}):
+                    ref = self._put_context_artifact(artifact_type, source, value)
+                    if ref:
+                        refs[key] = ref
+        return refs
+
+    def _headroom_context_policy(self) -> dict:
+        return {
+            "original_requirements_full_is_authoritative_and_present": True,
+            "legacy_data_digest_not_in_prompt": True,
+            "large_local_artifacts_not_visible_in_prompt": True,
+            "use_only_visible_evidence_packs": True,
+            "stable_prompt_order": "fixed rules/schema -> original requirements -> compact evidence pack; dynamic defects/errors last",
+        }
+
+    def _output_language_policy(self) -> dict:
+        lang = str(getattr(self.config.prompt, "output_language", "zh") or "zh").strip().lower()
+        if lang in {"zh", "cn", "chinese", "中文"}:
+            return {
+                "target_language": "zh",
+                "prose_language": "Chinese",
+                "rules": [
+                    "无论原始输入是中文、英文还是中英混合，最终 description 的正文解释必须统一使用中文。",
+                    "允许保留原始代码、函数名、文件名、Sheet 名、字段名、列名、指标名、JSON key、正则表达式和必要 API 参数。",
+                    "不要把英文业务短语直接混入普通说明文字；如需解释英文材料，应翻译或用中文转述。",
+                ],
+            }
+        if lang in {"en", "english"}:
+            return {
+                "target_language": "en",
+                "prose_language": "English",
+                "rules": [
+                    "Regardless of whether the source material is Chinese, English, or mixed, reader-facing description prose must be written in English.",
+                    "Keep original code, function names, file names, sheet names, field names, column names, metric names, JSON keys, regular expressions, and necessary API parameters unchanged.",
+                    "Do not mix Chinese prose into ordinary explanations; translate or explain Chinese source material in English.",
+                ],
+            }
+        return {
+            "target_language": "auto",
+            "prose_language": "follow source material",
+            "rules": [
+                "No global prose language is enforced because prompt.output_language=auto.",
+                "Still avoid unnecessary mixed-language prose within one sentence unless it is a field name, file name, code identifier, or required technical term.",
+            ],
+        }
+
+    def _headroom_pack_telemetry(self, packs: dict) -> dict:
+        telemetry: dict[str, dict] = {}
+        for name, payload in packs.items():
+            if payload in (None, "", [], {}):
+                continue
+            if isinstance(payload, dict):
+                telemetry[name] = context_telemetry(payload)
+            else:
+                text = dumps_json_safe(payload, sort_keys=True)
+                telemetry[name] = {
+                    "chars": len(text),
+                    "estimated_tokens": max(1, len(text) // 4) if text else 0,
+                    "sha256_16": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
+                    "artifact_refs": 0,
+                    "top_level_chars": {},
+                    "contains_forbidden_large_keys": [],
+                    "headroom_warnings": ["large_text_pack_over_120k_chars"] if len(text) > 120_000 else [],
+                }
+        return telemetry
+
+    def _record_headroom_pack_telemetry(self, stage: str, packs: dict) -> None:
+        """Write pack observability locally instead of sending it to the LLM.
+
+        Headroom keeps compression telemetry out of the model context. We follow
+        the same rule here: prompts carry only task evidence; artifact indexes,
+        size/hash/warning details go to a local JSONL ledger for cost analysis.
+        """
+
+        if not stage:
+            stage = "unknown"
+        payload = {
+            "stage": stage,
+            "packs": self._headroom_pack_telemetry(packs),
+        }
+        path = self.report_dir / "context_pack_telemetry.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(dumps_json_safe(payload, sort_keys=True) + "\n")
+
+    def _downstream_signal_pack(self, downstream_context: dict) -> dict:
+        return {
+            "task_hint": downstream_context.get("task_hint", ""),
+            "task_type_hint": downstream_context.get("task_type_hint", ""),
+            "problem_paradigm": downstream_context.get("problem_paradigm", ""),
+            "target_column": downstream_context.get("target_column", ""),
+            "y_true_field": downstream_context.get("y_true_field", ""),
+            "id_column": downstream_context.get("id_column", ""),
+            "train_table": downstream_context.get("train_table", ""),
+            "predict_table": downstream_context.get("predict_table", ""),
+            "submission_columns": downstream_context.get("submission_columns", []),
+            "generated_submission_columns": downstream_context.get("generated_submission_columns", []),
+            "generate_sample_submission": downstream_context.get("generate_sample_submission", True),
+            "sample_submission_available": downstream_context.get("sample_submission_available", False),
+            "submission_contract_source": downstream_context.get("submission_contract_source", ""),
+        }
+
+    def _table_card_index_for_task_prompts(
+        self,
+        table_cards: list[dict],
+        *,
+        limit: int = 16,
+        field_limit: int = 8,
+    ) -> list[dict]:
+        out: list[dict] = []
+        for card in table_cards[: max(1, int(limit))]:
+            if not isinstance(card, dict):
+                continue
+            fields = []
+            for field in self._table_card_fields(card)[: max(1, int(field_limit))]:
+                if not isinstance(field, dict):
+                    continue
+                fields.append(
+                    {
+                        k: field.get(k)
+                        for k in ["name", "role", "logical_type"]
+                        if field.get(k) not in (None, "", [], {})
+                    }
+                )
+            out.append(
+                {
+                    k: v
+                    for k, v in {
+                        "table_id": card.get("table_id"),
+                        "source_file": card.get("source_file"),
+                        "sheet_name": card.get("sheet_name"),
+                        "table_kind": card.get("table_kind"),
+                        "role": card.get("role"),
+                        "file_cognition": str(card.get("file_cognition", "") or "")[:220],
+                        "shape": card.get("shape"),
+                        "field_index": fields,
+                        "reading_notes": card.get("reading_notes"),
+                        "warnings": [str(x)[:180] for x in (card.get("warnings") or [])[:3]],
+                    }.items()
+                    if v not in (None, "", [], {})
+                }
+            )
+        return out
+
+    def _build_problem_paradigm_pack(
+        self,
+        *,
+        downstream_context: dict,
+        file_summaries: list | None = None,
+        relations: list | None = None,
+    ) -> dict:
+        auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
+        constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries or [],
+            downstream_context=downstream_context,
+            relations=relations or [],
+            table_limit=14,
+            relation_limit=20,
+        )
+        table_index = self._table_card_index_for_task_prompts(compiled["table_cards"], limit=14, field_limit=6)
+        return {
+            "purpose": "Classify whether this task is prediction, static optimization, RL, hybrid, or executable-unknown.",
+            "downstream_signals": self._downstream_signal_pack(downstream_context),
+            "authoritative_memory": compact_authoritative_memory(auth),
+            "constraint_memory": compact_constraint_memory(constraint_memory),
+            "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
+            "table_index": table_index,
+            "relations": compiled["relations"][:16],
+            "filename_sample_groups": compiled["filename_sample_groups"][:10],
+            "question_memory": self._question_memory_pack(downstream_context),
+            "classification_clues": {
+                "prediction_clues": ["train/test split", "target/label/y_true", "sample submission with id+target"],
+                "optimization_clues": ["decision variables", "constraints", "cost/objective", "feasible solution"],
+                "rl_clues": ["state/action/reward/episode/policy/environment"],
+                "hybrid_clues": ["ML prediction feeds an optimization policy or solver"],
+            },
+        }
+
+    def _build_description_protocol_pack(
+        self,
+        *,
+        problem_review: ProblemParadigmReview,
+        downstream_context: dict,
+        deterministic_data_access: object,
+        file_summaries: list | None = None,
+        relations: list | None = None,
+    ) -> dict:
+        auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
+        constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries or [],
+            downstream_context=downstream_context,
+            relations=relations or [],
+            table_limit=max(1, int(getattr(self.config.prompt, "description_protocol_file_limit", 16))),
+            relation_limit=30,
+        )
+        table_index = self._table_card_index_for_task_prompts(compiled["table_cards"], limit=18, field_limit=8)
+        pack = {
+            "problem_paradigm_review": problem_review.model_dump(),
+            "downstream_signals": self._downstream_signal_pack(downstream_context),
+            "authoritative_memory": compact_authoritative_memory(auth),
+            "constraint_memory": compact_constraint_memory(constraint_memory),
+            "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
+            "question_memory": self._question_memory_pack(downstream_context),
+            "data_access_inventory": self._compact_data_access_inventory(deterministic_data_access),
+            "table_index": table_index,
+            "relations": compiled["relations"][:24],
+            "filename_sample_groups": compiled["filename_sample_groups"][:12],
+        }
+        return pack
 
     def _validate_sample_against_spec(self, out_df, sample_spec: SampleSubmissionSpec) -> list[str]:
         issues: list[str] = []
@@ -1431,17 +2803,31 @@ class TaskDefinitionModule:
         generated_preview: list[dict],
         frozen_context: dict,
         rule_issues: list[str],
+        original_text: str,
+        artifact_refs: dict | None = None,
     ) -> SampleSubmissionValidationResult:
         system = self.services.prompt_mgr.load("system/sample_submission_validator.md")
-        stable, dynamic = stable_dynamic_prompt(
-            stable={
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "original_requirements_full": original_text,
+            "sample_submission_spec": sample_spec.model_dump(),
+            "frozen_task_eval_output_context": frozen_context,
+            "rules": [
+                "Check schema/meaning only; placeholder values are allowed.",
+                "Official columns, when present, are strict.",
+            ],
+        }
+        self._record_headroom_pack_telemetry(
+            "sample_submission_spec_validator",
+            {
+                "original_requirements_full": original_text,
                 "sample_submission_spec": sample_spec.model_dump(),
                 "frozen_task_eval_output_context": frozen_context,
-                "rules": [
-                    "Check schema/meaning only; placeholder values are allowed.",
-                    "Official columns, when present, are strict.",
-                ],
+                "artifact_refs": artifact_refs or {},
             },
+        )
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_payload,
             dynamic={
                 "generated_columns": generated_columns,
                 "generated_preview": generated_preview[:10],
@@ -1449,7 +2835,6 @@ class TaskDefinitionModule:
             },
             stable_title="Stable sample validator evidence",
             dynamic_title="Dynamic generated sample candidate",
-            stable_limit=22000,
             dynamic_limit=10000,
         )
         return self.services.llm_client.ask_structured(
@@ -1471,6 +2856,8 @@ class TaskDefinitionModule:
         downstream_context: dict,
         relations: list,
         frozen_context: dict,
+        original_text: str,
+        artifact_refs: dict | None = None,
     ) -> dict:
         import autorealize.pipeline as legacy
 
@@ -1495,6 +2882,8 @@ class TaskDefinitionModule:
             relations=relations,
         )
         stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "original_requirements_full": original_text,
             "sample_submission_spec": sample_spec.model_dump(),
             "data_access_minipack": minipack,
             "candidate_table": str(candidate.relative_to(data_root)).replace("\\", "/") if candidate else "",
@@ -1502,6 +2891,16 @@ class TaskDefinitionModule:
             "candidate_shape_sampled": [int(df.shape[0]), int(df.shape[1])],
             "frozen_task_eval_output_context": frozen_context,
         }
+        self._record_headroom_pack_telemetry(
+            "sample_submission_spec_builder",
+            {
+                "original_requirements_full": original_text,
+                "data_access_minipack": minipack,
+                "sample_submission_spec": sample_spec.model_dump(),
+                "frozen_task_eval_output_context": frozen_context,
+                "artifact_refs": artifact_refs or {},
+            },
+        )
 
         def _ask_plan(dynamic_payload: dict, round_idx: int) -> SubmissionScriptPlan:
             stable, dynamic = stable_dynamic_prompt(
@@ -1509,7 +2908,6 @@ class TaskDefinitionModule:
                 dynamic=dynamic_payload,
                 stable_title="Stable sample builder evidence",
                 dynamic_title="Dynamic sample builder request",
-                stable_limit=28000,
                 dynamic_limit=12000,
             )
             plan = self.services.llm_client.ask_structured(
@@ -1578,6 +2976,8 @@ class TaskDefinitionModule:
                 generated_preview=generated_preview,
                 frozen_context=frozen_context,
                 rule_issues=rule_issues,
+                original_text=original_text,
+                artifact_refs=artifact_refs,
             )
             validator_rounds += 1
             blocking = rule_issues + [str(x) for x in (validator.issues or []) if str(x).strip()]
@@ -1727,7 +3127,14 @@ class TaskDefinitionModule:
 
             if use_full_document:
                 system = self.services.prompt_mgr.load("system/description_writer.md")
+                artifact_refs = self._task_definition_artifact_refs(
+                    original_text=original_text,
+                    data_description_text=data_digest,
+                    current_description=current,
+                    downstream_context=downstream_context,
+                )
                 stable_payload = {
+                    "context_policy": self._headroom_context_policy(),
                     "instruction": (
                         "上一版 description.md 没有通过检查。请根据 errors 修复并重新输出完整、最终、给人看的中文 Markdown。"
                         "不要输出修复说明或审查日志。"
@@ -1739,17 +3146,33 @@ class TaskDefinitionModule:
                         "保留原始需求、权威说明、提交格式和评估协议，不要因为修复文件名而改写任务目标。",
                     ],
                     "existing_file_names": self._known_data_file_names(data_root),
-                    "authoritative_context": self._compact_agent_context(downstream_context, route="description_writer"),
+                    "authoritative_context": {
+                        "downstream_signals": self._downstream_signal_pack(downstream_context),
+                        "authoritative_memory": compact_authoritative_memory(
+                            downstream_context.get("authoritative_memory", {})
+                        ),
+                        "constraint_memory": compact_constraint_memory(downstream_context.get("constraint_memory", {})),
+                        "question_memory": self._question_memory_pack(downstream_context),
+                    },
                     "evaluation_contract": evaluation_contract.model_dump() if evaluation_contract else {},
-                    "original_requirements": original_text[:12000],
-                    "data_cognition_digest": data_digest[:10000],
+                    "original_requirements_full": original_text,
                 }
+                self._record_headroom_pack_telemetry(
+                    f"description_repair_{stage}_{idx+1}",
+                    {
+                        "original_requirements_full": original_text,
+                        "authoritative_context": stable_payload["authoritative_context"],
+                        "evaluation_contract": stable_payload["evaluation_contract"],
+                        "artifact_refs": artifact_refs,
+                    },
+                )
                 dynamic_payload = {
                     "stage": stage,
                     "round": idx + 1,
                     "errors": defects,
                     "missing_file_references": missing_refs,
-                    "current_description": current[:22000],
+                    "current_description_visible_excerpt": current[:8000],
+                    "current_description_policy": "Only this excerpt is visible to the model in this repair call. The full current draft is stored locally for audit, not expanded in the prompt.",
                 }
                 stable, dynamic = stable_dynamic_prompt(
                     stable=stable_payload,
@@ -1878,20 +3301,34 @@ class TaskDefinitionModule:
         evaluation_contract: EvaluationContractReview,
     ) -> str:
         system = self.services.prompt_mgr.load("system/description_writer.md")
-        compact_context = self._compact_agent_context(downstream_context, route="description_writer")
+        artifact_refs = self._task_definition_artifact_refs(
+            original_text=original_text,
+            data_description_text=data_digest,
+            current_description=desc,
+            downstream_context=downstream_context,
+        )
+        compact_context = {
+            "downstream_signals": self._downstream_signal_pack(downstream_context),
+            "authoritative_memory": compact_authoritative_memory(downstream_context.get("authoritative_memory", {})),
+            "constraint_memory": compact_constraint_memory(downstream_context.get("constraint_memory", {})),
+            "question_memory": self._question_memory_pack(downstream_context),
+            "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
+        }
         composer_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
             "instruction": (
                 "Rewrite the current draft into the final reader-facing description.md. "
                 "Official/original task documents and official sample/output contracts have highest priority. "
                 "Data profiles may explain files and fields but must not override official task, output, or evaluation rules."
             ),
             "hard_rules": [
-                "必须输出一份完整、自然、给人看的中文 Markdown 赛题说明。",
+                "必须输出一份完整、自然、给人看的 Markdown 赛题说明，并严格遵守 output_language_policy。",
                 "不得输出反思过程、审查日志、智能体中间结果、issues/fixes、ambiguity_points、Contract Status。",
                 "不得发明提交列、输出文件名、评估指标、指标方向、行数规则或固定随机种子。",
                 "若没有权威提交合同，不要编造 sample_submission.csv；按原始说明描述输出协议或说明由下游实验协议决定。",
                 "原始 description.md、README、官方规则、官方样例提交优先级高于数据统计和字段名猜测。",
-                "除章节标题、文件名、字段名、变量名、公式和必要技术名词外，不要中英文混用。",
+                "除 output_language_policy 允许保留的代码、文件名、字段名、列名、变量名、公式和必要技术名词外，不要混用其它自然语言。",
             ],
             "required_sections": [
                 "任务概述",
@@ -1904,20 +3341,18 @@ class TaskDefinitionModule:
             ],
             "authoritative_context": compact_context,
             "evaluation_contract": evaluation_contract.model_dump(),
-            "downstream_context": {
-                "task_type_hint": downstream_context.get("task_type_hint", ""),
-                "target_column": downstream_context.get("target_column", ""),
-                "y_true_field": downstream_context.get("y_true_field", ""),
-                "train_table": downstream_context.get("train_table", ""),
-                "predict_table": downstream_context.get("predict_table", ""),
-                "submission_columns": downstream_context.get("submission_columns", []),
-                "generated_submission_columns": downstream_context.get("generated_submission_columns", []),
-                "generate_sample_submission": downstream_context.get("generate_sample_submission", True),
-                "submission_contract_source": downstream_context.get("submission_contract_source", ""),
-            },
-            "original_requirements": original_text[:14000],
-            "data_cognition_digest": data_digest[:12000],
+            "downstream_context": self._downstream_signal_pack(downstream_context),
+            "original_requirements_full": original_text,
         }
+        self._record_headroom_pack_telemetry(
+            "description_final_composer",
+            {
+                "original_requirements_full": original_text,
+                "authoritative_context": compact_context,
+                "evaluation_contract": evaluation_contract.model_dump(),
+                "artifact_refs": artifact_refs,
+            },
+        )
         current = desc
         defects: list[str] = []
         max_rounds = max(3, int(getattr(self.config.prompt, "description_quality_max_retries", 3)))
@@ -1925,7 +3360,8 @@ class TaskDefinitionModule:
             stable, dynamic = stable_dynamic_prompt(
                 stable=composer_payload,
                 dynamic={
-                    "current_reviewed_draft": current[:22000],
+                    "current_reviewed_draft_visible_excerpt": current[:10000],
+                    "current_draft_policy": "Only this excerpt is visible to the model. The full draft and data cognition report are stored locally for audit, not expanded in the prompt.",
                     "previous_defects": defects,
                 },
                 stable_title="Stable final description composition context",
@@ -2005,42 +3441,50 @@ class TaskDefinitionModule:
         reflection_feedback: list[str] | None = None,
     ) -> EvaluationContractReview:
         system = self.services.prompt_mgr.load("system/evaluation_contract_reviewer.md")
+        artifact_refs = self._task_definition_artifact_refs(
+            original_text=original_text,
+            data_description_text=data_digest,
+            current_description=desc,
+            protocol_bundle=downstream_context.get("description_protocol_bundle", {}),
+            downstream_context=downstream_context,
+        )
         if evaluation_evidence_pack is None:
             compact_context = {
-                "task_hint": downstream_context.get("task_hint", ""),
-                "task_type_hint": downstream_context.get("task_type_hint", ""),
-                "problem_paradigm": downstream_context.get("problem_paradigm", ""),
+                "downstream_signals": self._downstream_signal_pack(downstream_context),
                 "problem_paradigm_review": downstream_context.get("problem_paradigm_review", {}),
-                "target_column": downstream_context.get("target_column", ""),
-                "y_true_field": downstream_context.get("y_true_field", ""),
-                "id_column": downstream_context.get("id_column", ""),
-                "train_table": downstream_context.get("train_table", ""),
-                "predict_table": downstream_context.get("predict_table", ""),
-                "submission_columns": downstream_context.get("submission_columns", []),
-                "generated_submission_columns": downstream_context.get("generated_submission_columns", []),
-                "authoritative_memory": downstream_context.get("authoritative_memory", {}),
+                "authoritative_memory": compact_authoritative_memory(downstream_context.get("authoritative_memory", {})),
                 "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
-                "constraint_memory": downstream_context.get("constraint_memory", {}),
+                "constraint_memory": compact_constraint_memory(downstream_context.get("constraint_memory", {})),
+                "question_memory": self._question_memory_pack(downstream_context),
                 "retrieved_knowledge": downstream_context.get("retrieved_knowledge", [])[:8],
-                "description_protocol_bundle": downstream_context.get("description_protocol_bundle", {}),
             }
             evaluation_evidence_pack = {
-                "original_requirements_excerpt": original_text[:5000],
-                "data_cognition_digest_excerpt": data_digest[:4000],
                 "downstream_context": compact_context,
                 "legacy_current_evaluation_section": self._h2_section_text(desc, "评估协议")[:5000] if desc else "",
                 "legacy_current_output_section": self._h2_section_text(desc, "输出或提交格式")[:4000] if desc else "",
             }
         stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._output_language_policy(),
             "instruction": (
                 "Compile or repair a strict EvaluationContractReview from the compact evidence pack. "
                 "Do not inspect or rewrite the full description. Normal review rounds may set passed=false "
                 "with concise issues/fixes when evidence is insufficient. The finalizer round must instead "
                 "write a complete executable contract using explicit AutoRealize-defined assumptions when needed."
             ),
+            "original_requirements_full": original_text,
             "evaluation_evidence_pack": evaluation_evidence_pack,
             "frozen_task_sections": frozen_task_sections or {},
         }
+        self._record_headroom_pack_telemetry(
+            "evaluation_contract_reviewer",
+            {
+                "original_requirements_full": original_text,
+                "evaluation_evidence_pack": evaluation_evidence_pack,
+                "frozen_task_sections": frozen_task_sections or {},
+                "artifact_refs": artifact_refs,
+            },
+        )
         reflection_payload = {}
         if previous_contract is not None or reflection_feedback:
             reflection_payload = {
@@ -2097,7 +3541,6 @@ class TaskDefinitionModule:
                 dynamic=dynamic_payload,
                 stable_title="Stable evaluation contract evidence",
                 dynamic_title="Dynamic evaluation review state",
-                stable_limit=35000,
                 dynamic_limit=14000,
             )
             review = self.services.llm_client.ask_structured(
@@ -2174,12 +3617,21 @@ class TaskDefinitionModule:
         file_summaries: list,
         downstream_context: dict,
         evaluation_contract: EvaluationContractReview,
+        relations: list,
     ) -> dict:
+        compiled_context = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=24,
+            relation_limit=40,
+        )
         pack = build_automl_context_pack(
             protocol_bundle,
             file_summaries=file_summaries,
             downstream_context=downstream_context,
             evaluation_contract=evaluation_contract,
+            compiled_context=compiled_context,
         )
         payload = pack.model_dump()
         write_json_safe(self.report_dir / "automl_context_pack.json", payload, indent=2)
@@ -2409,7 +3861,8 @@ class TaskDefinitionModule:
         log_event(logger, "module.task_definition", "CREATED")
         log_event(logger, "module.task_definition", "ACTIVATED")
         data_description_path = cognition.data_description_path or (self.report_dir / "data_description.md")
-        data_digest = data_description_path.read_text(encoding="utf-8")[:16000] if data_description_path.exists() else ""
+        data_description_text = data_description_path.read_text(encoding="utf-8") if data_description_path.exists() else ""
+        data_digest = data_description_text[:16000]
         original_text = self._authoritative_requirement_text(
             cognition.authoritative_memory,
             cognition.original_requirement_texts,
@@ -2467,6 +3920,9 @@ class TaskDefinitionModule:
             original_text=original_text,
             data_digest=data_digest,
             downstream_context=downstream_context,
+            file_summaries=cognition.file_summaries,
+            relations=cognition.relation_hints,
+            data_description_text=data_description_text,
         )
         downstream_context["problem_paradigm"] = problem_review.problem_paradigm
         downstream_context["problem_paradigm_review"] = problem_review.model_dump()
@@ -2522,7 +3978,8 @@ class TaskDefinitionModule:
         dir_summaries_refined = legacy._summarize_dirs(data_root, cognition.file_summaries)
         write_data_description(data_description_path, cognition.file_summaries, dir_summaries_refined, rel_hints_refined)
         append_constraint_memory_section(data_description_path, cognition.constraint_memory)
-        data_digest = data_description_path.read_text(encoding="utf-8")[:16000]
+        data_description_text = data_description_path.read_text(encoding="utf-8")
+        data_digest = data_description_text[:16000]
 
         protocol_bundle = self._build_description_protocol_bundle(
             problem_review=problem_review,
@@ -2530,6 +3987,9 @@ class TaskDefinitionModule:
             data_digest=data_digest,
             downstream_context=downstream_context,
             deterministic_data_access=deterministic_data_access,
+            file_summaries=cognition.file_summaries,
+            relations=rel_hints_refined,
+            data_description_text=data_description_text,
         )
         downstream_context["description_protocol_bundle"] = protocol_bundle.model_dump()
         self._write_protocol_artifacts(
@@ -2544,7 +4004,17 @@ class TaskDefinitionModule:
             problem_review=problem_review,
             downstream_context=downstream_context,
         )
-        overview_task = self._generate_overview_task_definition_sections(task_authority_pack=task_authority_pack)
+        task_definition_artifact_refs = self._task_definition_artifact_refs(
+            original_text=original_text,
+            data_description_text=data_description_text,
+            protocol_bundle=protocol_bundle,
+            downstream_context=downstream_context,
+        )
+        overview_task = self._generate_overview_task_definition_sections(
+            task_authority_pack=task_authority_pack,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
+        )
         frozen_sections: dict[str, str] = {
             "任务概述": overview_task.overview_markdown,
             "任务定义": overview_task.task_definition_markdown,
@@ -2562,6 +4032,8 @@ class TaskDefinitionModule:
             downstream_context=downstream_context,
             evaluation_evidence_pack=evaluation_evidence_pack,
             frozen_task_sections=frozen_sections,
+            original_text=original_text,
+            data_digest=data_description_text,
         )
         downstream_context["evaluation_contract"] = evaluation_contract.model_dump()
         evaluation_section = self._render_evaluation_section(evaluation_contract, downstream_context)
@@ -2594,12 +4066,16 @@ class TaskDefinitionModule:
             downstream_context=downstream_context,
             problem_review=problem_review,
             official_sample_probe=official_sample_probe,
+            file_summaries=cognition.file_summaries,
+            relations=rel_hints_refined,
             evaluation_contract=evaluation_contract,
         )
         output_draft = self._generate_output_section(
             output_evidence_pack=output_evidence_pack,
             frozen_sections=frozen_sections,
             evaluation_contract=evaluation_contract,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
         )
         sample_spec = output_draft.sample_submission_spec
         if official_sample_probe.get("columns"):
@@ -2615,7 +4091,64 @@ class TaskDefinitionModule:
             protocol_bundle.output.format_rules = list(dict.fromkeys(protocol_bundle.output.format_rules + sample_spec.format_rules))
         if sample_spec.no_sample_submission_reason:
             protocol_bundle.output.no_sample_submission_reason = sample_spec.no_sample_submission_reason
+        source_schema_contract = build_data_schema_contract(cognition.file_summaries, max_tables=80)
+        source_field_corrections = self._correct_sample_spec_source_fields(
+            sample_spec,
+            schema_contract=source_schema_contract,
+        )
+        source_field_audit_rules = [
+            str(rule)
+            for rule in (sample_spec.validation_rules or [])
+            if str(rule).startswith("AutoRealize corrected source field alias")
+            or str(rule).startswith("AutoRealize could not resolve source field alias")
+        ]
+        if source_field_corrections:
+            evaluation_contract = self._apply_source_field_alias_corrections_to_contract(
+                evaluation_contract,
+                source_field_corrections,
+            )
+            downstream_context["evaluation_contract"] = evaluation_contract.model_dump()
+            evaluation_section = self._apply_source_field_alias_corrections_to_text(
+                self._render_evaluation_section(evaluation_contract, downstream_context),
+                source_field_corrections,
+            )
+            frozen_sections["评估协议"] = evaluation_section
+            self._write_evaluation_contract_report(evaluation_contract)
+        if source_field_corrections or source_field_audit_rules:
+            output_draft.markdown = self._apply_source_field_corrections_to_output_markdown(
+                output_draft.markdown,
+                sample_spec,
+                source_field_corrections,
+            )
+        if source_field_corrections:
+            downstream_context["sample_submission_source_field_corrections"] = source_field_corrections
+            log_event(
+                logger,
+                "module.task_definition.sample_submission",
+                "SOURCE_FIELDS_CORRECTED",
+                corrections=source_field_corrections[:8],
+            )
+        elif source_field_audit_rules:
+            log_event(
+                logger,
+                "module.task_definition.sample_submission",
+                "SOURCE_FIELDS_AUDITED",
+                unresolved_rules=source_field_audit_rules[:8],
+            )
         downstream_context["sample_submission_spec"] = sample_spec.model_dump()
+        source_alias_guard = self._collect_source_alias_guard(
+            sample_spec=sample_spec,
+            schema_contract=source_schema_contract,
+            downstream_context=downstream_context,
+        )
+        if source_alias_guard:
+            downstream_context["source_alias_guard"] = source_alias_guard
+            log_event(
+                logger,
+                "module.task_definition.source_alias_guard",
+                "COMPLETED",
+                aliases=len(source_alias_guard),
+            )
 
         generate_sample_submission = bool(getattr(self.config.switches, "generate_sample_submission", True))
         downstream_context["sample_submission_generation_requested"] = generate_sample_submission
@@ -2631,6 +4164,8 @@ class TaskDefinitionModule:
                 file_summaries=cognition.file_summaries,
                 downstream_context=downstream_context,
                 relations=rel_hints_refined,
+                original_text=original_text,
+                artifact_refs=task_definition_artifact_refs,
                 frozen_context={
                     "任务概述": overview_task.overview_markdown,
                     "任务定义": overview_task.task_definition_markdown,
@@ -2690,6 +4225,8 @@ class TaskDefinitionModule:
                 downstream_context=downstream_context,
             ),
             frozen_sections=frozen_sections,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
             extra_rules=[
                 "只写输入文件/文件组作用、shape 和必要读取提示。",
                 "不要展开完整 preview，不要把字段说明放到本章主体。",
@@ -2705,6 +4242,8 @@ class TaskDefinitionModule:
                 relations=rel_hints_refined,
             ),
             frozen_sections=frozen_sections,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
             extra_rules=[
                 "只说明任务相关关键字段；多 sheet Excel 需要标注 sheet 级字段边界。",
                 "字段含义优先使用前置文件认知结果，不要重新发明。",
@@ -2719,6 +4258,8 @@ class TaskDefinitionModule:
                 relations=rel_hints_refined,
             ),
             frozen_sections=frozen_sections,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
             extra_rules=[
                 "写硬约束、非法输出、防泄漏和验证边界。",
                 "不要发明权威材料中没有的约束。",
@@ -2730,6 +4271,8 @@ class TaskDefinitionModule:
             section_title="关键坑点与待确认事项",
             evidence_pack=self._build_tips_pack(downstream_context=downstream_context),
             frozen_sections=frozen_sections,
+            original_text=original_text,
+            artifact_refs=task_definition_artifact_refs,
             extra_rules=[
                 "必须包含 QDI 未解问题处理原则。",
                 "提醒下游避免依赖未验证疑惑，无法避免时写成可配置假设或保守兜底。",
@@ -2749,6 +4292,7 @@ class TaskDefinitionModule:
                 tips_section.markdown,
             ]
         )
+        desc = self._apply_source_alias_guard_to_description(desc, source_alias_guard)
         desc = legacy._enforce_existing_file_references(desc, data_root)
         defects = self._artifact_sanity_check(
             desc=desc,
@@ -2778,6 +4322,7 @@ class TaskDefinitionModule:
             file_summaries=cognition.file_summaries,
             downstream_context=downstream_context,
             evaluation_contract=evaluation_contract,
+            relations=rel_hints_refined,
         )
         main_task_protocol = self._write_main_task_protocol(
             task_hint=task_hint,

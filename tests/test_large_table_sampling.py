@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 from autorealize.config import AutoRealizeConfig
+from autorealize.modules.data_cognition import _table_schema_signature
 from autorealize.parsers.table_parser import TableParser
 from autorealize.pipeline import AutoRealizePipeline
 from autorealize.profiling.stats import excel_sheet_groups_from_profiles, profile_excel_sheets
@@ -68,6 +69,56 @@ def test_excel_parser_preserves_raw_top_rows_for_every_sheet(tmp_path: Path) -> 
     assert "订单说明" in parsed.metadata["excel_sheet_names"]
     assert "成本明细" in parsed.metadata["excel_sheet_names"]
     assert "line_id" in parsed.columns
+
+
+def test_excel_layout_inference_detects_headerless_and_non_default_header(tmp_path: Path) -> None:
+    workbook = tmp_path / "layout_cases.xlsx"
+    with pd.ExcelWriter(workbook) as writer:
+        pd.DataFrame([["A", 1], ["B", 2]]).to_excel(
+            writer,
+            sheet_name="headerless_map",
+            index=False,
+            header=False,
+        )
+        pd.DataFrame([["note", "open row"], ["id", "amount"], ["A", 1]]).to_excel(
+            writer,
+            sheet_name="header_row_1",
+            index=False,
+            header=False,
+        )
+
+    profiles = profile_excel_sheets(
+        workbook,
+        max_rows=10,
+        preview_rows=5,
+        large_threshold_bytes=1024 * 1024,
+        full_profile_sheet_threshold=10,
+    )
+    by_sheet = {str(p["sheet_name"]): p for p in profiles}
+
+    assert by_sheet["headerless_map"]["layout_kind"] == "headerless_table"
+    assert by_sheet["headerless_map"]["read_strategy_kind"] == "header_none_table"
+    assert "header=None" in by_sheet["headerless_map"]["recommended_read"]
+    assert by_sheet["header_row_1"]["layout_kind"] == "non_default_header"
+    assert by_sheet["header_row_1"]["detected_header_row"] == 1
+    assert "header=1" in by_sheet["header_row_1"]["recommended_read"]
+
+
+def test_excel_schema_signature_is_layout_aware_for_sampling(tmp_path: Path) -> None:
+    first = tmp_path / "sample_01_map.xlsx"
+    second = tmp_path / "sample_02_map.xlsx"
+    with pd.ExcelWriter(first) as writer:
+        pd.DataFrame([["A", 1], ["B", 2]]).to_excel(writer, sheet_name="map", index=False, header=False)
+    with pd.ExcelWriter(second) as writer:
+        pd.DataFrame([["X", 9], ["Y", 10]]).to_excel(writer, sheet_name="map", index=False, header=False)
+
+    sig_a = _table_schema_signature(first)
+    sig_b = _table_schema_signature(second)
+
+    assert sig_a["signature"] == sig_b["signature"]
+    assert sig_a["schema_basis"] == "excel_sheet_layout_and_header_strategy"
+    assert sig_a["layout_summary"][0]["layout_kind"] == "headerless_table"
+    assert sig_a["layout_summary"][0]["columns_preview"] == ["col1:text", "col2:number"]
 
 
 def test_excel_many_similar_sheets_group_and_profile_representatives(tmp_path: Path) -> None:

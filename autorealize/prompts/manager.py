@@ -25,13 +25,17 @@ class PromptManager:
         if lang in {"zh", "cn", "chinese", "中文"}:
             return (
                 "输出语言要求：除代码、文件名、字段名、列名、指标名、正则表达式、JSON schema 字段名和必要 API 参数外，"
-                "所有面向用户或写入最终文档的自然语言必须使用中文。不要中英文混写；如果原文是英文，也要用中文解释其含义。"
+                "所有面向用户或写入最终文档的自然语言必须使用中文。无论输入材料是中文、英文还是中英混合，"
+                "正文解释、段落、列表说明、风险提示和开放问题都必须统一用中文表达。不要中英文混写；"
+                "如果原文是英文，也要用中文解释其含义。"
             )
         if lang in {"en", "english"}:
             return (
                 "Output language requirement: except for code, file names, field names, column names, metric names, "
                 "regular expressions, JSON schema keys, and necessary API parameters, all user-facing natural language "
-                "must be written in English. Do not mix Chinese and English prose."
+                "must be written in English. Regardless of whether the source material is Chinese, English, or mixed, "
+                "reader-facing explanations, paragraphs, list prose, risks, and open issues must use English only. "
+                "Do not mix Chinese and English prose."
             )
         return ""
 

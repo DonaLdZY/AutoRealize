@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from autorealize.config import AutoRealizeConfig
 from autorealize.llm.client import (
     LLMClient,
+    _deepseek_cost_breakdown,
+    _prompt_stage,
     _prompt_part_stats,
     _usage_cache_tokens,
     _usage_to_dict,
@@ -67,9 +69,32 @@ def test_prompt_part_stats_supports_synthetic_lengths() -> None:
     assert rows[1]["provider_prompt_tokens_estimate"] > rows[0]["provider_prompt_tokens_estimate"]
 
 
+def test_deepseek_cost_breakdown_uses_hit_miss_output_prices() -> None:
+    breakdown = _deepseek_cost_breakdown(
+        prompt_tokens=150,
+        cached_tokens=100,
+        miss_tokens=40,
+        completion_tokens=20,
+    )
+
+    assert breakdown["unknown_input_tokens"] == 10
+    assert breakdown["cache_hit_input_rmb"] == 0.000003
+    assert breakdown["cache_miss_input_rmb"] == 0.00012
+    assert breakdown["unknown_input_as_miss_rmb"] == 0.00003
+    assert breakdown["output_rmb"] == 0.00012
+    assert breakdown["total_unknown_as_miss_rmb"] == 0.000273
+
+
+def test_prompt_stage_groups_known_autorealize_prompts() -> None:
+    assert _prompt_stage("question_investigator_action_1") == "qdi"
+    assert _prompt_stage("description_protocol_static_optimization_1") == "description_protocol"
+    assert _prompt_stage("evaluation_contract_reviewer_2") == "evaluation_contract"
+
+
 def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> None:
     cfg = AutoRealizeConfig()
     cfg.llm.api_key = "test-key"
+    cfg.llm.model_name = "deepseek-v4-pro"
     client = LLMClient(cfg, tmp_path)
     response = SimpleNamespace(
         usage={
@@ -115,9 +140,15 @@ def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> N
     assert summary["prompt_cache_hit_tokens"] == 80
     assert summary["prompt_cache_miss_tokens"] == 40
     assert summary["provider_cache_hit_ratio"] == 0.666667
+    assert summary["deepseek_cost_breakdown_rmb"]["cache_miss_input_tokens"] == 40
     assert summary["by_prompt"]["unit_prompt"]["calls"] == 1
     assert summary["by_prompt"]["unit_prompt"]["by_part_ranked"][0]["estimated_tokens"] >= 1
     assert summary["by_prompt_part_ranked"][0]["prompt_name"] == "unit_prompt"
+    brief = json.loads((tmp_path / "llm_usage_brief.json").read_text(encoding="utf-8"))
+    assert brief["deepseek_pricing_rmb_per_1m"]["cache_miss_input"] == 3.0
+    assert brief["deepseek_cost_breakdown_rmb"]["output_tokens"] == 12
+    assert brief["top_prompts_by_estimated_cost"][0]["stage"] == "other"
+    assert brief["by_stage"][0]["stage"] == "other"
 
 
 def test_log_provider_usage_marks_unknown_cache_fields(tmp_path) -> None:

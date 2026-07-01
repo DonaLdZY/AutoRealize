@@ -510,7 +510,7 @@ def _config_apply_dict(self, updates: dict) -> "AutoRealizeConfig":
 
 def _config_from_file(cls, path: Path | str) -> "AutoRealizeConfig":
     cfg = cls.from_env()
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
         raise ValueError("配置文件必须是 JSON object。")
     cfg.apply_dict(data)

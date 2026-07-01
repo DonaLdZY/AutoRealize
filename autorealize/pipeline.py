@@ -783,6 +783,19 @@ def _fill_deterministic_file_memory(fs: FileSummary, parsed_kind: str) -> None:
         facts.append(f"Excel 工作簿包含 {len(sheet_names)} 个 sheet：" + "、".join(f"`{x}`" for x in sheet_names[:12]) + (" 等。" if len(sheet_names) > 12 else "。"))
         if len(sheet_names) > 1:
             risks.append("多 sheet Excel 不能依赖 pandas 默认读取第一个 sheet，后续代码应显式指定 sheet_name。")
+    if sheets:
+        abnormal_layouts = []
+        for item in sheets[:20]:
+            if not isinstance(item, dict):
+                continue
+            layout_kind = str(item.get("layout_kind", "") or "")
+            if layout_kind and layout_kind != "standard_table":
+                abnormal_layouts.append(
+                    f"`{item.get('sheet_name')}`={layout_kind}, read={item.get('recommended_read') or 'inspect header=None'}"
+                )
+        if abnormal_layouts:
+            facts.append("检测到非标准 Excel sheet 读取方式：" + "；".join(abnormal_layouts[:8]) + "。")
+            risks.append("存在无表头、非默认表头、说明页或稀疏布局 sheet；后续代码必须按 sheet 级读取建议核对表头。")
     json_schema = meta.get("json_first_level_schema") if isinstance(meta.get("json_first_level_schema"), dict) else {}
     if json_schema:
         facts.append(
@@ -829,8 +842,10 @@ def _fill_deterministic_file_memory(fs: FileSummary, parsed_kind: str) -> None:
                 continue
             cols = [str(x) for x in (item.get("columns") or [])[:8]]
             shape_item = item.get("shape") or []
+            layout_kind = str(item.get("layout_kind", "") or "")
+            read = str(item.get("recommended_read", "") or "")
             sheet_bits.append(
-                f"`{item.get('sheet_name')}` shape={shape_item} columns={cols}"
+                f"`{item.get('sheet_name')}` shape={shape_item} layout={layout_kind or 'standard_table'} read={read or 'default'} columns={cols}"
             )
         if sheet_bits:
             lines.append("Sheet 概览：" + "；".join(sheet_bits))

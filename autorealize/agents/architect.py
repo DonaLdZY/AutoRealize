@@ -22,12 +22,52 @@ class Architect:
         obj = json.loads(content)
         return json.dumps(obj, ensure_ascii=False, indent=2)
 
+    def _compact_cognition_digest_for_plan(self, cognition_digest: str) -> dict[str, object]:
+        """Keep the legacy architect call from ingesting a long report slice.
+
+        The current task-definition pipeline no longer relies on this planner
+        in low-token mode, but users can still enable it. This compact view
+        preserves navigation signals without sending the full data description.
+        """
+
+        text = str(cognition_digest or "")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        headings = [line[:220] for line in lines if line.startswith(("#", "##", "###"))][:40]
+        key_lines: list[str] = []
+        keywords = (
+            "目标",
+            "评估",
+            "指标",
+            "提交",
+            "输出",
+            "约束",
+            "泄漏",
+            "sample",
+            "submission",
+            "metric",
+            "score",
+            "target",
+        )
+        for line in lines:
+            low = line.lower()
+            if any(k.lower() in low for k in keywords):
+                key_lines.append(line[:280])
+            if len(key_lines) >= 80:
+                break
+        return {
+            "source": "deterministic line filter from data_description.md",
+            "original_chars": len(text),
+            "headings": headings,
+            "key_lines": key_lines,
+            "policy": "Navigation only. Full task authority is original_requirements.txt in the later pipeline.",
+        }
+
     def build_plan(self, task_hint: str, cognition_digest: str) -> PipelinePlan:
         system = self.prompt_mgr.load("system/architect_plan.md")
         stable, dynamic = stable_dynamic_prompt(
             stable={
                 "task_hint": task_hint,
-                "data_cognition_digest": cognition_digest[:12000],
+                "data_cognition_navigation": self._compact_cognition_digest_for_plan(cognition_digest),
             },
             dynamic={"instruction": "Build the task definition plan."},
             stable_title="Stable task and data cognition context",
