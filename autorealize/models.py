@@ -381,10 +381,64 @@ class ContextRetrievalRequest(BaseModel):
     reason: str = ""
 
 
+class DocumentSearchRequest(BaseModel):
+    """Search full locally extracted document chunks without an LLM call."""
+
+    question_id: str = ""
+    query: str = ""
+    document_ids: list[str] = Field(default_factory=list)
+    source_files: list[str] = Field(default_factory=list)
+    top_k: int = 5
+    reason: str = ""
+
+
+class DocumentChunkReadRequest(BaseModel):
+    """Read exact chunks and optional neighbors from the local document store."""
+
+    question_id: str = ""
+    chunk_ids: list[str] = Field(default_factory=list)
+    neighbor_count: int = 1
+    reason: str = ""
+
+
+class QDIArtifactExcerptRequest(BaseModel):
+    """Read a bounded excerpt from an artifact created by the current QDI run."""
+
+    question_id: str = ""
+    artifact_id: str = ""
+    offset: int = 0
+    max_chars: int = 8000
+    json_path: str = ""
+    reason: str = ""
+
+
+class QDIWorkingMemoryUpdate(BaseModel):
+    """Evidence-linked incremental memory emitted by an existing QDI action call."""
+
+    confirmed_facts: list[str] = Field(default_factory=list)
+    temporary_conclusions: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    open_gaps: list[str] = Field(default_factory=list)
+    invalidated_hypotheses: list[str] = Field(default_factory=list)
+    recommended_next_focus: str = ""
+
+
+class QDIActionDigest(BaseModel):
+    """LLM-authored digest of a previously executed evidence-gathering action."""
+
+    sequence: int = 0
+    action: str = ""
+    what_was_done: str = ""
+    key_outputs: list[str] = Field(default_factory=list)
+    temporary_conclusion: str = ""
+    remaining_gap: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
 class QuestionInvestigationAction(BaseModel):
     """Tool-call style action for the single-question QDI loop."""
 
-    action: str = "give_up"  # answer/request_script/request_context/add_followup_questions/give_up/refine_current_question/mark_duplicate
+    action: str = "give_up"  # answer/request_script/request_context/search_document/read_document_chunks/read_qdi_artifact_excerpt/...
     question_id: str = ""
     answer: str = ""
     confidence: str = "medium"
@@ -398,6 +452,11 @@ class QuestionInvestigationAction(BaseModel):
     refined_question: str = ""
     request_script: ReadonlyPythonRequest = Field(default_factory=ReadonlyPythonRequest)
     request_context: ContextRetrievalRequest = Field(default_factory=ContextRetrievalRequest)
+    search_document: DocumentSearchRequest = Field(default_factory=DocumentSearchRequest)
+    read_document_chunks: DocumentChunkReadRequest = Field(default_factory=DocumentChunkReadRequest)
+    read_qdi_artifact_excerpt: QDIArtifactExcerptRequest = Field(default_factory=QDIArtifactExcerptRequest)
+    working_memory_update: QDIWorkingMemoryUpdate = Field(default_factory=QDIWorkingMemoryUpdate)
+    action_digest_updates: list[QDIActionDigest] = Field(default_factory=list)
     followup_questions: list[QuestionInvestigationFollowupQuestion] = Field(default_factory=list)
     notes: str = ""
 
@@ -418,6 +477,8 @@ class QuestionInvestigationReport(BaseModel):
     context_routing_notes: list[str] = Field(default_factory=list)
     question_records: list[dict[str, Any]] = Field(default_factory=list)
     action_history: list[dict[str, Any]] = Field(default_factory=list)
+    action_digest_cards: list[dict[str, Any]] = Field(default_factory=list)
+    working_memory_cards: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LLMTrace(BaseModel):
@@ -532,6 +593,24 @@ class CognitionSummary(BaseModel):
     key_facts: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     related_hints: list[str] = Field(default_factory=list)
+
+
+class DocumentCognitionMemory(BaseModel):
+    """Bounded rolling memory while first-stage cognition reads a long document."""
+
+    processed_chunks: int = 0
+    total_chunks: int = 0
+    covered_chars: int = 0
+    concise_purpose: str = ""
+    task_goals: list[str] = Field(default_factory=list)
+    business_context: list[str] = Field(default_factory=list)
+    data_objects_and_fields: list[str] = Field(default_factory=list)
+    constraints_and_rules: list[str] = Field(default_factory=list)
+    formulas_thresholds_units: list[str] = Field(default_factory=list)
+    evaluation_and_submission: list[str] = Field(default_factory=list)
+    methods_and_workflows: list[str] = Field(default_factory=list)
+    risks_conflicts_unknowns: list[str] = Field(default_factory=list)
+    source_anchors: list[str] = Field(default_factory=list)
 
 
 class FileGroupingRegexCandidate(BaseModel):

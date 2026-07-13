@@ -1085,7 +1085,12 @@ class TaskDefinitionModule:
         return [{k: v for k, v in item.items() if v not in (None, "", [], {})} for item in out]
 
     def _context_artifact_store(self) -> ArtifactStore:
-        return ArtifactStore(self.report_dir / "context_artifacts")
+        return ArtifactStore(
+            self.report_dir / "context_artifacts",
+            default_visible_limit=int(
+                getattr(self.config.context, "artifact_visible_excerpt_chars", 1200)
+            ),
+        )
 
     def _ranked_file_summaries_for_sections(self, file_summaries: list, *, limit: int | None = None) -> list:
         max_files = limit or max(1, int(getattr(self.config.prompt, "description_protocol_file_limit", 16)))

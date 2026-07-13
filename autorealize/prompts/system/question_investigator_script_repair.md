@@ -13,14 +13,16 @@
 - 失败脚本。
 - 失败结果、错误栈、stdout/stderr 片段。
 - 相关 table manifest、retrieved context、文件/sheet/字段/读取提示。
-- 历史脚本完整输出默认不可见；不要假设旧结果仍在 prompt 中。
+- 当前问题的紧凑动作轨迹会保留历史动作和结果状态；完整大输出在 artifact 中。修复只依赖当前失败脚本、精确错误和相关 cards，不需要复写历史成功脚本。
 
 脚本安全规则：
 - 只允许读取 `input_dir` 或 `scratch_dir`。
 - 只允许写 `scratch_dir`。
 - 禁止网络、删除、移动、修改输入文件、读取输入目录外文件。
-- 允许 pandas、numpy、json、math、statistics、re、csv、collections、itertools、pathlib、datetime、typing。
+- 允许本地只读分析库：pandas、numpy、scipy、sklearn、statsmodels、polars、pyarrow、fastparquet、networkx、rapidfuzz、xarray、h5py、tables、zarr、openpyxl、xlrd、pyxlsb、odf，以及 json、math、statistics、re、csv、collections、itertools、pathlib、datetime、typing。
+- 即使库自身提供联网、数据库连接、扩展下载或任意文件写入接口，也不得使用；所有读取仍必须限定在 `input_dir` / `scratch_dir`，所有写入仍必须限定在 `scratch_dir`。
 - 返回小型 JSON-compatible dict，不要打印整张大表，不要返回大列表。
+- 如果失败结果标记为 `truncated=true`，只修复可见错误，不得猜测被截断内容。
 
 保守修复策略：
 - 如果文件名不确定，先枚举 `input_dir` 下相关文件名，再匹配候选。

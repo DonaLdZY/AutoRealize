@@ -24,10 +24,9 @@ class TextParser(BaseParser):
                 continue
         if not text:
             text = "文件为空，或无法按候选编码可靠读取。"
-        summary = text[:24000]
         return ParsedFile(
             path=path,
             kind=self.kind,
-            text_summary=summary,
-            metadata={"chars": len(text), "encoding": encoding_used},
+            text_summary=text,
+            metadata={"chars": len(text), "encoding": encoding_used, "full_text_extracted": True},
         )

@@ -6,7 +6,17 @@ import os as _os
 from dataclasses import fields, is_dataclass, dataclass, field
 from pathlib import Path
 
+import yaml
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility.
+    import tomli as tomllib
+
 from .utils.safe_json import write_json_safe
+
+
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 
 
 @dataclass
@@ -125,6 +135,13 @@ class DataConfig:
     # none = 单文件阶段不调用 LLM；documents_only = 仅说明/文档类文件调用 LLM。
     # 单文件 LLM 不再调 probe 工具，只消费程序画像，避免逐文件多轮烧 token。
     llm_file_cognition_mode: str = "all"
+    # Long documents are read sequentially in bounded chunks. Earlier raw text
+    # leaves the live context after its important facts enter rolling memory.
+    document_cognition_chunk_chars: int = 12000
+    document_cognition_chunk_overlap_chars: int = 300
+    document_cognition_memory_items_per_section: int = 12
+    document_cognition_memory_max_chars: int = 18000
+    document_cognition_chunk_max_tokens: int = 4096
     # 超过该字节数的 CSV 被视为大文件，只读取前 table_profile_sample_rows 行并记录 sampling 标记。
     large_table_threshold_bytes: int = 256 * 1024 * 1024
     # 类别列展示 top-k 值。若唯一值不足 top-k，画像会尽量完整列出。
@@ -155,6 +172,12 @@ class DataConfig:
     similar_table_use_header_signature: bool = True
     # 相似表格最多读取几个代表文件。
     similar_table_sample_file_count: int = 2
+    # 表格文件名模式达到该数量后，允许按结构签名抽样。独立于通用文件模式阈值。
+    tabular_pattern_min_group: int = 3
+    # 表格模式组默认读取的代表文件数。
+    tabular_pattern_sample_file_count: int = 2
+    # 表格模式抽样前是否比较列名/工作表结构签名。
+    tabular_pattern_use_schema_signature: bool = True
     # 是否允许 LLM 根据目录文件名提出分组正则；默认开启，程序验证后才用于抽样。
     enable_llm_filename_grouping: bool = True
     # 每个目录送给 LLM 判断分组模式的最多文件名数量。
@@ -197,9 +220,15 @@ class InvestigationConfig:
     # Maximum blocking questions the investigator may pursue in one run.
     max_questions: int = 5
     # Maximum plan/observe rounds before the investigator must summarize.
-    max_rounds_per_run: int = 3
+    max_rounds_per_run: int = 6
+    # Follow-up question breadth-first search depth.
+    question_bfs_max_depth: int = 3
+    # Maximum child questions generated from one question.
+    max_followup_questions_per_question: int = 3
     # Allow the investigator to request sandboxed read-only Python scripts.
     allow_custom_readonly_python: bool = True
+    # Script actions are budgeted separately from document/context retrieval.
+    max_scripts_per_question: int = 3
     # Per custom Python subprocess timeout.
     custom_python_timeout_seconds: float = 30.0
     # LLM-proposed read-only Python script repair attempts after execution/static validation fails.
@@ -208,6 +237,23 @@ class InvestigationConfig:
     custom_python_max_stdout_chars: int = 12000
     # Maximum JSON result characters retained from any investigation script.
     max_result_chars: int = 20000
+    # Maximum deterministic full-text retrieval actions per question.
+    document_retrievals_per_question: int = 4
+    # Full-text document chunking and retrieval limits.
+    document_chunk_chars: int = 2200
+    document_chunk_overlap_chars: int = 200
+    document_search_top_k: int = 5
+    document_retrieval_max_chars: int = 12000
+    # Recent actions stay directly visible; older actions collapse to the compact ledger.
+    recent_action_count: int = 3
+    recent_script_chars: int = 12000
+    recent_result_chars: int = 8000
+    recent_retrieval_chars: int = 8000
+    # LLM-authored evidence-linked memory is merged without an extra summarization call.
+    working_memory_max_chars: int = 12000
+    # Old QDI artifacts can be read in bounded excerpts without consuming script/repair budgets.
+    artifact_retrievals_per_question: int = 2
+    artifact_retrieval_max_chars: int = 8000
     # Legacy internal helper row limit. The investigator execution surface is
     # script-only, but these helpers remain available for tests/debugging.
     tool_sample_rows: int | None = 50000
@@ -225,7 +271,10 @@ class VLLMConfig:
     # 示例: "https://open.bigmodel.cn/api/paas/v4/"
     base_url: str = "https://open.bigmodel.cn/api/paas/v4/"
     # 视觉模型 API key。可改为环境变量注入。
-    api_key: str = "0b88bd66cfaa4544ab2790b9f3366c84.SmTVkjhVl30IQzjk"
+    api_key: str | None = field(
+        default_factory=lambda: os.environ.get("AUTOREALIZE_VISION_API_KEY")
+        or os.environ.get("VLLM_API_KEY")
+    )
     # 视觉模型名称。
     model_name: str = "glm-4.6v-flashx"
     # 每个图片目录最多抽样几张图片发给视觉模型。
@@ -273,6 +322,75 @@ class PromptConfig:
 
 
 @dataclass
+class ContextConfig:
+    """Headroom-style context compiler limits."""
+
+    # Maximum files materialized into detailed local table cards.
+    table_card_file_limit: int = 120
+    # Maximum Excel sheets materialized into detailed local table cards.
+    table_card_sheet_limit: int = 80
+    # Maximum fields retained per detailed table card.
+    table_card_field_limit: int = 80
+    # Fields retained in each route-only table card placed in stable prompts.
+    stable_table_card_field_limit: int = 3
+    # Maximum route-only table cards placed in stable prompts.
+    stable_table_card_limit: int = 48
+    # Maximum cards from the same source file in stable prompts.
+    stable_table_cards_per_source: int = 6
+    # Maximum relation cards in stable prompts.
+    relation_card_limit: int = 100
+    # Maximum filename group cards in stable prompts.
+    filename_group_card_limit: int = 80
+    # Default visible excerpt length stored in ArtifactRef.
+    artifact_visible_excerpt_chars: int = 1200
+
+
+@dataclass
+class LoggingConfig:
+    """Human-readable and structured logging controls."""
+
+    # Root log level: DEBUG | INFO | WARNING | ERROR.
+    level: str = "INFO"
+    # Print raw component/event/field records instead of compact human lines.
+    raw_event_log: bool = False
+    # Level assigned to noisy SDK/client loggers.
+    noisy_logger_level: str = "WARNING"
+    # Logger names whose verbosity should be reduced.
+    noisy_loggers: tuple[str, ...] = (
+        "autorealize.llm.client",
+        "autorealize.cognition",
+        "httpx",
+        "openai",
+    )
+
+
+@dataclass
+class ServiceConfig:
+    """AutoRealize service API and frontend snapshot limits."""
+
+    # Characters retained in GET /jobs status stdout/stderr tails.
+    job_status_tail_chars: int = 60000
+    # Characters persisted from service-captured stdout/stderr.
+    captured_log_tail_chars: int = 200000
+    # Maximum characters in the extracted last-error message.
+    last_error_chars: int = 1200
+    # Event rows returned by one snapshot.
+    snapshot_event_limit: int = 400
+    # Maximum nodes rendered in the output directory tree.
+    snapshot_tree_max_nodes: int = 6000
+    # Maximum per-file cognition records returned by one snapshot.
+    snapshot_file_cognition_limit: int = 400
+    # Markdown characters retained per file-cognition record.
+    snapshot_file_markdown_chars: int = 50000
+    # Graceful wait before force-killing a stopped process.
+    stop_wait_seconds: float = 15.0
+    # Service-captured stdout filename under realize_report.
+    stdout_filename: str = "_service_stdout.log"
+    # Service-captured stderr filename under realize_report.
+    stderr_filename: str = "_service_stderr.log"
+
+
+@dataclass
 class TelemetryConfig:
     """运行遥测与前端可视化接口配置。"""
 
@@ -284,10 +402,14 @@ class TelemetryConfig:
     current_state_filename: str = "current_state.json"
     # current_state.json 中保留最近事件数量。
     recent_events_limit: int = 200
-    # 是否在每次 run 中写出 final_config.json。
+    # 是否在每次 run 中写出最终生效配置快照。
     write_config_snapshot: bool = True
+    # 最终生效配置快照文件名。统一使用 YAML，便于人工检查。
+    config_snapshot_filename: str = "final_config.yaml"
     # 是否写出 config_schema.json，便于前端自动生成配置面板。
     write_config_schema: bool = True
+    # 机器可读配置 schema 文件名。
+    config_schema_filename: str = "config_schema.json"
 
 
 @dataclass
@@ -338,6 +460,9 @@ class AutoRealizeConfig:
     investigation: InvestigationConfig = field(default_factory=InvestigationConfig)
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    service: ServiceConfig = field(default_factory=ServiceConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
@@ -349,6 +474,11 @@ class AutoRealizeConfig:
         """从环境变量读取基础配置。"""
         cfg = cls()
         cfg.llm.api_key = os.environ.get("DEEPSEEK_API_KEY", cfg.llm.api_key)
+        cfg.vllm.api_key = (
+            os.environ.get("AUTOREALIZE_VISION_API_KEY")
+            or os.environ.get("VLLM_API_KEY")
+            or cfg.vllm.api_key
+        )
         return cfg
 
 
@@ -377,6 +507,11 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "generate_sample_submission": "是否在任务定义阶段生成 sample_submission.csv；关闭后仅生成 description.md 和任务定义报告。",
     "prefer_original_description": "若输入数据目录已有 description.md，则将其作为最高优先级任务说明并写入最终 description.md，避免自动生成内容改写提交格式。",
     "direct_automl_from_description": "若输入数据目录已有人工确认的 description.md，允许 AutoDecision 跳过 AutoRealize，直接准备 AutoML 输入目录。",
+    "auto_enable_weighted_routing": "自动模式下是否按阶段权重和最低激活分数决定路由。",
+    "weight_data_cognition": "数据认知阶段的自动路由权重。",
+    "weight_task_definition": "任务定义阶段的自动路由权重。",
+    "base_min_activation_score": "自动路由阶段的最低激活分数。",
+    "always_run_task_definition": "是否无条件执行任务定义，确保下游获得 description.md。",
     "probe_retry_max": "探查脚本失败后，LLM 基于报错重规划并重试的最大次数。",
     "description_protocol_max_tokens": "description 协议结构化输出最大 token；None/0 表示不传该参数，由 API/provider 默认决定。",
     "description_protocol_original_chars": "description 协议生成时注入原始需求的最大字符数。",
@@ -384,6 +519,12 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "description_protocol_file_limit": "description 协议生成时传给 LLM 的关键文件数量上限。",
     "description_protocol_fields_per_file": "description 协议生成时每个文件展示的关键字段数量上限。",
     "output_language": "最终 description 与 LLM 自然语言输出的语言约束：zh/en/auto。",
+    "prompt_token_budget": "单次 prompt 的粗略 token 预算。",
+    "prompt_budget_warn_ratio": "prompt 达到预算多少比例时发出告警。",
+    "wide_table_column_threshold": "字段数达到该阈值时按宽表处理并裁剪 prompt 字段。",
+    "traceback_tail_chars": "修复调用中保留异常 traceback 尾部的最大字符数。",
+    "description_quality_max_retries": "description 质量门失败后的最大修复次数。",
+    "enforce_description_real_file_refs": "是否强制 description 只能引用真实存在的文件。",
     "enable_fewshot": "是否向关键 prompt 注入 few-shot 示例。",
     "auto_mode": "是否使用自动模式；后续前端可切为人机确认模式。",
     "preview_rows": "表格预览最大行数。",
@@ -404,6 +545,9 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "similar_table_min_files_to_sample": "同目录、同命名模式、同表头结构的表格文件达到该数量时启用抽样读取。",
     "similar_table_use_header_signature": "相似表格抽样时是否读取轻量表头签名，防止误合并不同结构表。",
     "similar_table_sample_file_count": "相似表格最多读取几个代表文件。",
+    "tabular_pattern_min_group": "表格文件名模式达到该数量后允许按结构签名抽样。",
+    "tabular_pattern_sample_file_count": "每个表格文件名模式默认读取的代表文件数。",
+    "tabular_pattern_use_schema_signature": "表格模式抽样前是否验证列名或工作表结构签名。",
     "enable_llm_filename_grouping": "是否允许 LLM 根据目录文件名提出分组正则；程序验证后才用于抽样。",
     "llm_filename_grouping_max_names": "每个目录送给 LLM 判断分组模式的最多文件名数量。",
     "llm_filename_grouping_max_patterns": "每个目录最多接受多少条 LLM 正则候选。",
@@ -419,21 +563,68 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "max_questions": "Question-Driven Investigator 每轮最多追问的关键跨文件问题数量。",
     "trigger_mode": "Question-Driven Investigator 触发策略：always/on_demand/disabled；默认 always。",
     "max_rounds_per_run": "Question-Driven Investigator 最多执行多少轮计划-观察循环。",
+    "question_bfs_max_depth": "Question-Driven Investigator 子问题广度优先搜索的最大深度。",
+    "max_followup_questions_per_question": "每个调查问题最多生成的直接子问题数量。",
     "allow_custom_readonly_python": "是否允许 Question-Driven Investigator 请求沙盒只读 Python 脚本探查。",
     "custom_python_timeout_seconds": "自定义只读 Python 子进程超时时间（秒）。",
+    "max_scripts_per_question": "每个 QDI 问题最多执行的只读 Python 调查脚本数；不含文档检索动作。",
     "custom_python_max_retries": "Question-Driven Investigator 只读 Python 脚本失败后的最大修复重试次数。",
     "custom_python_max_stdout_chars": "自定义只读 Python stdout/stderr 最大保留字符数。",
+    "document_retrievals_per_question": "每个 QDI 问题允许的本地全文文档检索/取回动作数。",
+    "document_chunk_chars": "PDF、DOCX、文本等全文文档的本地切片目标字符数。",
+    "document_chunk_overlap_chars": "相邻文档切片之间的重叠字符数。",
+    "document_search_top_k": "QDI 单次全文文档检索最多返回的匹配切片数。",
+    "document_retrieval_max_chars": "QDI 单次读取文档切片时进入 prompt 的最大原文字符数。",
+    "recent_action_count": "QDI 每轮默认直接展示的最近动作数量；更旧动作只保留在紧凑 ledger 中。",
+    "recent_script_chars": "QDI 最近动作窗口中单个脚本源码直接可见的最大字符数，超出部分保存为 artifact。",
+    "recent_result_chars": "QDI 最近动作窗口中单个脚本结果直接可见的最大字符数，超出部分保存为 artifact。",
+    "recent_retrieval_chars": "QDI 最近动作窗口中单次上下文、文档或 artifact 取回结果的最大可见字符数。",
+    "working_memory_max_chars": "QDI 单问题累计工作记忆卡的字符预算；更新随现有 action 返回，不新增总结调用。",
+    "artifact_retrievals_per_question": "每个 QDI 问题最多分段读取旧 QDI artifact 的动作次数；不占脚本或 repair 次数。",
+    "artifact_retrieval_max_chars": "QDI 单次分段读取旧 artifact 时返回的最大字符数。",
+    "document_cognition_chunk_chars": "第一阶段长文档逐块认知时每块目标字符数。",
+    "document_cognition_chunk_overlap_chars": "第一阶段长文档相邻认知块的重叠字符数。",
+    "document_cognition_memory_items_per_section": "滚动文档重点记忆每类最多保留的事实条数。",
+    "document_cognition_memory_max_chars": "第一阶段长文档滚动重点记忆进入下一块时的总字符预算。",
+    "document_cognition_chunk_max_tokens": "每次文档切片重点提取调用的最大输出 token。",
     "max_result_chars": "调查脚本结果注入 LLM/报告前的最大字符数。",
     "evaluation_contract_max_rounds": "评估合同 LLM 审查/返修最大轮数。",
     "evaluation_reflection_max_rounds": "评估章节反思最大轮数。",
     "tool_sample_rows": "旧版内部调查辅助函数读取表格时最多采样行数；当前 LLM 调查入口只接受只读 Python 脚本。",
     "max_sample_rows": "调查工具返回样例行/键的最大数量。",
+    "max_images_per_dir": "每个图片目录最多发送给视觉模型的图片数量。",
+    "fail_silently": "视觉模型失败时是否降级为仅使用图片元数据而不中断任务。",
+    "table_card_file_limit": "本地详细 TableCard 最多覆盖的源文件数量。",
+    "table_card_sheet_limit": "本地详细 TableCard 最多覆盖的 Excel sheet 数量。",
+    "table_card_field_limit": "每张详细 TableCard 最多保留的字段数量。",
+    "stable_table_card_field_limit": "稳定 prompt 中每张路由 TableCard 最多保留的字段数量。",
+    "stable_table_card_limit": "稳定 prompt 中最多放入的 TableCard 数量。",
+    "stable_table_cards_per_source": "稳定 prompt 中同一源文件最多放入的 TableCard 数量。",
+    "relation_card_limit": "稳定 prompt 中最多放入的 RelationCard 数量。",
+    "filename_group_card_limit": "稳定 prompt 中最多放入的 FilenameGroupCard 数量。",
+    "artifact_visible_excerpt_chars": "ArtifactRef 默认直接展示的摘要字符数。",
+    "level": "AutoRealize 根日志级别：DEBUG/INFO/WARNING/ERROR。",
+    "raw_event_log": "是否打印未经压缩的结构化事件字段。",
+    "noisy_logger_level": "第三方高噪声 logger 使用的日志级别。",
+    "noisy_loggers": "需要降低输出级别的第三方或内部 logger 名称列表。",
+    "job_status_tail_chars": "任务状态接口返回 stdout/stderr 尾部的最大字符数。",
+    "captured_log_tail_chars": "服务进程落盘保存 stdout/stderr 尾部的最大字符数。",
+    "last_error_chars": "服务提取最后错误摘要的最大字符数。",
+    "snapshot_event_limit": "单次前端快照返回的事件数量。",
+    "snapshot_tree_max_nodes": "前端快照目录树最多展开的节点数。",
+    "snapshot_file_cognition_limit": "单次前端快照最多返回的文件认知记录数。",
+    "snapshot_file_markdown_chars": "每条文件认知在快照中保留的 Markdown 字符数。",
+    "stop_wait_seconds": "停止任务后等待进程正常退出的秒数，超时后强制终止。",
+    "stdout_filename": "服务捕获 stdout 的日志文件名。",
+    "stderr_filename": "服务捕获 stderr 的日志文件名。",
     "enabled": "是否启用该配置组功能。",
     "event_stream_filename": "结构化事件流 JSONL 文件名。",
     "current_state_filename": "当前状态快照 JSON 文件名。",
     "recent_events_limit": "状态快照保留最近事件数量。",
-    "write_config_snapshot": "是否输出 final_config.json。",
+    "write_config_snapshot": "是否输出最终生效配置 YAML 快照。",
+    "config_snapshot_filename": "最终生效配置 YAML 快照文件名。",
     "write_config_schema": "是否输出 config_schema.json。",
+    "config_schema_filename": "机器可读配置 schema 的 JSON 文件名。",
     "store_filename": "本地知识库 JSONL 文件名。",
     "retrieval_top_k": "任务定义阶段检索注入的知识条数。",
     "max_entry_chars": "单条知识最大字符数。",
@@ -446,6 +637,16 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "enable_parallel_probe_actions": "是否并行执行探查动作。",
     "probe_max_workers": "探查动作 worker 数。",
     "run_root": "默认运行根目录。",
+}
+
+_CONFIG_PATH_DESCRIPTIONS: dict[str, str] = {
+    "investigation.enabled": "是否启用 Question-Driven Investigator 跨文件调查。",
+    "vllm.enabled": "是否启用视觉模型对图片样本做语义认知。",
+    "vllm.base_url": "视觉模型的 OpenAI 兼容 API 地址。",
+    "vllm.model_name": "视觉模型名称。",
+    "vllm.api_key": "视觉模型 API key；默认读取 AUTOREALIZE_VISION_API_KEY 或 VLLM_API_KEY。",
+    "knowledge.enabled": "是否启用本地知识存储与检索。",
+    "telemetry.enabled": "是否启用结构化事件流与当前状态快照。",
 }
 
 
@@ -461,6 +662,20 @@ def _jsonable(value):
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     return value
+
+
+def _redact_config_secrets(value):
+    if not isinstance(value, dict):
+        return value
+    redacted = {}
+    for key, item in value.items():
+        if key == "api_key":
+            redacted[key] = None
+        elif isinstance(item, dict):
+            redacted[key] = _redact_config_secrets(item)
+        else:
+            redacted[key] = item
+    return redacted
 
 
 def _coerce_value(current, value):
@@ -482,25 +697,30 @@ def _deep_update_dataclass(obj, updates: dict) -> None:
             setattr(obj, key, _coerce_value(current, value))
 
 
-def _schema_for_dataclass(obj) -> dict:
+def _schema_for_dataclass(obj, prefix: str = "") -> dict:
     descriptions = _CONFIG_DESCRIPTIONS
     props = {}
     for f in fields(obj):
         value = getattr(obj, f.name)
+        field_path = f"{prefix}.{f.name}" if prefix else f.name
         if is_dataclass(value):
-            props[f.name] = _schema_for_dataclass(value)
+            props[f.name] = _schema_for_dataclass(value, field_path)
         else:
             props[f.name] = {
                 "type": type(value).__name__,
-                "default": _jsonable(value),
-                "description": descriptions.get(f.name, ""),
+                "default": None if f.name == "api_key" else _jsonable(value),
+                "description": _CONFIG_PATH_DESCRIPTIONS.get(
+                    field_path,
+                    descriptions.get(f.name, ""),
+                ),
             }
     return {"type": "object", "properties": props}
 
 
 # Attach helper methods after class creation; keeps dataclass definitions concise.
-def _config_to_dict(self) -> dict:
-    return _jsonable(self)
+def _config_to_dict(self, *, include_secrets: bool = False) -> dict:
+    data = _jsonable(self)
+    return data if include_secrets else _redact_config_secrets(data)
 
 
 def _config_apply_dict(self, updates: dict) -> "AutoRealizeConfig":
@@ -510,15 +730,54 @@ def _config_apply_dict(self, updates: dict) -> "AutoRealizeConfig":
 
 def _config_from_file(cls, path: Path | str) -> "AutoRealizeConfig":
     cfg = cls.from_env()
-    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    config_path = Path(path)
+    text = config_path.read_text(encoding="utf-8-sig")
+    suffix = config_path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        data = yaml.safe_load(text)
+    elif suffix == ".json":
+        data = json.loads(text)
+    elif suffix in {".toml", ".tml"}:
+        data = tomllib.loads(text)
+    else:
+        raise ValueError("配置文件必须使用 YAML、JSON 或 TOML 格式。")
     if not isinstance(data, dict):
-        raise ValueError("配置文件必须是 JSON object。")
+        raise ValueError("配置文件顶层必须是 object/mapping。")
     cfg.apply_dict(data)
+    if not cfg.llm.api_key:
+        cfg.llm.api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not cfg.vllm.api_key:
+        cfg.vllm.api_key = os.environ.get("AUTOREALIZE_VISION_API_KEY") or os.environ.get("VLLM_API_KEY")
     return cfg
 
 
-def _config_write_json(self, path: Path | str) -> None:
-    write_json_safe(Path(path), self.to_dict(), indent=2)
+def _config_write_json(
+    self,
+    path: Path | str,
+    *,
+    include_secrets: bool = False,
+) -> None:
+    write_json_safe(
+        Path(path),
+        self.to_dict(include_secrets=include_secrets),
+        indent=2,
+    )
+
+
+def _config_write_yaml(
+    self,
+    path: Path | str,
+    *,
+    include_secrets: bool = False,
+) -> None:
+    Path(path).write_text(
+        yaml.safe_dump(
+            self.to_dict(include_secrets=include_secrets),
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _config_schema(self) -> dict:
@@ -529,6 +788,7 @@ AutoRealizeConfig.to_dict = _config_to_dict
 AutoRealizeConfig.apply_dict = _config_apply_dict
 AutoRealizeConfig.from_file = classmethod(_config_from_file)
 AutoRealizeConfig.write_json = _config_write_json
+AutoRealizeConfig.write_yaml = _config_write_yaml
 AutoRealizeConfig.schema_dict = _config_schema
 
 

@@ -20,6 +20,7 @@
 - `relations` 是字段级关系卡，重点关注 `left_file`、`left_field`、`right_file`、`right_field`、`relation_type`、`confidence`、`short_evidence`。
 - `filename_sample_groups` 表示重复文件组，只当组级信息看，不要要求逐个重复文件都进入问题；其中 `shared_fields` 是共通字段，`variant_fields_by_file` / `field_presence` 是非共通字段证据，不要把 union 字段当成每个文件都存在。
 - `question_records` 用于避免重复提问和复用已有结论。
+- `document_manifest` 表示已经全文抽取并切片存入本地的 PDF、DOCX、TXT、Markdown 等文档。Planner 不需要展开原文；Answerer 会通过 `search_document` 和 `read_document_chunks` 按需取回。
 
 只提出真正阻塞后续任务定义、评估、输出、约束、读取或关联边界的问题。优先关注：
 - 非默认 CSV、多 sheet Excel、表格型 JSON、特殊 header 等读取方式是否会影响数据使用。

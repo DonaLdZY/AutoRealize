@@ -1,44 +1,49 @@
 from __future__ import annotations
 
 import argparse
-import json
-import logging
 import sys
 from pathlib import Path
 
-from .config import AutoRealizeConfig
+import yaml
+
+from .config import AutoRealizeConfig, DEFAULT_CONFIG_PATH
 from .logging_utils import setup_logging
 from .pipeline import AutoRealizePipeline
-from .utils.safe_json import dumps_json_safe
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="AutoRealize CLI")
-    p.add_argument("--input-root", help="原始数据目录")
-    p.add_argument("--output-root", help="输出 runs 根目录")
-    p.add_argument("--task", default="", help="可选自然语言业务需求；若为空则尽量从数据文档中识别")
-    p.add_argument("--run-name", help="本次运行名称，不建议使用时间戳，建议使用编号+测试内容")
-    p.add_argument("--config", help="JSON 配置文件路径，可覆盖默认配置")
-    p.add_argument("--print-default-config", action="store_true", help="打印默认 JSON 配置")
-    p.add_argument("--write-default-config", help="把默认 JSON 配置写入指定路径")
-    p.add_argument("--no-cognition", action="store_true", help="跳过数据认知阶段")
-    p.add_argument("--no-task-definition", action="store_true", help="跳过任务定义阶段")
-    p.add_argument("--no-knowledge", action="store_true", help="关闭本地知识库写入与检索")
-    p.add_argument("--no-telemetry", action="store_true", help="关闭 event_stream/current_state 遥测输出")
-    p.add_argument("--no-llm-cache", action="store_true", help="关闭 LLM 响应缓存")
-    p.add_argument("--llm-timeout", type=float, help="单次 LLM 请求超时时间（秒）")
-    p.add_argument("--llm-concurrency", type=int, help="LLM API 最大并发请求数")
-    p.add_argument("--cognition-workers", type=int, help="数据认知并行 worker 数")
-    p.add_argument(
+    parser = argparse.ArgumentParser(description="AutoRealize CLI")
+    parser.add_argument("--input-root", help="原始数据目录 / Source data directory")
+    parser.add_argument("--output-root", help="运行输出根目录 / Run output root")
+    parser.add_argument("--task", default="", help="可选业务需求 / Optional human task requirement")
+    parser.add_argument("--run-name", help="本次运行名称 / Run name")
+    parser.add_argument(
+        "--config",
+        help="YAML 配置文件路径；兼容 JSON/TOML / YAML config path; JSON/TOML remain supported",
+    )
+    parser.add_argument("--print-default-config", action="store_true", help="打印默认 YAML / Print default YAML")
+    parser.add_argument("--write-default-config", help="写出默认 YAML / Write default YAML to path")
+
+    # Compatibility overrides. The YAML file remains the primary source of truth.
+    parser.add_argument("--no-cognition", action="store_true", help="跳过数据认知 / Skip data cognition")
+    parser.add_argument("--no-task-definition", action="store_true", help="跳过任务定义 / Skip task definition")
+    parser.add_argument("--no-knowledge", action="store_true", help="关闭知识库 / Disable knowledge store")
+    parser.add_argument("--no-telemetry", action="store_true", help="关闭结构化遥测 / Disable telemetry")
+    parser.add_argument("--no-llm-cache", action="store_true", help="关闭 LLM 缓存 / Disable LLM cache")
+    parser.add_argument("--llm-timeout", type=float, help="LLM 请求超时秒数 / LLM timeout seconds")
+    parser.add_argument("--llm-concurrency", type=int, help="LLM 最大并发 / Max concurrent LLM calls")
+    parser.add_argument("--cognition-workers", type=int, help="认知 worker 数 / Cognition worker count")
+    parser.add_argument(
         "--auto-generate-predict-split",
         action="store_true",
-        help="当没有独立预测集时自动生成 predict_split 演练集，默认关闭",
+        help="自动生成预测演练切分 / Generate a synthetic prediction split",
     )
-    return p
+    return parser
 
 
 def _load_config(args: argparse.Namespace) -> AutoRealizeConfig:
-    cfg = AutoRealizeConfig.from_file(args.config) if args.config else AutoRealizeConfig.from_env()
+    config_path = Path(args.config).expanduser() if args.config else DEFAULT_CONFIG_PATH
+    cfg = AutoRealizeConfig.from_file(config_path) if config_path.exists() else AutoRealizeConfig.from_env()
     if args.no_cognition:
         cfg.switches.run_data_cognition = False
     if args.no_task_definition:
@@ -61,28 +66,43 @@ def _load_config(args: argparse.Namespace) -> AutoRealizeConfig:
 
 
 def main() -> None:
-    # Windows 控制台常见默认编码不是 UTF-8；强制重配可避免中文日志和 CLI 帮助乱码。
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     args = parser.parse_args()
-    setup_logging(logging.INFO)
 
     if args.print_default_config:
-        print(dumps_json_safe(AutoRealizeConfig.from_env().to_dict(), indent=2))
+        default_cfg = (
+            AutoRealizeConfig.from_file(DEFAULT_CONFIG_PATH)
+            if DEFAULT_CONFIG_PATH.exists()
+            else AutoRealizeConfig.from_env()
+        )
+        print(yaml.safe_dump(default_cfg.to_dict(), allow_unicode=True, sort_keys=False))
         return
     if args.write_default_config:
-        AutoRealizeConfig.from_env().write_json(args.write_default_config)
-        print(f"[AutoRealize] 默认配置已写入: {args.write_default_config}")
+        default_cfg = (
+            AutoRealizeConfig.from_file(DEFAULT_CONFIG_PATH)
+            if DEFAULT_CONFIG_PATH.exists()
+            else AutoRealizeConfig.from_env()
+        )
+        default_cfg.write_yaml(args.write_default_config)
+        print(f"[AutoRealize] Default YAML config written to: {args.write_default_config}")
         return
 
-    missing = [name for name in ["input_root", "output_root", "run_name"] if not getattr(args, name)]
+    missing = [name for name in ("input_root", "output_root", "run_name") if not getattr(args, name)]
     if missing:
-        parser.error("缺少必要参数: " + ", ".join(["--" + x.replace("_", "-") for x in missing]))
+        parser.error("Missing required arguments: " + ", ".join("--" + x.replace("_", "-") for x in missing))
 
     cfg = _load_config(args)
+    setup_logging(
+        cfg.logging.level,
+        raw_event_log=cfg.logging.raw_event_log,
+        noisy_logger_level=cfg.logging.noisy_logger_level,
+        noisy_loggers=cfg.logging.noisy_loggers,
+    )
     pipeline = AutoRealizePipeline(cfg)
     run_dir = pipeline.run(
         input_root=Path(args.input_root),
@@ -90,7 +110,7 @@ def main() -> None:
         task_hint=args.task,
         run_name=args.run_name,
     )
-    print(f"[AutoRealize] 运行完成，输出目录: {run_dir}")
+    print(f"[AutoRealize] Run completed: {run_dir}")
 
 
 if __name__ == "__main__":

@@ -9,13 +9,13 @@ import re
 import subprocess
 import sys
 import tempfile
-import textwrap
 from typing import Any
 
 import pandas as pd
 
 from .config import AutoRealizeConfig
 from .context_compiler import ArtifactStore, build_qdi_context_and_details, compact_detail_table_card_for_prompt
+from .document_retrieval import LocalDocumentIndex
 from .logging_utils import log_event
 from .models import (
     InvestigationStepResult,
@@ -28,7 +28,7 @@ from .models import (
     QuestionInvestigationReport,
     ReadonlyPythonRequest,
 )
-from .prompt_cache import stable_dynamic_prompt
+from .prompt_cache import json_block, join_blocks, stable_dynamic_prompt
 from .profiling.csv_utils import infer_csv_dialect, read_csv_auto
 from .profiling.stats import read_table
 from .utils.filesystem import rel
@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 
 BUILTIN_TOOL_NAMES = {"custom_readonly_python"}
+QDI_EVIDENCE_ACTIONS = {
+    "request_context",
+    "search_document",
+    "read_document_chunks",
+    "read_qdi_artifact_excerpt",
+    "request_script",
+}
 
 
 def run_question_investigator(
@@ -111,7 +118,16 @@ def _run_question_investigator_inner(
     log_event(logger, "module.data_cognition.investigator", "ACTIVATED")
     planner_prompt = prompt_mgr.load("system/question_investigator_planner.md")
     answerer_prompt = prompt_mgr.load("system/question_investigator_answerer.md")
-    artifact_store = ArtifactStore((report_dir or data_root) / "context_artifacts")
+    artifact_store = ArtifactStore(
+        (report_dir or data_root) / "context_artifacts",
+        default_visible_limit=int(getattr(cfg.context, "artifact_visible_excerpt_chars", 1200)),
+    )
+    document_index = LocalDocumentIndex.build(
+        data_root=data_root,
+        store_root=(report_dir or data_root) / "document_store",
+        chunk_chars=int(getattr(cfg.investigation, "document_chunk_chars", 2200)),
+        chunk_overlap_chars=int(getattr(cfg.investigation, "document_chunk_overlap_chars", 200)),
+    )
     context, table_card_details = _build_investigation_context(
         cfg=cfg,
         data_root=data_root,
@@ -123,11 +139,15 @@ def _run_question_investigator_inner(
         knowledge_base=knowledge_base,
         artifact_store=artifact_store,
     )
+    context["document_manifest"] = document_index.manifest_for_prompt()
+    context["context_policy"]["full_document_text_local"] = True
+    context["context_policy"]["document_retrieval_actions"] = ["search_document", "read_document_chunks"]
     tools = CrossFileInvestigationTools(
         cfg=cfg,
         data_root=data_root,
         authoritative_memory=authoritative_memory,
         knowledge_base=knowledge_base,
+        artifact_store=artifact_store,
     )
 
     all_questions: dict[str, InvestigationQuestion] = {}
@@ -139,12 +159,19 @@ def _run_question_investigator_inner(
     unresolved_questions: list[str] = []
     routing_notes: list[str] = []
     action_history: list[dict[str, Any]] = []
+    action_digest_cards: list[dict[str, Any]] = []
+    action_timeline: list[dict[str, Any]] = []
+    working_memory_cards: dict[str, dict[str, Any]] = {}
+    qdi_artifact_ids: set[str] = set()
 
     max_total_questions = max(1, int(getattr(cfg.investigation, "max_questions", 5)))
     max_actions_per_question = max(1, int(getattr(cfg.investigation, "max_rounds_per_run", 3)))
-    max_depth = 3
-    max_followups_per_question = 3
-    max_scripts_per_question = max_actions_per_question
+    max_depth = max(0, int(getattr(cfg.investigation, "question_bfs_max_depth", 3)))
+    max_followups_per_question = max(
+        0,
+        int(getattr(cfg.investigation, "max_followup_questions_per_question", 3)),
+    )
+    max_scripts_per_question = max(0, int(getattr(cfg.investigation, "max_scripts_per_question", 3)))
     max_scripts_total = max_total_questions * max_scripts_per_question
     max_output_chars = int(getattr(cfg.investigation, "max_result_chars", 20000))
 
@@ -233,7 +260,13 @@ def _run_question_investigator_inner(
         current_request: InvestigationToolRequest | None = None
         scripts_for_question = 0
         context_retrievals_for_question = 0
-        retrieved_context: list[dict[str, Any]] = []
+        document_retrievals_for_question = 0
+        artifact_retrievals_for_question = 0
+        question_action_ledger: list[dict[str, Any]] = []
+        question_live_actions: list[dict[str, Any]] = []
+        working_memory = _empty_working_memory_card(qid)
+        working_memory_cards[qid] = working_memory
+        answerer_stable_prefix = _qdi_answerer_stable_prefix(context, record)
 
         for action_round in range(1, max_actions_per_question + 1):
             available_actions = _available_qdi_actions(
@@ -241,6 +274,16 @@ def _run_question_investigator_inner(
                 current_record=record,
                 scripts_for_question=scripts_for_question,
                 context_retrievals_for_question=context_retrievals_for_question,
+                document_retrievals_for_question=document_retrievals_for_question,
+                has_documents=bool(document_index.documents),
+                max_document_retrievals=max(
+                    0, int(getattr(cfg.investigation, "document_retrievals_per_question", 4))
+                ),
+                has_qdi_artifacts=bool(qdi_artifact_ids),
+                artifact_retrievals_for_question=artifact_retrievals_for_question,
+                max_artifact_retrievals=max(
+                    0, int(getattr(cfg.investigation, "artifact_retrievals_per_question", 2))
+                ),
                 total_scripts=len(all_requests),
                 max_scripts_per_question=max_scripts_per_question,
                 max_scripts_total=max_scripts_total,
@@ -249,34 +292,43 @@ def _run_question_investigator_inner(
                 max_followups_per_question=max_followups_per_question,
                 allow_custom_readonly_python=bool(getattr(cfg.investigation, "allow_custom_readonly_python", True)),
             )
-            stable, dynamic = stable_dynamic_prompt(
-                stable=context,
-                dynamic={
+            if action_round >= max_actions_per_question:
+                available_actions = _terminal_qdi_actions(available_actions)
+            pending_digest_requests = _pending_action_digest_requests(
+                action_history,
+                action_digest_cards,
+                qid,
+            )
+            dynamic = join_blocks(
+                json_block("1. Append-only action and digest timeline", action_timeline),
+                json_block("2. Current evidence-linked working memory", working_memory),
+                json_block(
+                    "3. Recent live action window",
+                    _recent_action_window(
+                        question_live_actions,
+                        count=int(getattr(cfg.investigation, "recent_action_count", 3)),
+                    ),
+                ),
+                json_block("4. Compact question ledger", _question_records_for_prompt(question_records)),
+                json_block("5. Current dynamic action state", {
                     "instruction": (
-                        "基于当前证据回答、继续探查或标记未解决。如要提出新脚本继续探查，旧结果将不可见；"
-                        f"生成新脚本时请包含旧脚本内容或重新计算所需旧结论，并且注意最大可见输出是 {max_output_chars} 字符，超出会被截断。"
-                        "只能基于 current_visible_output 和截断元信息判断脚本结果；不要根据未显示输出做推断。"
+                        "基于当前证据回答、继续探查或标记未解决。action_timeline 是动作与摘要组成的追加式轨迹，"
+                        "recent_action_window 是最近动作的精确可见区，working_memory 是证据关联的累计认知。"
+                        "任何 truncated=true 的内容都不得根据未显示部分推断；需要旧 QDI 证据时可分段读取其 artifact。"
+                        "不要为了保留历史而复写旧脚本；需要文档原文时优先 search_document/read_document_chunks。"
                     ),
                     "available_actions": available_actions,
+                    "pending_action_digest_requests": pending_digest_requests,
                     "remaining_script_requests": max(0, max_scripts_total - len(all_requests)),
                     "remaining_followup_questions": max(0, max_total_questions - len(question_records)),
                     "current_depth": int(record.get("depth", 0) or 0),
                     "max_depth": max_depth,
                     "max_output_len": max_output_chars,
-                    "question_records": _question_records_for_prompt(question_records),
                     "current_question": record,
-                    "retrieved_context": retrieved_context[-2:],
-                    "current_table_card_details": [],
                     "context_retrieval_policy": (
                         "Stable table_cards are route-only manifests. If field meanings, field statistics, "
                         "reading notes, warnings, or sheet details are needed, choose "
-                        "request_context; the retrieved excerpt will appear in retrieved_context on the next turn."
-                    ),
-                    "current_script_evidence": _current_script_evidence(
-                        current_request,
-                        current_result,
-                        max_output_chars,
-                        artifact_store=artifact_store,
+                        "request_context; the retrieved excerpt will appear in recent_action_window on the next turn."
                     ),
                     "action_round": action_round,
                     "action_policy": {
@@ -284,29 +336,82 @@ def _run_question_investigator_inner(
                         "use_mark_duplicate_when_needed": True,
                         "use_refine_current_question_only_for_narrow_rewording": True,
                         "do_not_print_full_tables_in_scripts": True,
+                        "script_results_are_artifact_backed": True,
+                        "document_retrieval_does_not_consume_script_budget": True,
+                        "artifact_retrieval_does_not_consume_script_or_repair_budget": True,
+                        "working_memory_is_interpretive_not_authoritative": True,
+                        "every_pending_action_digest_must_be_returned": True,
+                        "final_round_allows_terminal_actions_only": action_round >= max_actions_per_question,
                     },
-                },
-                stable_title="Stable QDI compact context",
-                dynamic_title="Dynamic single-question QDI action request",
+                }),
             )
             action = llm_client.ask_structured(
                 model_cls=QuestionInvestigationAction,
                 system_prompt=answerer_prompt,
                 user_prompt=dynamic,
-                prompt_name=f"question_investigator_action_{qid}_{action_round}",
-                static_context_prompt=stable,
+                prompt_name="question_investigator_action",
+                static_context_prompt=answerer_stable_prefix,
                 dynamic_user_prompt=dynamic,
             )
             action_name = str(action.action or "").strip().lower()
+            applied_digest_sequences = _apply_action_digest_updates(
+                action_history,
+                action_digest_cards,
+                action_timeline,
+                action.action_digest_updates,
+                question_id=qid,
+                pending_sequences={int(item["sequence"]) for item in pending_digest_requests},
+            )
+            _backfill_action_digests_from_working_memory(
+                action_history,
+                action_digest_cards,
+                action_timeline,
+                action.working_memory_update,
+                question_id=qid,
+                pending_sequences={int(item["sequence"]) for item in pending_digest_requests}
+                - applied_digest_sequences,
+            )
+            entry = _compact_action_history(qid, action_name, "selected", action)
+            entry["sequence"] = len(action_history) + 1
+            action_history.append(entry)
+            question_action_ledger.append(entry)
+            action_timeline.append(entry)
+            live_entry = _new_live_action_entry(
+                sequence=entry["sequence"],
+                question_id=qid,
+                action_name=action_name,
+                action=action,
+                artifact_store=artifact_store,
+                script_chars=int(getattr(cfg.investigation, "recent_script_chars", 12000)),
+            )
+            question_live_actions.append(live_entry)
+            qdi_artifact_ids.update(_artifact_ids_in(live_entry))
+            working_memory = _merge_working_memory_card(
+                working_memory,
+                action.working_memory_update,
+                sequence=entry["sequence"],
+                max_chars=int(getattr(cfg.investigation, "working_memory_max_chars", 12000)),
+            )
+            working_memory_cards[qid] = working_memory
             if action_name not in available_actions:
-                action_history.append(_compact_action_history(qid, action_name, "illegal_action", action))
+                entry["status"] = "illegal_action"
+                live_entry["observation"] = {"status": "illegal_action", "available_actions": available_actions}
                 record["status"] = "unresolved"
                 record["unresolved_reason"] = f"LLM selected unavailable action `{action_name}`."
                 unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
                 break
 
-            action_history.append(_compact_action_history(qid, action_name, "selected", action))
             if action_name == "answer":
+                entry["status"] = "answered"
+                live_entry["observation"] = _bounded_json_view(
+                    {
+                        "answer": action.answer,
+                        "evidence": action.evidence,
+                        "confidence": action.confidence,
+                        "remaining_uncertainty": action.remaining_uncertainty,
+                    },
+                    int(getattr(cfg.investigation, "recent_result_chars", 8000)),
+                )
                 answer = InvestigationAnswer(
                     question_id=qid,
                     question=str(record.get("question", "")),
@@ -338,6 +443,11 @@ def _run_question_investigator_inner(
                 break
 
             if action_name == "give_up":
+                entry["status"] = "given_up"
+                live_entry["observation"] = {
+                    "unresolved_reason": str(action.unresolved_reason or action.remaining_uncertainty or "")[:2000],
+                    "what_was_tried": [str(x)[:500] for x in (action.what_was_tried or [])[:12]],
+                }
                 reason = str(action.unresolved_reason or action.remaining_uncertainty or "Evidence is insufficient.").strip()
                 record.update({"status": "unresolved", "unresolved_reason": reason[:1200]})
                 unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {reason}")
@@ -357,6 +467,7 @@ def _run_question_investigator_inner(
                 break
 
             if action_name == "mark_duplicate":
+                entry["status"] = "marked_duplicate"
                 duplicate_of = str(action.duplicate_of_question_id or "").strip()
                 record.update({"status": "duplicate", "duplicate_of_question_id": duplicate_of})
                 break
@@ -367,6 +478,8 @@ def _run_question_investigator_inner(
                     record["question"] = refined[:1000]
                     question.question = refined[:1000]
                     record["status"] = "refined"
+                entry["status"] = "question_refined"
+                live_entry["observation"] = {"refined_question": refined[:1000]}
                 continue
 
             if action_name == "add_followup_questions":
@@ -388,9 +501,12 @@ def _run_question_investigator_inner(
                 )
                 if not added:
                     unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
+                entry["status"] = "followups_added" if added else "followup_rejected"
+                live_entry["observation"] = {"added_followup_count": added}
                 break
 
             if action_name == "request_context":
+                entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
                 req_ctx = action.request_context
                 req_ctx.question_id = req_ctx.question_id or qid
                 retrieved = _retrieve_qdi_context_excerpt(
@@ -400,17 +516,133 @@ def _run_question_investigator_inner(
                     request=req_ctx,
                     max_cards=2,
                 )
-                retrieved_context.append(
-                    {
-                        "request": req_ctx.model_dump(),
-                        "cards": retrieved,
-                        "retrieval_policy": "Local deterministic context retrieval; this does not execute data scripts.",
-                    }
-                )
+                retrieval_result = {
+                    "cards": retrieved,
+                    "retrieval_policy": "Local deterministic context retrieval; this does not execute data scripts.",
+                }
                 context_retrievals_for_question += 1
+                question_action_ledger[-1].update(
+                    status="context_retrieved",
+                    result="context_retrieved",
+                    retrieved_tables=[str(card.get("table_id") or card.get("source_file") or "") for card in retrieved],
+                )
+                live_entry["observation"] = _artifact_backed_observation(
+                    retrieval_result,
+                    artifact_store=artifact_store,
+                    artifact_type="qdi_context_retrieval_full",
+                    source=f"{qid}:action:{entry['sequence']}",
+                    max_chars=int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                )
+                qdi_artifact_ids.update(_artifact_ids_in(live_entry))
+                continue
+
+            if action_name == "search_document":
+                entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
+                request = action.search_document
+                request.question_id = request.question_id or qid
+                query = str(request.query or record.get("question", "")).strip()
+                result = document_index.search(
+                    query,
+                    document_ids=request.document_ids,
+                    source_files=request.source_files,
+                    top_k=min(
+                        max(1, int(request.top_k or 0)),
+                        max(1, int(getattr(cfg.investigation, "document_search_top_k", 5))),
+                    ),
+                )
+                document_retrievals_for_question += 1
+                question_action_ledger[-1].update(
+                    status="document_searched",
+                    query=query[:500],
+                    result="document_search",
+                    hits=[
+                        {
+                            "chunk_id": match.get("chunk_id"),
+                            "source_file": match.get("source_file"),
+                            "locator": match.get("locator"),
+                            "score": match.get("score"),
+                            "evidence_excerpt": str(match.get("excerpt") or "")[:300],
+                        }
+                        for match in result.get("matches", [])
+                    ],
+                )
+                live_entry["observation"] = _bounded_json_view(
+                    result,
+                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                )
+                continue
+
+            if action_name == "read_document_chunks":
+                entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
+                request = action.read_document_chunks
+                request.question_id = request.question_id or qid
+                result = document_index.read_chunks(
+                    request.chunk_ids,
+                    neighbor_count=min(max(0, int(request.neighbor_count)), 2),
+                    max_chunks=8,
+                    max_chars=int(getattr(cfg.investigation, "document_retrieval_max_chars", 12000)),
+                )
+                document_retrievals_for_question += 1
+                question_action_ledger[-1].update(
+                    status="document_chunks_read",
+                    result="document_chunks_read",
+                    chunks=[
+                        {
+                            "chunk_id": chunk.get("chunk_id"),
+                            "source_file": chunk.get("source_file"),
+                            "locator": chunk.get("locator"),
+                            "chars": chunk.get("chars"),
+                            "evidence_excerpt": str(chunk.get("text") or "")[:300],
+                        }
+                        for chunk in result.get("chunks", [])
+                    ],
+                    truncated=bool(result.get("truncated")),
+                )
+                live_entry["observation"] = _bounded_json_view(
+                    result,
+                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                )
+                continue
+
+            if action_name == "read_qdi_artifact_excerpt":
+                entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
+                request = action.read_qdi_artifact_excerpt
+                request.question_id = request.question_id or qid
+                artifact_id = str(request.artifact_id or "").strip()
+                if artifact_id not in qdi_artifact_ids:
+                    result = {
+                        "status": "rejected",
+                        "artifact_id": artifact_id,
+                        "error": "artifact_not_created_or_exposed_in_current_qdi_run",
+                    }
+                else:
+                    result = artifact_store.read_excerpt(
+                        artifact_id,
+                        offset=max(0, int(request.offset or 0)),
+                        max_chars=min(
+                            max(1, int(request.max_chars or 0)),
+                            max(1, int(getattr(cfg.investigation, "artifact_retrieval_max_chars", 8000))),
+                        ),
+                        json_path=str(request.json_path or ""),
+                    )
+                artifact_retrievals_for_question += 1
+                entry.update(
+                    status="artifact_excerpt_read" if result.get("status") == "completed" else "artifact_excerpt_failed",
+                    result="artifact_excerpt",
+                    artifact_id=artifact_id,
+                    offset=int(result.get("offset") or 0),
+                    next_offset=int(result.get("next_offset") or 0),
+                    has_more=bool(result.get("has_more")),
+                    error=str(result.get("error") or "")[:500],
+                )
+                live_entry["observation"] = _bounded_json_view(
+                    result,
+                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                )
                 continue
 
             if action_name == "request_script":
+                entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
                 script_req = action.request_script
                 script_req.question_id = script_req.question_id or qid
                 script_req.goal = script_req.goal or str(action.notes or record.get("question", ""))
@@ -433,6 +665,8 @@ def _run_question_investigator_inner(
                         reason="duplicate_script_request",
                         error="duplicate_script_request",
                     )
+                    entry["status"] = "duplicate_script_request"
+                    live_entry["observation"] = {"status": "failed", "error": "duplicate_script_request"}
                     continue
                 seen_request_keys.add(key)
                 all_requests.append(req)
@@ -451,6 +685,31 @@ def _run_question_investigator_inner(
                 current_request = final_req
                 all_results.extend(attempt_results)
                 current_result = attempt_results[-1]
+                visible = _visible_output_payload(current_result.result, max_output_chars)
+                stored_result_ref = (
+                    current_result.result.get("_full_result_artifact", {})
+                    if isinstance(current_result.result, dict)
+                    else {}
+                )
+                question_action_ledger[-1].update(
+                    status="script_completed" if current_result.status == "completed" else "script_failed",
+                    result="script_completed" if current_result.status == "completed" else "script_failed",
+                    request_id=current_result.request_id,
+                    error=str(current_result.error or "")[:500],
+                    output_truncated=bool(visible["output_truncated"]),
+                    original_output_chars=visible["original_output_chars"],
+                    visible_output_chars=visible["visible_output_chars"],
+                    result_artifact_id=str(stored_result_ref.get("artifact_id") or ""),
+                )
+                script_evidence = _current_script_evidence(
+                    current_request,
+                    current_result,
+                    int(getattr(cfg.investigation, "recent_result_chars", 8000)),
+                    artifact_store=artifact_store,
+                )
+                script_evidence.pop("current_script", None)
+                live_entry["observation"] = script_evidence
+                qdi_artifact_ids.update(_artifact_ids_in(live_entry))
                 log_event(
                     logger,
                     "module.data_cognition.investigator",
@@ -486,6 +745,8 @@ def _run_question_investigator_inner(
         context_routing_notes=list(dict.fromkeys(routing_notes))[:80],
         question_records=_question_records_for_prompt(question_records),
         action_history=action_history[:200],
+        action_digest_cards=action_digest_cards[:200],
+        working_memory_cards=list(working_memory_cards.values()),
     )
     log_event(
         logger,
@@ -572,7 +833,7 @@ def _execute_request_with_repair(
                 model_cls=ReadonlyPythonRequest,
                 system_prompt=prompt_mgr.load("system/question_investigator_script_repair.md"),
                 user_prompt=dynamic,
-                prompt_name=f"question_investigator_script_repair_{current.question_id}_{attempt + 1}",
+                prompt_name="question_investigator_script_repair",
                 static_context_prompt=stable,
                 dynamic_user_prompt=dynamic,
             )
@@ -749,6 +1010,12 @@ def _available_qdi_actions(
     current_record: dict[str, Any],
     scripts_for_question: int,
     context_retrievals_for_question: int,
+    document_retrievals_for_question: int,
+    has_documents: bool,
+    max_document_retrievals: int,
+    has_qdi_artifacts: bool = False,
+    artifact_retrievals_for_question: int = 0,
+    max_artifact_retrievals: int = 0,
     total_scripts: int,
     max_scripts_per_question: int,
     max_scripts_total: int,
@@ -760,6 +1027,11 @@ def _available_qdi_actions(
     actions = ["answer", "give_up", "refine_current_question", "mark_duplicate"]
     if context_retrievals_for_question < 2:
         actions.insert(1, "request_context")
+    if has_documents and document_retrievals_for_question < max_document_retrievals:
+        actions.insert(1, "read_document_chunks")
+        actions.insert(1, "search_document")
+    if has_qdi_artifacts and artifact_retrievals_for_question < max_artifact_retrievals:
+        actions.insert(1, "read_qdi_artifact_excerpt")
     if allow_custom_readonly_python and scripts_for_question < max_scripts_per_question and total_scripts < max_scripts_total:
         actions.insert(1, "request_script")
     depth = int(current_record.get("depth", 0) or 0)
@@ -774,6 +1046,145 @@ def _available_qdi_actions(
     ):
         actions.insert(-1, "add_followup_questions")
     return actions
+
+
+def _terminal_qdi_actions(actions: list[str]) -> list[str]:
+    terminal = {"answer", "give_up", "mark_duplicate", "add_followup_questions"}
+    selected = [action for action in actions if action in terminal]
+    return selected or ["answer", "give_up"]
+
+
+def _pending_action_digest_requests(
+    action_history: list[dict[str, Any]],
+    action_digest_cards: list[dict[str, Any]],
+    question_id: str,
+) -> list[dict[str, Any]]:
+    summarized_sequences = {
+        int(card.get("digest_for_sequence", 0) or 0)
+        for card in action_digest_cards
+        if str(card.get("question_id", "")) == str(question_id)
+    }
+    pending = []
+    for entry in action_history:
+        if str(entry.get("question_id", "")) != str(question_id):
+            continue
+        if str(entry.get("action", "")) not in QDI_EVIDENCE_ACTIONS:
+            continue
+        if int(entry.get("sequence", 0) or 0) in summarized_sequences:
+            continue
+        pending.append(
+            {
+                "sequence": int(entry.get("sequence", 0) or 0),
+                "action": str(entry.get("action", "")),
+                "status": str(entry.get("status", "")),
+                "query": str(entry.get("query") or entry.get("context_query") or entry.get("document_query") or "")[:500],
+                "request_id": str(entry.get("request_id", "")),
+                "error": str(entry.get("error", ""))[:500],
+                "retrieved_tables": [str(x) for x in (entry.get("retrieved_tables", []) or [])[:8]],
+                "hits": [
+                    {
+                        "chunk_id": item.get("chunk_id"),
+                        "source_file": item.get("source_file"),
+                        "locator": item.get("locator"),
+                        "evidence_excerpt": str(item.get("evidence_excerpt") or "")[:300],
+                    }
+                    for item in (entry.get("hits", []) or [])[:6]
+                    if isinstance(item, dict)
+                ],
+                "chunks": [
+                    {
+                        "chunk_id": item.get("chunk_id"),
+                        "source_file": item.get("source_file"),
+                        "locator": item.get("locator"),
+                        "evidence_excerpt": str(item.get("evidence_excerpt") or "")[:300],
+                    }
+                    for item in (entry.get("chunks", []) or [])[:6]
+                    if isinstance(item, dict)
+                ],
+                "result_artifact_id": str(entry.get("result_artifact_id") or entry.get("artifact_id") or ""),
+                "output_truncated": bool(entry.get("output_truncated") or entry.get("truncated")),
+                "original_output_chars": int(entry.get("original_output_chars", 0) or 0),
+                "visible_output_chars": int(entry.get("visible_output_chars", 0) or 0),
+                "instruction": "Summarize this completed exploration from the matching recent_action_window evidence.",
+            }
+        )
+    return pending[-3:]
+
+
+def _apply_action_digest_updates(
+    action_history: list[dict[str, Any]],
+    action_digest_cards: list[dict[str, Any]],
+    action_timeline: list[dict[str, Any]],
+    updates: list[Any],
+    *,
+    question_id: str,
+    pending_sequences: set[int],
+) -> set[int]:
+    applied: set[int] = set()
+    by_sequence = {
+        int(entry.get("sequence", 0) or 0): entry
+        for entry in action_history
+        if str(entry.get("question_id", "")) == str(question_id)
+    }
+    for update in updates or []:
+        sequence = int(getattr(update, "sequence", 0) or 0)
+        entry = by_sequence.get(sequence)
+        if sequence not in pending_sequences or entry is None:
+            continue
+        card = {
+            "event_type": "action_digest",
+            "digest_for_sequence": sequence,
+            "question_id": str(question_id),
+            "action": str(entry.get("action", "")),
+            "what_was_done": str(getattr(update, "what_was_done", "") or "")[:1000],
+            "key_outputs": [str(x)[:700] for x in (getattr(update, "key_outputs", []) or [])[:6]],
+            "temporary_conclusion": str(getattr(update, "temporary_conclusion", "") or "")[:1000],
+            "remaining_gap": str(getattr(update, "remaining_gap", "") or "")[:1000],
+            "evidence_refs": [str(x)[:500] for x in (getattr(update, "evidence_refs", []) or [])[:8]],
+            "digest_source": "llm_action_digest",
+        }
+        action_digest_cards.append(card)
+        action_timeline.append(card)
+        applied.add(sequence)
+    return applied
+
+
+def _backfill_action_digests_from_working_memory(
+    action_history: list[dict[str, Any]],
+    action_digest_cards: list[dict[str, Any]],
+    action_timeline: list[dict[str, Any]],
+    update: Any,
+    *,
+    question_id: str,
+    pending_sequences: set[int],
+) -> None:
+    """Preserve an action-linked card even when the model omits the explicit digest field."""
+    if not pending_sequences:
+        return
+    facts = [str(x)[:700] for x in (getattr(update, "confirmed_facts", []) or [])[:4]]
+    conclusions = [str(x)[:700] for x in (getattr(update, "temporary_conclusions", []) or [])[:3]]
+    gaps = [str(x)[:700] for x in (getattr(update, "open_gaps", []) or [])[:3]]
+    refs = [str(x)[:500] for x in (getattr(update, "evidence_refs", []) or [])[:8]]
+    for entry in action_history:
+        sequence = int(entry.get("sequence", 0) or 0)
+        if sequence not in pending_sequences or str(entry.get("question_id", "")) != str(question_id):
+            continue
+        action = str(entry.get("action", ""))
+        status = str(entry.get("status", ""))
+        card = {
+            "event_type": "action_digest",
+            "digest_for_sequence": sequence,
+            "question_id": str(question_id),
+            "action": action,
+            "what_was_done": f"Executed `{action}`; resulting status was `{status}`.",
+            "key_outputs": facts + conclusions,
+            "temporary_conclusion": conclusions[0] if conclusions else "",
+            "remaining_gap": gaps[0] if gaps else "",
+            "evidence_refs": refs,
+            "digest_source": "llm_working_memory_fallback",
+        }
+        action_digest_cards.append(card)
+        action_timeline.append(card)
 
 
 def _question_records_for_prompt(question_records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -808,8 +1219,16 @@ def _current_script_evidence(
         return {}
     payload = result.model_dump() if result is not None else {}
     visible = _visible_output_payload(payload.get("result", {}), max_output_chars)
+    was_truncated = bool(payload.get("output_truncated")) or bool(visible["output_truncated"])
+    original_chars = max(
+        int(payload.get("original_output_chars") or 0),
+        int(visible["original_output_chars"]),
+    )
     artifact_ref = {}
-    if result is not None and artifact_store is not None:
+    stored_ref = payload.get("result", {}).get("_full_result_artifact") if isinstance(payload.get("result"), dict) else None
+    if isinstance(stored_ref, dict):
+        artifact_ref = stored_ref
+    elif result is not None and artifact_store is not None:
         artifact_ref = artifact_store.put(
             "qdi_script_output_full",
             f"{result.question_id}:{result.request_id}",
@@ -822,12 +1241,16 @@ def _current_script_evidence(
         "status": payload.get("status", ""),
         "error": str(payload.get("error", ""))[:2000],
         "current_visible_output": visible["current_visible_output"],
-        "output_truncated": visible["output_truncated"],
+        "truncated": was_truncated,
+        "output_truncated": was_truncated,
         "max_output_len": max_output_chars,
-        "original_output_chars": visible["original_output_chars"],
+        "original_output_chars": original_chars,
         "visible_output_chars": visible["visible_output_chars"],
         "current_output_artifact": artifact_ref,
-        "instruction": "若输出被截断，不能根据未显示内容做反向推断；如需更多证据，必须生成更聚焦的新脚本。",
+        "instruction": (
+            "完整结构化结果已保存到 current_output_artifact。truncated=true 表示当前 prompt 仅显示前缀；"
+            "可以继续使用可见结论，但不能根据未显示部分推断。需要额外细节时生成更聚焦的新脚本。"
+        ),
     }
 
 
@@ -1106,7 +1529,10 @@ def _failed_result_for_prompt(
         "original_output_chars": visible["original_output_chars"],
         "visible_output_chars": visible["visible_output_chars"],
     }
-    if artifact_store is not None:
+    stored_ref = result.result.get("_full_result_artifact") if isinstance(result.result, dict) else None
+    if isinstance(stored_ref, dict):
+        payload["result_artifact"] = stored_ref
+    elif artifact_store is not None:
         payload["result_artifact"] = artifact_store.put(
             "qdi_failed_script_result_full",
             f"{result.question_id}:{result.request_id}",
@@ -1127,6 +1553,23 @@ def _compact_action_history(question_id: str, action_name: str, status: str, act
         "duplicate_of_question_id": str(action.duplicate_of_question_id or ""),
         "followup_count": len(action.followup_questions or []),
         "requested_script": bool(action.request_script and action.request_script.python_code),
+        "context_query": str(action.request_context.query or "")[:500],
+        "document_query": str(action.search_document.query or "")[:500],
+        "document_ids": [str(x) for x in (action.search_document.document_ids or [])[:8]],
+        "requested_chunk_ids": [str(x) for x in (action.read_document_chunks.chunk_ids or [])[:12]],
+        "requested_artifact_id": str(action.read_qdi_artifact_excerpt.artifact_id or ""),
+        "artifact_offset": max(0, int(action.read_qdi_artifact_excerpt.offset or 0)),
+        "working_memory_items": sum(
+            len(getattr(action.working_memory_update, field, []) or [])
+            for field in (
+                "confirmed_facts",
+                "temporary_conclusions",
+                "evidence_refs",
+                "open_gaps",
+                "invalidated_hypotheses",
+            )
+        ),
+        "notes": str(action.notes or "")[:500],
     }
 
 
@@ -1260,11 +1703,13 @@ class CrossFileInvestigationTools:
         data_root: Path,
         authoritative_memory: dict,
         knowledge_base: dict,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.cfg = cfg
         self.data_root = data_root.resolve()
         self.authoritative_memory = authoritative_memory if isinstance(authoritative_memory, dict) else {}
         self.knowledge_base = knowledge_base if isinstance(knowledge_base, dict) else {}
+        self.artifact_store = artifact_store
 
     def execute(self, request: InvestigationToolRequest) -> InvestigationStepResult:
         tool = (request.tool_name or "").strip()
@@ -1280,16 +1725,27 @@ class CrossFileInvestigationTools:
             )
             max_chars = int(getattr(self.cfg.investigation, "max_result_chars", 20000))
             visible = _visible_output_payload(result, max_chars)
-            result = _truncate_result(result, max_chars)
+            full_result_artifact = {}
+            if self.artifact_store is not None:
+                full_result_artifact = self.artifact_store.put(
+                    "qdi_script_output_full",
+                    f"{request.question_id}:{request.request_id}",
+                    result,
+                    visible_excerpt=visible["current_visible_output"],
+                    visible_limit=max_chars,
+                )
+            visible_result = _truncate_result(result, max_chars)
+            if isinstance(visible_result, dict) and full_result_artifact:
+                visible_result["_full_result_artifact"] = full_result_artifact
             if isinstance(result, dict) and result.get("error"):
-                return _failed_result(request, str(result.get("error")), result=result)
+                return _failed_result(request, str(result.get("error")), result=visible_result)
             return InvestigationStepResult(
                 request_id=request.request_id,
                 question_id=request.question_id,
                 tool_name=tool,
                 status="completed",
                 reason=request.reason,
-                result=result if isinstance(result, dict) else {"value": result},
+                result=visible_result if isinstance(visible_result, dict) else {"value": visible_result},
                 output_truncated=bool(visible["output_truncated"]),
                 max_output_chars=max_chars,
                 original_output_chars=int(visible["original_output_chars"]),
@@ -1571,38 +2027,47 @@ def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeCo
     with tempfile.TemporaryDirectory(prefix="autorealize_scratch_") as scratch:
         scratch_dir = Path(scratch).resolve()
         wrapper_path = scratch_dir / "run_custom_readonly.py"
+        result_path = scratch_dir / "__autorealize_result.json"
+        stdout_path = scratch_dir / "__autorealize_stdout.log"
+        stderr_path = scratch_dir / "__autorealize_stderr.log"
         wrapper_path.write_text(_custom_python_wrapper(code), encoding="utf-8")
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        proc = subprocess.run(
-            [sys.executable, str(wrapper_path), str(input_dir.resolve()), str(scratch_dir)],
-            cwd=str(scratch_dir),
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
-        stdout = (proc.stdout or "")[-max_stdout:]
-        stderr = (proc.stderr or "")[-max_stdout:]
-        marker_lines = [line for line in stdout.splitlines() if line.startswith("__AUTOREALIZE_RESULT__")]
+        try:
+            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                proc = subprocess.run(
+                    [sys.executable, str(wrapper_path), str(input_dir.resolve()), str(scratch_dir), str(result_path)],
+                    cwd=str(scratch_dir),
+                    env=env,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired:
+            return {
+                "error": f"custom_python_timeout:{timeout}",
+                "stdout_tail": _read_text_tail(stdout_path, max_stdout),
+                "stderr_tail": _read_text_tail(stderr_path, max_stdout),
+            }
+        stdout_info = _read_text_tail_info(stdout_path, max_stdout)
+        stderr_info = _read_text_tail_info(stderr_path, max_stdout)
+        stdout = stdout_info["visible_tail"]
+        stderr = stderr_info["visible_tail"]
         if proc.returncode != 0:
             return {
                 "error": f"custom_python_exit_code:{proc.returncode}",
                 "stdout_tail": stdout,
                 "stderr_tail": stderr,
             }
-        if not marker_lines:
+        if not result_path.exists():
             return {
-                "error": "custom_python_missing_result_marker",
+                "error": "custom_python_missing_result_file",
                 "stdout_tail": stdout,
                 "stderr_tail": stderr,
             }
-        raw = marker_lines[-1].removeprefix("__AUTOREALIZE_RESULT__")
         try:
-            result = json.loads(raw)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             return {
                 "error": f"custom_python_result_not_json:{exc}",
@@ -1612,9 +2077,34 @@ def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeCo
         if not isinstance(result, dict):
             return {"error": "custom_python_result_not_object", "result": _json_safe(result)}
         result["_scratch_destroyed_after_execution"] = True
+        if stdout_info["original_bytes"]:
+            result["_stdout_capture"] = stdout_info
         if stderr.strip():
-            result["_stderr_tail"] = stderr
+            result["_stderr_capture"] = stderr_info
         return result
+
+
+def _read_text_tail(path: Path, limit: int) -> str:
+    return str(_read_text_tail_info(path, limit)["visible_tail"])
+
+
+def _read_text_tail_info(path: Path, limit: int) -> dict[str, Any]:
+    if limit <= 0 or not path.exists():
+        return {"visible_tail": "", "truncated": False, "original_bytes": 0, "visible_chars": 0}
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max(limit * 4, limit)))
+            visible = stream.read().decode("utf-8", errors="replace")[-limit:]
+            return {
+                "visible_tail": visible,
+                "truncated": size > len(visible.encode("utf-8", errors="replace")),
+                "original_bytes": size,
+                "visible_chars": len(visible),
+            }
+    except OSError:
+        return {"visible_tail": "", "truncated": False, "original_bytes": 0, "visible_chars": 0}
 
 
 def validate_custom_readonly_python(code: str) -> list[str]:
@@ -1644,6 +2134,22 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         "__future__",
         "pandas",
         "numpy",
+        "scipy",
+        "sklearn",
+        "statsmodels",
+        "polars",
+        "pyarrow",
+        "fastparquet",
+        "networkx",
+        "rapidfuzz",
+        "xarray",
+        "h5py",
+        "tables",
+        "zarr",
+        "openpyxl",
+        "xlrd",
+        "pyxlsb",
+        "odf",
         "json",
         "math",
         "statistics",
@@ -1740,6 +2246,7 @@ import pandas as pd
 
 INPUT_DIR = Path(sys.argv[1]).resolve()
 SCRATCH_DIR = Path(sys.argv[2]).resolve()
+RESULT_PATH = Path(sys.argv[3]).resolve()
 
 _orig_open = builtins.open
 _orig_path_open = Path.open
@@ -1878,7 +2385,15 @@ def _json_safe(value):
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in list(value)[:200]]
+        values = list(value)
+        visible = [_json_safe(v) for v in values[:200]]
+        if len(values) > len(visible):
+            visible.append({
+                "_truncated_sequence": True,
+                "original_items": len(values),
+                "visible_items": 200,
+            })
+        return visible
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
@@ -1902,7 +2417,11 @@ try:
     if not callable(analyze):
         raise RuntimeError("custom code must define analyze(input_dir: str, scratch_dir: str) -> dict")
     result = analyze(str(INPUT_DIR), str(SCRATCH_DIR))
-    print("__AUTOREALIZE_RESULT__" + json.dumps(_json_safe(result), ensure_ascii=False, default=str))
+    _orig_path_write_text(
+        RESULT_PATH,
+        json.dumps(_json_safe(result), ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 except Exception:
     traceback.print_exc()
     sys.exit(1)
@@ -2010,8 +2529,12 @@ def _legacy_build_investigation_context_unused(
             "max_questions": getattr(cfg.investigation, "max_questions", 5),
             "max_rounds_per_run": getattr(cfg.investigation, "max_rounds_per_run", 3),
             "allow_custom_readonly_python": getattr(cfg.investigation, "allow_custom_readonly_python", True),
-            "question_bfs_max_depth": 3,
-            "max_followup_questions_per_question": 3,
+            "question_bfs_max_depth": getattr(cfg.investigation, "question_bfs_max_depth", 3),
+            "max_followup_questions_per_question": getattr(
+                cfg.investigation,
+                "max_followup_questions_per_question",
+                3,
+            ),
         },
     }
 
@@ -2241,6 +2764,202 @@ def _compact_filename_sample_groups(groups: Any, *, file_summaries: list[Any]) -
             }
         )
     return out
+
+
+def _immutable_question_card(record: dict[str, Any]) -> dict[str, Any]:
+    """Freeze question identity separately from changing status/budget fields."""
+    return {
+        "question_id": str(record.get("question_id", "")),
+        "question": str(record.get("question", ""))[:1000],
+        "category": str(record.get("category", "")),
+        "why_blocking": str(record.get("why_blocking", ""))[:1000],
+        "candidate_files": [str(x) for x in (record.get("candidate_files", []) or [])[:20]],
+        "parent_id": str(record.get("parent_id", "")),
+        "depth": int(record.get("depth", 0) or 0),
+    }
+
+
+def _qdi_answerer_stable_prefix(context: dict[str, Any], record: dict[str, Any]) -> str:
+    """Keep global context first so providers can reuse it across QDI questions."""
+    return join_blocks(
+        json_block("1. Frozen global QDI context", context),
+        json_block("2. Immutable initial current-question card", _immutable_question_card(record)),
+    )
+
+
+def _empty_working_memory_card(question_id: str) -> dict[str, Any]:
+    return {
+        "question_id": str(question_id or ""),
+        "confirmed_facts": [],
+        "temporary_conclusions": [],
+        "evidence_refs": [],
+        "open_gaps": [],
+        "invalidated_hypotheses": [],
+        "recommended_next_focus": "",
+        "last_updated_sequence": 0,
+        "trust_policy": (
+            "This is an LLM-authored interpretation of visible evidence, not an authority layer. "
+            "Parser/script facts and exact source excerpts take precedence."
+        ),
+    }
+
+
+def _merge_working_memory_card(
+    card: dict[str, Any],
+    update: Any,
+    *,
+    sequence: int,
+    max_chars: int,
+) -> dict[str, Any]:
+    merged = dict(card or {})
+    list_fields = (
+        "confirmed_facts",
+        "temporary_conclusions",
+        "evidence_refs",
+        "open_gaps",
+        "invalidated_hypotheses",
+    )
+    for field in list_fields:
+        existing = [str(x)[:800] for x in (merged.get(field) or []) if str(x).strip()]
+        incoming = [str(x)[:800] for x in (getattr(update, field, []) or []) if str(x).strip()]
+        merged[field] = _dedupe_qdi_strings(existing + incoming, limit=24)
+    focus = str(getattr(update, "recommended_next_focus", "") or "").strip()
+    if focus:
+        merged["recommended_next_focus"] = focus[:1200]
+    merged["last_updated_sequence"] = int(sequence)
+    limit = max(1000, int(max_chars))
+    trim_order = (
+        "temporary_conclusions",
+        "open_gaps",
+        "invalidated_hypotheses",
+        "confirmed_facts",
+        "evidence_refs",
+    )
+    while len(json.dumps(merged, ensure_ascii=False, sort_keys=True, default=str)) > limit:
+        changed = False
+        for field in trim_order:
+            values = merged.get(field)
+            if isinstance(values, list) and len(values) > 1:
+                values.pop(0)
+                changed = True
+                break
+        if not changed:
+            merged["recommended_next_focus"] = str(merged.get("recommended_next_focus") or "")[:400]
+            break
+    return merged
+
+
+def _recent_action_window(actions: list[dict[str, Any]], *, count: int) -> list[dict[str, Any]]:
+    if count <= 0:
+        return []
+    return actions[-max(1, int(count)) :]
+
+
+def _bounded_json_view(value: Any, max_chars: int) -> dict[str, Any]:
+    safe = _json_safe(value)
+    text = json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return {
+            "content": safe,
+            "truncated": False,
+            "original_chars": len(text),
+            "visible_chars": len(text),
+        }
+    return {
+        "visible_excerpt": text[:limit],
+        "truncated": True,
+        "original_chars": len(text),
+        "visible_chars": limit,
+    }
+
+
+def _artifact_backed_observation(
+    value: Any,
+    *,
+    artifact_store: ArtifactStore,
+    artifact_type: str,
+    source: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    view = _bounded_json_view(value, max_chars)
+    text = json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True, default=str)
+    ref = artifact_store.put(
+        artifact_type,
+        source,
+        value,
+        visible_excerpt=text[: max(1, int(max_chars))],
+        visible_limit=max_chars,
+    )
+    view["artifact_ref"] = ref
+    return view
+
+
+def _new_live_action_entry(
+    *,
+    sequence: int,
+    question_id: str,
+    action_name: str,
+    action: QuestionInvestigationAction,
+    artifact_store: ArtifactStore,
+    script_chars: int,
+) -> dict[str, Any]:
+    request: dict[str, Any]
+    if action_name == "request_script":
+        request = action.request_script.model_dump()
+        code = str(request.get("python_code") or "")
+        if len(code) > max(1, int(script_chars)):
+            ref = artifact_store.put(
+                "qdi_script_source_full",
+                f"{question_id}:action:{sequence}",
+                request,
+                visible_excerpt=code[: max(1, int(script_chars))],
+                visible_limit=script_chars,
+            )
+            request["python_code"] = code[: max(1, int(script_chars))]
+            request["python_code_truncated"] = True
+            request["python_code_original_chars"] = len(code)
+            request["python_code_visible_chars"] = len(request["python_code"])
+            request["source_artifact"] = ref
+    elif action_name == "request_context":
+        request = action.request_context.model_dump()
+    elif action_name == "search_document":
+        request = action.search_document.model_dump()
+    elif action_name == "read_document_chunks":
+        request = action.read_document_chunks.model_dump()
+    elif action_name == "read_qdi_artifact_excerpt":
+        request = action.read_qdi_artifact_excerpt.model_dump()
+    elif action_name == "add_followup_questions":
+        request = {"followup_questions": [item.model_dump() for item in (action.followup_questions or [])]}
+    else:
+        request = {
+            "answer": str(action.answer or "")[:2000],
+            "unresolved_reason": str(action.unresolved_reason or "")[:2000],
+            "refined_question": str(action.refined_question or "")[:1000],
+            "duplicate_of_question_id": str(action.duplicate_of_question_id or ""),
+            "notes": str(action.notes or "")[:1000],
+        }
+    return {
+        "sequence": int(sequence),
+        "question_id": str(question_id),
+        "action": str(action_name),
+        "request": request,
+        "observation": {"status": "pending_local_execution"},
+    }
+
+
+def _artifact_ids_in(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        artifact_id = str(value.get("artifact_id") or "").strip()
+        if artifact_id:
+            found.add(artifact_id)
+        for nested in value.values():
+            found.update(_artifact_ids_in(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(_artifact_ids_in(nested))
+    return found
 
 
 def _shared_columns_for_files(files: list[str], summary_by_path: dict[str, Any]) -> list[str]:

@@ -15,6 +15,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .config import AutoRealizeConfig, DEFAULT_CONFIG_PATH, ServiceConfig
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_WORKDIR = str(ROOT_DIR)
@@ -30,7 +32,7 @@ class StartAutoRealizeRequest(BaseModel):
     output_root: str
     run_name: str
     task_hint: str = ""
-    config_path: str
+    config_path: str = ""
     python_executable: str = "python"
     working_dir: str = DEFAULT_WORKDIR
     auto_generate_predict_split: bool = False
@@ -71,6 +73,8 @@ class JobRuntime:
     last_error: str | None = None
     stdout_tail: str = ""
     stderr_tail: str = ""
+    job_status_tail_chars: int = 60000
+    stop_wait_seconds: float = 15.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -139,8 +143,8 @@ class JobStore:
             run_dir=job.run_dir,
             exit_code=job.exit_code,
             last_error=job.last_error,
-            stdout_tail=job.stdout_tail[-60000:],
-            stderr_tail=job.stderr_tail[-60000:],
+            stdout_tail=_tail_text(job.stdout_tail, job.job_status_tail_chars),
+            stderr_tail=_tail_text(job.stderr_tail, job.job_status_tail_chars),
         )
 
 
@@ -149,6 +153,8 @@ app = FastAPI(title="AutoRealize Service API", version="0.1.0")
 
 
 def _tail_text(text: str, limit: int = 200000) -> str:
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     return text[-limit:]
@@ -242,7 +248,11 @@ def _render_directory_tree(root: Path, max_nodes: int = 6000) -> str:
     return "\n".join(lines)
 
 
-def _load_file_cognition_index(report_dir: Path, max_items: int = 400) -> dict[str, Any]:
+def _load_file_cognition_index(
+    report_dir: Path,
+    max_items: int = 400,
+    markdown_chars: int = 50000,
+) -> dict[str, Any]:
     out: dict[str, Any] = {}
     folder = report_dir / "file_cognition"
     if not folder.exists() or not folder.is_dir():
@@ -261,9 +271,29 @@ def _load_file_cognition_index(report_dir: Path, max_items: int = 400) -> dict[s
             md_text = md_path.read_text(encoding="utf-8", errors="ignore")
         out[source] = {
             "json": payload,
-            "markdown": md_text[:50000],
+            "markdown": md_text[: max(0, markdown_chars)],
         }
     return out
+
+
+def _load_run_config(report_dir: Path) -> AutoRealizeConfig:
+    candidates = [report_dir / "final_config.yaml", report_dir / "final_config.json"]
+    manifest = _safe_read_json(report_dir / "frontend_manifest.json", {})
+    snapshot_rel = str((manifest.get("config_entrypoints") or {}).get("snapshot") or "")
+    if snapshot_rel:
+        candidates.insert(0, report_dir.parent / snapshot_rel)
+    candidates.extend(sorted(report_dir.glob("*config*.yaml")))
+    seen: set[Path] = set()
+    for path in candidates:
+        path = path.resolve()
+        if path in seen or not path.exists() or path.name == "config_schema.json":
+            continue
+        seen.add(path)
+        try:
+            return AutoRealizeConfig.from_file(path)
+        except Exception:
+            continue
+    return AutoRealizeConfig.from_env()
 
 
 def _build_snapshot(run_dir_raw: str) -> dict[str, Any]:
@@ -273,10 +303,15 @@ def _build_snapshot(run_dir_raw: str) -> dict[str, Any]:
         report_dir = run_dir / "realize_report"
 
     out: dict[str, Any] = {"report_dir": str(report_dir)}
+    cfg = _load_run_config(report_dir)
+    service_cfg = cfg.service
     autorealize_dir = report_dir.parent
     directory_tree_file = report_dir / "directory_tree.txt"
 
-    out["current_state"] = _safe_read_json(report_dir / "current_state.json", {})
+    out["current_state"] = _safe_read_json(
+        report_dir / cfg.telemetry.current_state_filename,
+        {},
+    )
     out["frontend_manifest"] = _safe_read_json(report_dir / "frontend_manifest.json", {})
     out["run_summary"] = _safe_read_json(report_dir / "run_summary.json", {})
     out["data_cognition_report"] = _safe_read_json(report_dir / "data_cognition_report.json", {})
@@ -287,9 +322,15 @@ def _build_snapshot(run_dir_raw: str) -> dict[str, Any]:
     out["authoritative_task_memory"] = _safe_read_json(report_dir / "authoritative_task_memory.json", {})
     out["agent_context_pack"] = _safe_read_json(report_dir / "agent_context_pack.json", {})
     out["retrieved_knowledge"] = _safe_read_json(report_dir / "retrieved_knowledge.json", [])
-    out["events"] = _parse_jsonl(report_dir / "event_stream.jsonl", limit=400)
+    out["events"] = _parse_jsonl(
+        report_dir / cfg.telemetry.event_stream_filename,
+        limit=max(1, int(service_cfg.snapshot_event_limit)),
+    )
     out["directory_tree_text"] = directory_tree_file.read_text(encoding="utf-8", errors="ignore") if directory_tree_file.exists() else ""
-    out["output_tree_text"] = _render_directory_tree(autorealize_dir)
+    out["output_tree_text"] = _render_directory_tree(
+        autorealize_dir,
+        max_nodes=max(1, int(service_cfg.snapshot_tree_max_nodes)),
+    )
     desc_file = autorealize_dir / "description.md"
     out["description_text"] = desc_file.read_text(encoding="utf-8", errors="ignore") if desc_file.exists() else ""
     data_desc_file = report_dir / "data_description.md"
@@ -298,12 +339,29 @@ def _build_snapshot(run_dir_raw: str) -> dict[str, Any]:
     out["automl_context_text"] = automl_context_file.read_text(encoding="utf-8", errors="ignore") if automl_context_file.exists() else ""
     original_file = report_dir / "original_requirements.txt"
     out["original_requirements_text"] = original_file.read_text(encoding="utf-8", errors="ignore") if original_file.exists() else ""
-    out["file_cognition_index"] = _load_file_cognition_index(report_dir)
+    out["file_cognition_index"] = _load_file_cognition_index(
+        report_dir,
+        max_items=max(0, int(service_cfg.snapshot_file_cognition_limit)),
+        markdown_chars=max(0, int(service_cfg.snapshot_file_markdown_chars)),
+    )
     return out
 
 
 def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
     run_dir = str((Path(req.output_root).expanduser().resolve() / req.run_name))
+    workdir = req.working_dir.strip() or DEFAULT_WORKDIR
+    config_path = Path(req.config_path).expanduser() if req.config_path.strip() else DEFAULT_CONFIG_PATH
+    if not config_path.is_absolute():
+        config_path = Path(workdir) / config_path
+    try:
+        service_cfg = AutoRealizeConfig.from_file(config_path).service
+    except Exception:
+        service_cfg = ServiceConfig()
+    store.update(
+        job_id,
+        job_status_tail_chars=max(0, int(service_cfg.job_status_tail_chars)),
+        stop_wait_seconds=max(0.0, float(service_cfg.stop_wait_seconds)),
+    )
     cmd = [
         req.python_executable or "python",
         "-m",
@@ -317,14 +375,13 @@ def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
         "--run-name",
         req.run_name,
         "--config",
-        req.config_path,
+        str(config_path),
     ]
     if req.auto_generate_predict_split:
         cmd.append("--auto-generate-predict-split")
 
     env = os.environ.copy()
     env.update(req.env_overrides or {})
-    workdir = req.working_dir.strip() or DEFAULT_WORKDIR
 
     try:
         popen_kwargs: dict[str, Any] = {}
@@ -353,7 +410,10 @@ def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
     if exit_code != 0:
         tail = (err or out or "").strip()
         if tail:
-            last_error = _extract_last_error_from_output(tail)
+            last_error = _extract_last_error_from_output(
+                tail,
+                limit=max(1, int(service_cfg.last_error_chars)),
+            )
         else:
             last_error = f"AutoRealize exited with code {exit_code}"
 
@@ -362,9 +422,17 @@ def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
         report_dir = Path(run_dir) / "realize_report"
         report_dir.mkdir(parents=True, exist_ok=True)
         if out:
-            (report_dir / "_service_stdout.log").write_text(_tail_text(out), encoding="utf-8", errors="ignore")
+            (report_dir / service_cfg.stdout_filename).write_text(
+                _tail_text(out, max(0, int(service_cfg.captured_log_tail_chars))),
+                encoding="utf-8",
+                errors="ignore",
+            )
         if err:
-            (report_dir / "_service_stderr.log").write_text(_tail_text(err), encoding="utf-8", errors="ignore")
+            (report_dir / service_cfg.stderr_filename).write_text(
+                _tail_text(err, max(0, int(service_cfg.captured_log_tail_chars))),
+                encoding="utf-8",
+                errors="ignore",
+            )
     except Exception:
         pass
 
@@ -373,8 +441,8 @@ def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
         status=status,
         exit_code=exit_code,
         last_error=last_error,
-        stdout_tail=_tail_text(out or ""),
-        stderr_tail=_tail_text(err or ""),
+        stdout_tail=_tail_text(out or "", max(0, int(service_cfg.captured_log_tail_chars))),
+        stderr_tail=_tail_text(err or "", max(0, int(service_cfg.captured_log_tail_chars))),
     )
 
 
@@ -407,7 +475,7 @@ def stop_job(req: StopRequest) -> dict[str, Any]:
         if os.name == "nt":
             proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[arg-type]
             try:
-                proc.wait(timeout=15)
+                proc.wait(timeout=max(0.0, float(job.stop_wait_seconds)))
             except subprocess.TimeoutExpired:
                 proc.kill()
         else:

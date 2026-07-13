@@ -19,7 +19,7 @@
 - 多 sheet Excel 必须额外输出 sheet_field_descriptions：按每个 sheet 分别写字段说明。即使 workbook 级 field_descriptions 已有同名字段，也要在 sheet_field_descriptions 中说明该字段在该 sheet 的语义。
 - key_facts、risks、related_hints 都只保留对后续建模、约束、读取、评估或跨文件关联有用的信息。
 
-你的核心目标不是写普通摘要，而是为后续 AutoML/ML-Master 建立可执行的数据知识：
+你的核心目标不是写普通摘要，而是为后续 AutoML 建立可执行的数据知识：
 1) 如果是需求、说明、README、PDF/DOCX/TXT/日志文档，重点提取：业务背景、任务目标、硬约束、软约束、评价口径、提交格式、已有字段说明、时间粒度、实体粒度、禁止事项。关键信息不得被一句话吞掉。
    - 必须输出“可执行明细”，例如：时间窗具体长度、输入构造步骤、公式、阈值、单位、约束触发条件、资源上限/下限。
    - 禁止只写“文档详述了XX架构/XX输入构建”这种空泛概括，必须写“详述了什么”，把具体内容详细描述出来。

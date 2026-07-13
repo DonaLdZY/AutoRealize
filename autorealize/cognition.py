@@ -1,9 +1,9 @@
 ﻿from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 import pandas as pd
@@ -11,7 +11,7 @@ import pandas as pd
 from .config import AutoRealizeConfig
 from .llm.client import LLMClient
 from .logging_utils import log_event
-from .models import CognitionProbePlan, CognitionSummary, FileRole, FileSummary
+from .models import CognitionProbePlan, CognitionSummary, DocumentCognitionMemory, FileRole, FileSummary
 from .prompt_cache import stable_dynamic_prompt
 from .profiling.stats import column_profile_to_dict, profile_dataframe, read_table, table_probe_sample_rows
 from .prompts.manager import PromptManager
@@ -35,7 +35,7 @@ def llm_cognition_for_file(
     heuristic_field_semantics: dict[str, str] | None = None,
 ) -> FileSummary | None:
     document_like = parsed_kind in {"document", "structured_document", "archive"}
-    document_excerpt = parsed_text_summary[:18000] if document_like else parsed_text_summary[:4000]
+    document_excerpt = parsed_text_summary if document_like else parsed_text_summary[:4000]
     deterministic_context = _compact_deterministic_file_context(
         source_metadata=source_metadata or {},
         column_profiles=column_profiles or [],
@@ -78,7 +78,18 @@ def llm_cognition_for_file(
 
     log_event(logger, "agent.file_cognition_summary", "ACTIVATED", file=relative_path)
     try:
-        summary = _summarize_file(cfg, llm, prompt_mgr, base_context, probe_plan, probe_results)
+        document_trace: dict[str, Any] = {}
+        if document_like:
+            summary, document_trace = _summarize_document_full_text(
+                cfg=cfg,
+                llm=llm,
+                prompt_mgr=prompt_mgr,
+                base_context=base_context,
+                full_text=parsed_text_summary,
+                relative_path=relative_path,
+            )
+        else:
+            summary = _summarize_file(cfg, llm, prompt_mgr, base_context, probe_plan, probe_results)
     except Exception as exc:  # noqa: BLE001
         log_event(logger, "agent.file_cognition_summary", "FAILED", file=relative_path, error=str(exc)[:240])
         raise
@@ -119,6 +130,7 @@ def llm_cognition_for_file(
             "probe_plan": probe_plan.model_dump(),
             "probe_result_keys": list(probe_results.keys()) if isinstance(probe_results, dict) else [],
             "probe_results": _compact_probe_results(probe_results),
+            "document_cognition": document_trace,
             "cognition_trace": _build_cognition_trace(
                 file=relative_path,
                 parsed_kind=parsed_kind,
@@ -128,6 +140,221 @@ def llm_cognition_for_file(
             ),
         },
     )
+
+
+def _summarize_document_full_text(
+    *,
+    cfg: AutoRealizeConfig,
+    llm: LLMClient,
+    prompt_mgr: PromptManager,
+    base_context: dict[str, Any],
+    full_text: str,
+    relative_path: str,
+) -> tuple[CognitionSummary, dict[str, Any]]:
+    chunks = _document_cognition_chunks(
+        full_text,
+        chunk_chars=int(getattr(cfg.data, "document_cognition_chunk_chars", 12000)),
+        overlap_chars=int(getattr(cfg.data, "document_cognition_chunk_overlap_chars", 300)),
+    )
+    if not chunks:
+        return _summarize_file(
+            cfg,
+            llm,
+            prompt_mgr,
+            {**base_context, "document_excerpt": "", "document_excerpt_chars": 0},
+            CognitionProbePlan(need_more_probe=False),
+            {},
+        ), {"mode": "empty_document", "chunks_total": 0, "chunks_processed": 0, "covered_chars": 0}
+
+    # A short document already fits one normal call; avoid adding a compaction
+    # call that would cost more without reducing context.
+    if len(chunks) == 1:
+        summary = _summarize_file(
+            cfg,
+            llm,
+            prompt_mgr,
+            base_context,
+            CognitionProbePlan(need_more_probe=False),
+            {},
+        )
+        return summary, {
+            "mode": "single_call_full_text",
+            "chunks_total": 1,
+            "chunks_processed": 1,
+            "covered_chars": len(full_text),
+            "source_text_chars": len(full_text),
+            "coverage_ratio": 1.0,
+        }
+
+    memory = DocumentCognitionMemory(total_chunks=len(chunks))
+    compactor_system = prompt_mgr.load("system/cognition_document_compactor.md")
+    memory_limit = max(4, int(getattr(cfg.data, "document_cognition_memory_items_per_section", 24)))
+    memory_max_chars = max(4000, int(getattr(cfg.data, "document_cognition_memory_max_chars", 18000)))
+    chunk_max_tokens = max(512, int(getattr(cfg.data, "document_cognition_chunk_max_tokens", 4096)))
+    stable_context = {
+        "file": base_context.get("file"),
+        "kind": base_context.get("kind"),
+        "task": base_context.get("task"),
+        "source_text_chars": len(full_text),
+        "reading_policy": "sequential_full_coverage_with_bounded_rolling_memory",
+    }
+    for index, chunk in enumerate(chunks, 1):
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_context,
+            dynamic={
+                "rolling_memory": _bound_document_memory(memory, memory_limit, memory_max_chars),
+                "current_chunk": {
+                    "index": index,
+                    "total": len(chunks),
+                    "start_char": chunk["start_char"],
+                    "end_char": chunk["end_char"],
+                    "source_anchor_hint": chunk["source_anchor_hint"],
+                    "text": chunk["text"],
+                },
+                "progress": {
+                    "processed_chunks_after_this_call": index,
+                    "total_chunks": len(chunks),
+                    "covered_chars_after_this_call": chunk["end_char"],
+                },
+                "memory_item_limit": memory_limit,
+            },
+            stable_title="Stable document cognition rules",
+            dynamic_title="Current document chunk and rolling memory",
+        )
+        memory = llm.ask_structured(
+            model_cls=DocumentCognitionMemory,
+            system_prompt=compactor_system,
+            user_prompt=dynamic,
+            prompt_name="cognition_document_chunk",
+            static_context_prompt=stable,
+            dynamic_user_prompt=dynamic,
+            max_tokens=chunk_max_tokens,
+        )
+        memory.processed_chunks = index
+        memory.total_chunks = len(chunks)
+        memory.covered_chars = chunk["end_char"]
+        memory = DocumentCognitionMemory.model_validate(
+            _bound_document_memory(memory, memory_limit, memory_max_chars)
+        )
+        log_event(
+            logger,
+            "agent.file_cognition_document_chunk",
+            "COMPLETED",
+            file=relative_path,
+            chunk=index,
+            total_chunks=len(chunks),
+            start_char=chunk["start_char"],
+            end_char=chunk["end_char"],
+        )
+
+    final_context = {
+        **base_context,
+        "summary": "",
+        "document_excerpt": "",
+        "document_excerpt_chars": 0,
+        "full_document_cognition_memory": memory.model_dump(),
+        "full_document_coverage": {
+            "chunks_processed": len(chunks),
+            "chunks_total": len(chunks),
+            "covered_chars": len(full_text),
+            "source_text_chars": len(full_text),
+            "coverage_ratio": 1.0,
+        },
+    }
+    summary = _summarize_file(
+        cfg,
+        llm,
+        prompt_mgr,
+        final_context,
+        CognitionProbePlan(need_more_probe=False),
+        {},
+    )
+    return summary, {
+        "mode": "sequential_full_coverage_with_bounded_rolling_memory",
+        "chunks_total": len(chunks),
+        "chunks_processed": len(chunks),
+        "covered_chars": len(full_text),
+        "source_text_chars": len(full_text),
+        "coverage_ratio": 1.0,
+        "chunk_chars": int(getattr(cfg.data, "document_cognition_chunk_chars", 12000)),
+        "chunk_overlap_chars": int(getattr(cfg.data, "document_cognition_chunk_overlap_chars", 300)),
+    }
+
+
+def _document_cognition_chunks(text: str, *, chunk_chars: int, overlap_chars: int) -> list[dict[str, Any]]:
+    value = str(text or "")
+    if not value.strip():
+        return []
+    limit = max(1000, int(chunk_chars))
+    overlap = min(max(0, int(overlap_chars)), limit // 4)
+    chunks: list[dict[str, Any]] = []
+    start = 0
+    while start < len(value):
+        end = min(len(value), start + limit)
+        if end < len(value):
+            split_at = max(
+                value.rfind("\n\n", start + limit // 2, end),
+                value.rfind("。", start + limit // 2, end),
+            )
+            if split_at > start:
+                end = split_at + (2 if value[split_at : split_at + 2] == "\n\n" else 1)
+        chunk_text = value[start:end]
+        page_labels = re.findall(r"\[page\s+\d+\]", chunk_text, flags=re.IGNORECASE)
+        chunks.append(
+            {
+                "start_char": start,
+                "end_char": end,
+                "source_anchor_hint": " -> ".join([page_labels[0], page_labels[-1]]) if page_labels else f"chars {start}-{end}",
+                "text": chunk_text,
+            }
+        )
+        if end >= len(value):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
+
+
+def _bound_document_memory(
+    memory: DocumentCognitionMemory,
+    item_limit: int,
+    max_chars: int = 18000,
+) -> dict[str, Any]:
+    payload = memory.model_dump()
+    list_keys = [
+        "task_goals",
+        "business_context",
+        "data_objects_and_fields",
+        "constraints_and_rules",
+        "formulas_thresholds_units",
+        "evaluation_and_submission",
+        "methods_and_workflows",
+        "risks_conflicts_unknowns",
+        "source_anchors",
+    ]
+    candidates: dict[str, list[str]] = {}
+    for key in list_keys:
+        seen = []
+        for value in payload.get(key, []) or []:
+            text = str(value).strip()
+            if text and text not in seen:
+                seen.append(text[:400])
+        candidates[key] = seen[:item_limit]
+        payload[key] = []
+    payload["concise_purpose"] = str(payload.get("concise_purpose") or "")[:1200]
+    used = len(payload["concise_purpose"])
+    # Round-robin allocation prevents an early category from consuming the
+    # entire rolling-memory budget and starving evaluation or risk facts.
+    for item_index in range(max((len(values) for values in candidates.values()), default=0)):
+        for key in list_keys:
+            values = candidates[key]
+            if item_index >= len(values):
+                continue
+            text = values[item_index]
+            if used + len(text) > max_chars:
+                continue
+            payload[key].append(text)
+            used += len(text)
+    return payload
 
 
 def _compact_deterministic_file_context(

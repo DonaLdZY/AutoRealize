@@ -74,25 +74,44 @@ EVENT_TAXONOMY: dict[str, Any] = {
 }
 
 
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(
+    level: int | str = logging.INFO,
+    *,
+    raw_event_log: bool | None = None,
+    noisy_logger_level: int | str = logging.WARNING,
+    noisy_loggers: list[str] | tuple[str, ...] | None = None,
+) -> None:
     """初始化终端日志，统一输出到 stdout。"""
     global _raw_event_log
-    _raw_event_log = os.environ.get("AUTOREALIZE_RAW_EVENT_LOG", "0").strip() in {"1", "true", "True"}
+    if raw_event_log is None:
+        raw_event_log = os.environ.get("AUTOREALIZE_RAW_EVENT_LOG", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    _raw_event_log = bool(raw_event_log)
+    resolved_level = getattr(logging, str(level).upper(), logging.INFO) if isinstance(level, str) else level
+    resolved_noisy_level = (
+        getattr(logging, str(noisy_logger_level).upper(), logging.WARNING)
+        if isinstance(noisy_logger_level, str)
+        else noisy_logger_level
+    )
     logging.basicConfig(
-        level=level,
+        level=resolved_level,
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
         force=True,
     )
     # 降噪：这些模块保留 warning/error，避免终端刷屏。
-    noisy_loggers = [
+    configured_noisy_loggers = noisy_loggers or (
         "autorealize.llm.client",
         "autorealize.cognition",
         "httpx",
         "openai",
-    ]
-    for name in noisy_loggers:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    )
+    for name in configured_noisy_loggers:
+        logging.getLogger(name).setLevel(resolved_noisy_level)
 
 
 def configure_event_sink(

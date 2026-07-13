@@ -11,8 +11,8 @@ Desktop.ini
 # Local environment and secrets
 .env
 .env.*
-!.env.example
-!.env.*.example
+replacements.txt
+gitleaks-report.*
 
 # Python bytecode, environments, and packaging
 __pycache__/

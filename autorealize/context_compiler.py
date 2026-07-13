@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from .utils.safe_json import json_safe, write_json_safe
@@ -42,8 +43,9 @@ class ArtifactStore:
     audit/replay while compact cards enter the model context.
     """
 
-    def __init__(self, root: Path | None) -> None:
+    def __init__(self, root: Path | None, *, default_visible_limit: int = 1200) -> None:
         self.root = root
+        self.default_visible_limit = max(1, int(default_visible_limit))
         if self.root is not None:
             self.root.mkdir(parents=True, exist_ok=True)
 
@@ -54,7 +56,7 @@ class ArtifactStore:
         payload: Any,
         *,
         visible_excerpt: str = "",
-        visible_limit: int = 1200,
+        visible_limit: int | None = None,
     ) -> dict[str, Any]:
         safe = json_safe(payload)
         text = json.dumps(safe, ensure_ascii=False, sort_keys=True, indent=2, default=str)
@@ -76,7 +78,8 @@ class ArtifactStore:
                 indent=2,
             )
             artifact_path = str(path.name)
-        visible = str(visible_excerpt or text[: max(1, int(visible_limit))])
+        effective_limit = self.default_visible_limit if visible_limit is None else max(1, int(visible_limit))
+        visible = str(visible_excerpt or text[:effective_limit])
         return ArtifactRef(
             artifact_id=artifact_id,
             artifact_type=artifact_type,
@@ -87,6 +90,91 @@ class ArtifactStore:
             visible_chars=len(visible),
             artifact_path=artifact_path,
         ).model_dump()
+
+    def read_excerpt(
+        self,
+        artifact_id: str,
+        *,
+        offset: int = 0,
+        max_chars: int = 8000,
+        json_path: str = "",
+        allowed_type_prefixes: tuple[str, ...] = ("qdi_",),
+    ) -> dict[str, Any]:
+        """Read a bounded JSON excerpt without allowing arbitrary filesystem access."""
+        artifact_id = str(artifact_id or "").strip()
+        if self.root is None:
+            return {"status": "unavailable", "artifact_id": artifact_id, "error": "artifact_store_disabled"}
+        if not re.fullmatch(r"[A-Za-z0-9_]+", artifact_id):
+            return {"status": "rejected", "artifact_id": artifact_id, "error": "invalid_artifact_id"}
+        path = self.root / f"{artifact_id}.json"
+        if not path.is_file():
+            return {"status": "not_found", "artifact_id": artifact_id, "error": "artifact_not_found"}
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"status": "failed", "artifact_id": artifact_id, "error": str(exc)[:500]}
+        if str(envelope.get("artifact_id") or "") != artifact_id:
+            return {"status": "rejected", "artifact_id": artifact_id, "error": "artifact_identity_mismatch"}
+        artifact_type = str(envelope.get("artifact_type") or "")
+        if allowed_type_prefixes and not any(artifact_type.startswith(prefix) for prefix in allowed_type_prefixes):
+            return {
+                "status": "rejected",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "error": "artifact_type_not_allowed",
+            }
+        payload = envelope.get("payload")
+        selected, path_error = _select_artifact_json_path(payload, json_path)
+        if path_error:
+            return {
+                "status": "not_found",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "json_path": json_path,
+                "error": path_error,
+            }
+        text = json.dumps(json_safe(selected), ensure_ascii=False, sort_keys=True, indent=2, default=str)
+        start = min(max(0, int(offset)), len(text))
+        limit = max(1, int(max_chars))
+        excerpt = text[start : start + limit]
+        return {
+            "status": "completed",
+            "artifact_id": artifact_id,
+            "artifact_type": artifact_type,
+            "source": str(envelope.get("source") or ""),
+            "json_path": str(json_path or ""),
+            "offset": start,
+            "next_offset": start + len(excerpt),
+            "has_more": start + len(excerpt) < len(text),
+            "original_chars": len(text),
+            "visible_chars": len(excerpt),
+            "excerpt": excerpt,
+        }
+
+
+def _select_artifact_json_path(payload: Any, json_path: str) -> tuple[Any, str]:
+    path = str(json_path or "").strip()
+    if not path or path == "payload":
+        return payload, ""
+    if path.startswith("payload."):
+        path = path[len("payload.") :]
+    elif path.startswith("payload["):
+        path = path[len("payload") :]
+    tokens = re.findall(r"(?:^|\.)([^.\[\]]+)|\[(\d+)\]", path)
+    if not tokens:
+        return None, "invalid_json_path"
+    current = payload
+    for key, index in tokens:
+        if key:
+            if not isinstance(current, dict) or key not in current:
+                return None, f"json_path_key_not_found:{key}"
+            current = current[key]
+        else:
+            idx = int(index)
+            if not isinstance(current, list) or idx >= len(current):
+                return None, f"json_path_index_not_found:{idx}"
+            current = current[idx]
+    return current, ""
 
 
 def build_qdi_context_bundle(
@@ -106,9 +194,9 @@ def build_qdi_context_bundle(
     detailed_table_cards = build_table_cards(
         file_summaries,
         artifact_store=artifact_store,
-        file_limit=120,
-        sheet_limit=80,
-        field_limit=80,
+        file_limit=_context_int(cfg, "table_card_file_limit", 120),
+        sheet_limit=_context_int(cfg, "table_card_sheet_limit", 80),
+        field_limit=_context_int(cfg, "table_card_field_limit", 80),
     )
     return build_qdi_context_bundle_from_table_cards(
         cfg=cfg,
@@ -139,15 +227,18 @@ def build_qdi_context_bundle_from_table_cards(
 
     table_cards = compact_table_cards_for_prompt(
         detailed_table_cards,
-        field_limit=3,
-        max_cards=48,
-        per_source_limit=6,
+        field_limit=_context_int(cfg, "stable_table_card_field_limit", 3),
+        max_cards=_context_int(cfg, "stable_table_card_limit", 48),
+        per_source_limit=_context_int(cfg, "stable_table_cards_per_source", 6),
     )
-    relation_cards = build_relation_cards(relation_hints, limit=100)
+    relation_cards = build_relation_cards(
+        relation_hints,
+        limit=_context_int(cfg, "relation_card_limit", 100),
+    )
     filename_group_cards = build_filename_group_cards(
         (knowledge_base or {}).get("filename_sample_groups", []),
         file_summaries=file_summaries,
-        limit=80,
+        limit=_context_int(cfg, "filename_group_card_limit", 80),
     )
     entity_alias_candidates = build_entity_alias_candidates(
         file_summaries,
@@ -163,11 +254,16 @@ def build_qdi_context_bundle_from_table_cards(
             "retrieved_navigation_notes_are_not_authority": True,
             "authoritative_facts_source": "authoritative_memory",
             "constraint_facts_source": "constraint_memory",
-            "historical_script_outputs_not_in_prompt": True,
+            "historical_script_outputs_are_artifact_backed": True,
+            "append_only_action_and_digest_timeline_is_visible": True,
             "stable_table_cards_are_light_index": True,
             "detailed_field_statistics_are_dynamic_only": True,
             "stable_table_cards_are_route_only": True,
             "retrieve_details_action": "request_context",
+            "retrieve_document_actions": ["search_document", "read_document_chunks"],
+            "retrieve_qdi_artifact_action": "read_qdi_artifact_excerpt",
+            "working_memory_is_interpretive_not_authoritative": True,
+            "recent_live_action_window": True,
             "telemetry_is_local_not_prompt": True,
         },
         "table_cards": table_cards,
@@ -204,8 +300,12 @@ def build_qdi_context_bundle_from_table_cards(
             "max_questions": getattr(cfg.investigation, "max_questions", 5),
             "max_rounds_per_run": getattr(cfg.investigation, "max_rounds_per_run", 3),
             "allow_custom_readonly_python": getattr(cfg.investigation, "allow_custom_readonly_python", True),
-            "question_bfs_max_depth": 3,
-            "max_followup_questions_per_question": 3,
+            "question_bfs_max_depth": getattr(cfg.investigation, "question_bfs_max_depth", 3),
+            "max_followup_questions_per_question": getattr(
+                cfg.investigation,
+                "max_followup_questions_per_question",
+                3,
+            ),
         },
     }
 
@@ -227,9 +327,9 @@ def build_qdi_context_and_details(
     detailed_table_cards = build_table_cards(
         file_summaries,
         artifact_store=artifact_store,
-        file_limit=120,
-        sheet_limit=80,
-        field_limit=80,
+        file_limit=_context_int(cfg, "table_card_file_limit", 120),
+        sheet_limit=_context_int(cfg, "table_card_sheet_limit", 80),
+        field_limit=_context_int(cfg, "table_card_field_limit", 80),
     )
     context = build_qdi_context_bundle_from_table_cards(
         cfg=cfg,
@@ -249,6 +349,7 @@ def build_qdi_table_card_details(
     *,
     file_summaries: list[Any],
     artifact_store: ArtifactStore | None = None,
+    cfg: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build detailed table cards for deterministic, per-question retrieval.
 
@@ -259,11 +360,16 @@ def build_qdi_table_card_details(
     detailed = build_table_cards(
         file_summaries,
         artifact_store=artifact_store,
-        file_limit=120,
-        sheet_limit=80,
-        field_limit=80,
+        file_limit=_context_int(cfg, "table_card_file_limit", 120),
+        sheet_limit=_context_int(cfg, "table_card_sheet_limit", 80),
+        field_limit=_context_int(cfg, "table_card_field_limit", 80),
     )
     return _table_card_detail_map(detailed)
+
+
+def _context_int(cfg: Any | None, name: str, default: int) -> int:
+    context = getattr(cfg, "context", None) if cfg is not None else None
+    return max(1, int(getattr(context, name, default)))
 
 
 def _table_card_detail_map(detailed: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

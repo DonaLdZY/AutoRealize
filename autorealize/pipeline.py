@@ -271,12 +271,9 @@ class AutoRealizePipeline:
         )
         log_event(logger, "pipeline", "RUN_STARTED", run_name=run_name, input_root=str(input_root), output_root=str(run_dir))
         if self.config.telemetry.write_config_snapshot:
-            (report_dir / "final_config.json").write_text(
-                _json_dumps_safe(self.config.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            self.config.write_yaml(report_dir / self.config.telemetry.config_snapshot_filename)
         if self.config.telemetry.write_config_schema:
-            (report_dir / "config_schema.json").write_text(
+            (report_dir / self.config.telemetry.config_schema_filename).write_text(
                 _json_dumps_safe(self.config.schema_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -364,8 +361,8 @@ class AutoRealizePipeline:
                 "current_state": self.config.telemetry.current_state_filename,
                 "event_taxonomy": "event_taxonomy.json",
                 "frontend_manifest": "frontend_manifest.json",
-                "final_config": "final_config.json",
-                "config_schema": "config_schema.json",
+                "final_config": self.config.telemetry.config_snapshot_filename,
+                "config_schema": self.config.telemetry.config_schema_filename,
             },
             "knowledge": {
                 "enabled": bool(self.config.knowledge.enabled),
@@ -482,7 +479,7 @@ def _append_output_layout_to_description(run_dir: Path, report_dir: Path) -> Non
     lines.append("## 文件与目录职责")
 
     role_map = {
-        "description.md": "面向 ML-Master/AutoML 的任务说明文档（Kaggle 风格）",
+        "description.md": "面向下游 AutoML 的任务说明文档（Kaggle 风格）",
         "sample_submission.csv": "提交样例文件（优先复用原始样例）",
         "description_origin.md": "原始数据中自带的 description.md 备份",
         "realize_report": "AutoRealize 过程报告目录（认知/任务定义/轨迹/日志）",
@@ -525,11 +522,11 @@ def _write_frontend_manifest(
         return {"path": path, "exists": p.exists(), "kind": "dir" if p.is_dir() else "file"}
 
     report_files = [
-        "realize_report/event_stream.jsonl",
-        "realize_report/current_state.json",
+        f"realize_report/{config.telemetry.event_stream_filename}",
+        f"realize_report/{config.telemetry.current_state_filename}",
         "realize_report/event_taxonomy.json",
-        "realize_report/final_config.json",
-        "realize_report/config_schema.json",
+        f"realize_report/{config.telemetry.config_snapshot_filename}",
+        f"realize_report/{config.telemetry.config_schema_filename}",
         "realize_report/run_summary.json",
         "realize_report/trajectory.md",
         "realize_report/trajectory_events.jsonl",
@@ -588,10 +585,10 @@ def _write_frontend_manifest(
             "data_files": data_files,
         },
         "config_entrypoints": {
-            "snapshot": "realize_report/final_config.json",
-            "schema": "realize_report/config_schema.json",
+            "snapshot": f"realize_report/{config.telemetry.config_snapshot_filename}",
+            "schema": f"realize_report/{config.telemetry.config_schema_filename}",
             "cli_print_default": "python -m autorealize.cli --print-default-config",
-            "cli_write_default": "python -m autorealize.cli --write-default-config config.json",
+            "cli_write_default": "python -m autorealize.cli --write-default-config /path/to/config.yaml",
         },
         "frontend_notes": [
             "优先轮询 current_state.json 展示状态，按 seq 增量读取 event_stream.jsonl 追加细节。",
@@ -995,7 +992,7 @@ def _evaluate_submission_with_llm(
         stable={
             "rules": [
                 "只检查 schema/列语义，不检查样例值是否已经是优化后的最终答案。",
-                "候选 sample_submission 必须服务下游 ML-Master/AutoML，而不是服务 AutoRealize 自身。",
+                "候选 sample_submission 必须服务下游 AutoML，而不是服务 AutoRealize 自身。",
                 "优先判断提交文件是否表达题目真正需要预测/决策的对象，而不是套用固定模板。",
                 "不要把所有问题硬套成 id+target；优化、推荐、编排、分配类问题可以有多列决策输出。",
                 "sample_submission.csv 是格式/列契约样例，不是已经求解完成的最优方案。",

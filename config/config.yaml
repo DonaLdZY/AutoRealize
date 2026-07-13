@@ -1,0 +1,365 @@
+# AutoRealize 正式默认配置。
+# CLI 默认读取本文件，也可通过 --config 指定其他 YAML。请勿填写并提交真实 API Key。
+
+# Text LLM requests and generation / 文本大模型请求与生成
+llm:
+  # Text-model OpenAI-compatible endpoint / 文本模型 OpenAI 兼容地址
+  base_url: "https://api.deepseek.com"
+  # Text-model identifier / 文本模型名称
+  model_name: "deepseek-v4-pro"
+  # Non-empty config wins; null reads DEEPSEEK_API_KEY / 配置非空优先；null 时读取 DEEPSEEK_API_KEY
+  api_key: null
+  # Network or structured-output retries / 网络或结构化输出失败重试次数
+  max_retries: 3
+  # Sampling temperature / 生成温度
+  temperature: 0.0
+  # Normal output token cap; null/0 lets provider decide / 普通输出上限；null/0 由服务商决定
+  max_tokens: null
+  # Structured JSON output token cap / 结构化 JSON 输出上限
+  structured_max_tokens: null
+  # Per-request timeout in seconds / 单次请求超时秒数
+  request_timeout_seconds: 180.0
+  # Maximum concurrent LLM requests / LLM 最大并发请求数
+  max_concurrent_requests: 100
+  # Retry malformed JSON responses / JSON 不合法时是否重试
+  enforce_json_retry: true
+  # Cache identical calls locally / 是否缓存完全相同的调用
+  enable_cache: true
+  # Record cache hits in trace logs / 缓存命中是否仍记录轨迹
+  trace_cache_hits: true
+  # null=provider default, true=enabled, false=disabled / 思考模式：null=服务商默认
+  enable_thinking: null
+  # null=provider default; low|medium|high|xhigh|max / 思考强度
+  reasoning_effort: null
+  # Disable thinking for schema-constrained calls / 结构化调用是否关闭思考
+  structured_disable_thinking: true
+
+# Pipeline feature switches / 流程功能开关
+switches:
+  # Run data cognition / 是否运行数据认知
+  run_data_cognition: true
+  # Run task definition and description generation / 是否运行任务定义与 description 生成
+  run_task_definition: true
+  # Inject prompt few-shot examples / 是否注入少样本示例
+  enable_fewshot: false
+  # Enable token-saving Headroom route / 是否启用低 token 的 Headroom 路径
+  optimize_llm_cost: true
+  # Run legacy architect planning call / 是否运行旧版 architect 规划
+  run_architect_plan: false
+  # Run legacy task classifier / 是否运行旧版任务分类器
+  run_legacy_task_classifier: false
+  # Run final full-description polishing call / 是否运行最终全文润色调用
+  run_description_final_composer: false
+  # Generate sample_submission.csv / 是否生成 sample_submission.csv
+  generate_sample_submission: true
+  # Preserve an input description.md as authoritative / 是否优先保留输入中的 description.md
+  prefer_original_description: true
+  # Allow upstream orchestration to bypass AutoRealize / 是否允许上游直接跳过 AutoRealize
+  direct_automl_from_description: false
+  # Fully automatic routing / 是否自动路由
+  auto_mode: true
+
+# Automatic stage routing / 自动阶段路由
+orchestrator:
+  # Enable score-based stage routing / 是否启用按权重评分的阶段路由
+  auto_enable_weighted_routing: true
+  # Data-cognition activation weight / 数据认知权重
+  weight_data_cognition: 1.0
+  # Task-definition activation weight / 任务定义权重
+  weight_task_definition: 1.0
+  # Minimum activation score / 最低激活分数
+  base_min_activation_score: 0.4
+  # Always produce downstream task definition / 是否始终生成下游任务定义
+  always_run_task_definition: true
+
+# Probe failure replanning / 探查失败重规划
+sampling:
+  # LLM replans after a probe failure / 探查失败后的 LLM 重规划次数
+  probe_retry_max: 2
+
+# Input parsing, profiling, and file sampling / 输入解析、画像与文件抽样
+data:
+  # Rows retained in table previews / 表格预览行数
+  preview_rows: 10
+  # Maximum cells retained in previews / 预览最大单元格数量
+  preview_cell_budget: 2000
+  # Rows sampled for deterministic profiling; null means full read / 确定性画像采样行数；null 为全量
+  table_profile_sample_rows: 20000
+  # all|documents_only|none / 单文件 LLM 认知策略
+  llm_file_cognition_mode: "all"
+  # Long-document chunk size for first-stage cognition / 第一阶段长文档认知切片字符数
+  document_cognition_chunk_chars: 12000
+  # Overlap carried as raw boundary text between adjacent chunks / 相邻切片原文重叠字符数
+  document_cognition_chunk_overlap_chars: 300
+  # Facts retained per rolling-memory category / 滚动重点记忆每类最大条数
+  document_cognition_memory_items_per_section: 12
+  # Total rolling-memory character budget / 滚动重点记忆总字符预算
+  document_cognition_memory_max_chars: 18000
+  # Output budget for each rolling-memory update / 每次重点记忆更新输出 token 上限
+  document_cognition_chunk_max_tokens: 4096
+  # File size treated as a large table / 大表判定字节数
+  large_table_threshold_bytes: 268435456
+  # Top categorical values retained / 类别字段保留的高频值数量
+  category_top_k: 10
+  # Numeric outlier z-score threshold / 数值异常值 z-score 阈值
+  outlier_z_threshold: 4.0
+  # Mostly-null ratio threshold / 近乎全空阈值
+  mostly_null_threshold: 0.98
+  # Read image dimensions and metadata / 是否提取图片元数据
+  extract_image_metadata: true
+  # Extract archives in the run copy / 是否在运行副本中解压压缩包
+  enable_archive_extraction: true
+  # Maximum files extracted from one archive / 单压缩包最大解压文件数
+  archive_extract_file_limit: 50000
+  # Keep archive after extraction / 解压后是否保留原压缩包
+  keep_archive_after_extract: true
+  # Compact image directories above this count / 图片目录压缩阈值
+  image_dir_compact_threshold: 80
+  # Images sampled from a compacted directory / 压缩图片目录抽样数
+  image_dir_sample_file_count: 2
+  # Generic filename-pattern grouping threshold / 通用文件名模式分组阈值
+  filename_pattern_min_group: 20
+  # Similar-table sampling threshold / 相似表格抽样阈值
+  similar_table_min_files_to_sample: 3
+  # Compare lightweight headers before merging similar tables / 合并相似表格前是否比较表头
+  similar_table_use_header_signature: true
+  # Representative files for similar-table groups / 相似表格代表文件数
+  similar_table_sample_file_count: 2
+  # Tabular filename-pattern threshold / 表格文件名模式阈值
+  tabular_pattern_min_group: 3
+  # Representatives per tabular pattern / 每个表格模式的代表文件数
+  tabular_pattern_sample_file_count: 2
+  # Validate tabular schema signatures / 是否验证表格结构签名
+  tabular_pattern_use_schema_signature: true
+  # Let the LLM propose filename-grouping regexes / 是否允许 LLM 提出文件名分组正则
+  enable_llm_filename_grouping: true
+  # Filenames shown to the grouping call / 单目录送给分组 LLM 的最大文件名数
+  llm_filename_grouping_max_names: 80
+  # Regex candidates accepted per directory / 单目录最大正则候选数
+  llm_filename_grouping_max_patterns: 6
+  # Files sampled per accepted filename pattern / 每个命名模式抽样文件数
+  pattern_sample_file_count: 3
+  # Text decoding order / 文本编码尝试顺序
+  text_encodings: ["utf-8", "utf-8-sig", "gb18030"]
+  # Nested JSON column separator / JSON 嵌套列分隔符
+  json_flatten_sep: "__"
+  # Nested JSON flatten depth; null means unlimited / JSON 展开深度；null 表示不限
+  json_flatten_max_level: null
+  # Preserve raw nested JSON columns / 是否保留原始嵌套 JSON 列
+  json_keep_raw_nested_columns: false
+  # Generate a synthetic prediction split / 是否生成预测演练切分
+  auto_generate_predict_split: false
+  # Non-time-series split ratio / 非时序预测切分比例
+  generated_predict_split_ratio: 0.2
+  # Time-series prediction horizon days / 时序预测窗口天数
+  generated_predict_horizon_days: 30
+  # Maximum generated sample-submission rows / 自动样例提交最大行数
+  generated_sample_submission_max_rows: 20
+
+# Question-driven cross-file investigation / 问题驱动的跨文件调查
+investigation:
+  # Enable question-driven investigation / 是否启用问题驱动调查
+  enabled: true
+  # always|on_demand|disabled / 调查触发方式
+  trigger_mode: "always"
+  # Maximum questions in one run / 单次最大问题数
+  max_questions: 5
+  # Maximum actions per question / 每个问题最大动作轮数
+  max_rounds_per_run: 6
+  # Follow-up question depth / 子问题最大深度
+  question_bfs_max_depth: 3
+  # Child questions generated per question / 每个问题最大子问题数
+  max_followup_questions_per_question: 3
+  # Permit sandboxed read-only Python / 是否允许沙箱只读 Python
+  allow_custom_readonly_python: true
+  # Script actions per question; document retrieval is separate / 每题脚本次数，文档检索另计
+  max_scripts_per_question: 3
+  # Script timeout seconds / 探查脚本超时秒数
+  custom_python_timeout_seconds: 30.0
+  # Script repair retries / 探查脚本修复次数
+  custom_python_max_retries: 3
+  # Retained stdout/stderr characters / 保留的脚本输出字符数
+  custom_python_max_stdout_chars: 12000
+  # Retained structured result characters / 保留的结构化结果字符数
+  max_result_chars: 20000
+  # Deterministic document retrieval actions per question / 每个问题最多文档取回动作数
+  document_retrievals_per_question: 4
+  # Full-text document chunk size / 全文切片字符数
+  document_chunk_chars: 2200
+  # Neighboring overlap between document chunks / 文档切片重叠字符数
+  document_chunk_overlap_chars: 200
+  # Search hits returned to QDI / 文档检索返回条数
+  document_search_top_k: 5
+  # Maximum document text visible in one retrieval / 单次取回最大可见字符数
+  document_retrieval_max_chars: 12000
+  # Recent actions directly visible to the model / 模型默认直接看到的最近动作数
+  recent_action_count: 3
+  # Visible source code per recent script action / 最近脚本动作可见源码字符数
+  recent_script_chars: 12000
+  # Visible result per recent script action / 最近脚本动作可见结果字符数
+  recent_result_chars: 8000
+  # Visible result per recent context/document retrieval / 最近上下文或文档取回可见字符数
+  recent_retrieval_chars: 8000
+  # Bounded cumulative QDI working memory / QDI 累计工作记忆字符上限
+  working_memory_max_chars: 12000
+  # Old QDI artifact reads per question; separate from script/repair budgets / 每题旧 QDI artifact 取回次数
+  artifact_retrievals_per_question: 2
+  # Visible characters per old QDI artifact read / 单次旧 QDI artifact 取回字符数
+  artifact_retrieval_max_chars: 8000
+  # Rows available to legacy helper probes / 旧探查 helper 最大行数
+  tool_sample_rows: 50000
+  # Rows returned by sample actions / 样本动作最大返回行数
+  max_sample_rows: 20
+
+# Vision-model cognition / 视觉模型认知
+vllm:
+  # Enable image understanding / 是否启用视觉认知
+  enabled: true
+  # Vision-model endpoint / 视觉模型地址
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  # Non-empty config wins; null reads vision env vars / 配置非空优先；null 时读取视觉模型环境变量
+  api_key: null
+  # Vision-model identifier / 视觉模型名称
+  model_name: "glm-4.6v-flashx"
+  # Images sent per directory / 每个图片目录发送的图片数
+  max_images_per_dir: 2
+  # Fall back to metadata when vision fails / 视觉失败时是否静默降级
+  fail_silently: true
+
+# Prompt budgets and description quality gates / 提示词预算与 description 质量门
+prompt:
+  # Approximate prompt token budget / 提示词粗略 token 预算
+  prompt_token_budget: 12000
+  # Budget warning ratio / 预算告警比例
+  prompt_budget_warn_ratio: 0.8
+  # Wide-table column threshold / 宽表列数阈值
+  wide_table_column_threshold: 30
+  # Traceback tail retained in prompts / 提示词保留的 traceback 尾部字符数
+  traceback_tail_chars: 3000
+  # Description repair attempts / description 修复次数
+  description_quality_max_retries: 3
+  # Evaluation-contract total rounds / 评估合同最大轮数
+  evaluation_contract_max_rounds: 3
+  # Evaluation-section reflection rounds / 评估章节反思轮数
+  evaluation_reflection_max_rounds: 3
+  # Structured description-protocol output cap / description 协议输出上限
+  description_protocol_max_tokens: null
+  # Original-requirement characters in protocol calls / 协议调用携带的原始需求字符数
+  description_protocol_original_chars: 10000
+  # Data-digest characters in protocol calls / 协议调用携带的数据摘要字符数
+  description_protocol_data_digest_chars: 8000
+  # Files included in protocol packs / 协议证据包文件数
+  description_protocol_file_limit: 16
+  # Fields included per file / 每文件字段数
+  description_protocol_fields_per_file: 12
+  # zh|en|auto / 最终自然语言
+  output_language: "zh"
+  # Fail or repair references to nonexistent files / 是否严格拒绝不存在的文件引用
+  enforce_description_real_file_refs: true
+
+# Headroom-style context compiler / Headroom 式上下文编译器
+context:
+  # Files materialized into local detailed cards / 本地详细卡片最大文件数
+  table_card_file_limit: 120
+  # Excel sheets materialized into local detailed cards / 本地详细卡片最大 sheet 数
+  table_card_sheet_limit: 80
+  # Fields retained in detailed cards / 详细卡片每表最大字段数
+  table_card_field_limit: 80
+  # Fields retained in stable route-only cards / 稳定路由卡片每表字段数
+  stable_table_card_field_limit: 3
+  # Stable table-card count / 稳定提示词表卡片数量
+  stable_table_card_limit: 48
+  # Stable cards allowed per source file / 单源文件稳定卡片数量
+  stable_table_cards_per_source: 6
+  # Stable relation-card count / 稳定关系卡片数量
+  relation_card_limit: 100
+  # Stable filename-group-card count / 稳定文件名组卡片数量
+  filename_group_card_limit: 80
+  # ArtifactRef visible excerpt length / ArtifactRef 可见摘要字符数
+  artifact_visible_excerpt_chars: 1200
+
+# Deterministic and LLM work concurrency / 确定性任务与 LLM 并发
+parallel:
+  # Parallelize file cognition / 是否并行文件认知
+  enable_parallel_cognition: true
+  # File-cognition workers / 文件认知 worker 数
+  cognition_max_workers: 100
+  # Parallelize relation discovery / 是否并行关系发现
+  enable_parallel_relations: true
+  # Relation-discovery workers / 关系发现 worker 数
+  relations_max_workers: 100
+  # Parallelize probe actions / 是否并行探查动作
+  enable_parallel_probe_actions: true
+  # Probe workers / 探查 worker 数
+  probe_max_workers: 100
+
+# Local knowledge store and retrieval / 本地知识存储与检索
+knowledge:
+  # Enable local knowledge store / 是否启用本地知识库
+  enabled: true
+  # Store filename / 知识库存储文件名
+  store_filename: "knowledge_store.jsonl"
+  # Retrieved entries per task-definition call / 每次检索条数
+  retrieval_top_k: 24
+  # Maximum characters per entry / 单条知识最大字符数
+  max_entry_chars: 2400
+  # Write RAG ingestion manifest / 是否写出 RAG 清单
+  write_rag_manifest: true
+  # Boost constraints, metrics and field glossary / 是否提升约束、指标和字段知识权重
+  boost_structured_knowledge: true
+
+# Event stream, state, and resolved config / 事件流、状态与最终配置
+telemetry:
+  # Enable event stream and current-state snapshots / 是否启用事件流与状态快照
+  enabled: true
+  # Event stream filename / 事件流文件名
+  event_stream_filename: "event_stream.jsonl"
+  # Current-state filename / 当前状态文件名
+  current_state_filename: "current_state.json"
+  # Recent events retained in state / 状态中保留的最近事件数
+  recent_events_limit: 200
+  # Write resolved config into each run / 是否写出最终配置快照
+  write_config_snapshot: true
+  # Resolved YAML filename / 最终生效配置 YAML 文件名
+  config_snapshot_filename: "final_config.yaml"
+  # Write machine-readable config schema / 是否写出配置 schema
+  write_config_schema: true
+  # Machine-readable schema filename / 机器可读 schema 文件名
+  config_schema_filename: "config_schema.json"
+
+# Human-readable and dependency logs / 人类可读日志与依赖日志
+logging:
+  # DEBUG|INFO|WARNING|ERROR / 根日志级别
+  level: "INFO"
+  # Print raw event records / 是否打印原始事件字段
+  raw_event_log: false
+  # Level for noisy SDK loggers / 高噪声依赖日志级别
+  noisy_logger_level: "WARNING"
+  # Logger names to suppress / 需要降噪的 logger
+  noisy_loggers: ["autorealize.llm.client", "autorealize.cognition", "httpx", "openai"]
+
+# Service API lifecycle and frontend snapshots / 服务 API 生命周期与前端快照
+service:
+  # stdout/stderr characters returned by job status / 任务状态返回的日志尾部字符数
+  job_status_tail_chars: 60000
+  # stdout/stderr characters persisted by the service / 服务落盘保存的日志尾部字符数
+  captured_log_tail_chars: 200000
+  # Last-error summary characters / 最后错误摘要最大字符数
+  last_error_chars: 1200
+  # Events returned by one frontend snapshot / 单次前端快照返回事件数
+  snapshot_event_limit: 400
+  # Maximum nodes in the rendered output tree / 快照目录树最大节点数
+  snapshot_tree_max_nodes: 6000
+  # Per-file cognition records returned by one snapshot / 单次快照文件认知记录数
+  snapshot_file_cognition_limit: 400
+  # Markdown characters retained per cognition record / 每条文件认知保留 Markdown 字符数
+  snapshot_file_markdown_chars: 50000
+  # Graceful wait before force-kill / 停止任务后强杀前等待秒数
+  stop_wait_seconds: 15.0
+  # Service-captured stdout filename / 服务捕获 stdout 文件名
+  stdout_filename: "_service_stdout.log"
+  # Service-captured stderr filename / 服务捕获 stderr 文件名
+  stderr_filename: "_service_stderr.log"
+
+# Default run root used by direct CLI/programmatic runs / 直接运行时默认输出根目录
+run_root: "runs"

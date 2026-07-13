@@ -7,6 +7,8 @@ import pandas as pd
 from autorealize.config import AutoRealizeConfig
 from autorealize.investigation import (
     CrossFileInvestigationTools,
+    _available_qdi_actions,
+    _terminal_qdi_actions,
     run_custom_readonly_python,
     validate_custom_readonly_python,
 )
@@ -144,3 +146,62 @@ def analyze(input_dir: str, scratch_dir: str) -> dict:
 
     assert "banned_import:os" in issues
     assert "banned_import:requests" in issues
+
+
+def test_custom_python_static_validation_allows_local_analytics_imports() -> None:
+    issues = validate_custom_readonly_python(
+        """
+import polars as pl
+import pyarrow as pa
+import scipy.stats
+from networkx import Graph
+from rapidfuzz import fuzz
+from sklearn.metrics import mean_squared_error
+from statsmodels import api as sm
+
+def analyze(input_dir: str, scratch_dir: str) -> dict:
+    return {"ok": True}
+"""
+    )
+
+    assert issues == []
+
+
+def test_document_retrieval_actions_do_not_depend_on_script_budget() -> None:
+    actions = _available_qdi_actions(
+        question_records={"q1": {"question_id": "q1", "depth": 0}},
+        current_record={"question_id": "q1", "depth": 0},
+        scripts_for_question=3,
+        context_retrievals_for_question=2,
+        document_retrievals_for_question=0,
+        has_documents=True,
+        max_document_retrievals=4,
+        total_scripts=10,
+        max_scripts_per_question=3,
+        max_scripts_total=10,
+        max_total_questions=5,
+        max_depth=3,
+        max_followups_per_question=3,
+        allow_custom_readonly_python=True,
+    )
+
+    assert "request_script" not in actions
+    assert "search_document" in actions
+    assert "read_document_chunks" in actions
+
+
+def test_last_qdi_round_keeps_only_terminal_actions() -> None:
+    actions = _terminal_qdi_actions(
+        [
+            "answer",
+            "request_script",
+            "search_document",
+            "read_qdi_artifact_excerpt",
+            "add_followup_questions",
+            "give_up",
+            "refine_current_question",
+            "mark_duplicate",
+        ]
+    )
+
+    assert actions == ["answer", "add_followup_questions", "give_up", "mark_duplicate"]
