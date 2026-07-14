@@ -479,6 +479,9 @@ class QuestionInvestigationReport(BaseModel):
     action_history: list[dict[str, Any]] = Field(default_factory=list)
     action_digest_cards: list[dict[str, Any]] = Field(default_factory=list)
     working_memory_cards: list[dict[str, Any]] = Field(default_factory=list)
+    # Live progress is persisted throughout QDI so the frontend does not have to
+    # wait for the final report before showing useful investigation state.
+    progress: dict[str, Any] = Field(default_factory=dict)
 
 
 class LLMTrace(BaseModel):

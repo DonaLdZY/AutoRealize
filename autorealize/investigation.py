@@ -175,6 +175,54 @@ def _run_question_investigator_inner(
     max_scripts_total = max_total_questions * max_scripts_per_question
     max_output_chars = int(getattr(cfg.investigation, "max_result_chars", 20000))
 
+    live_report_path = (report_dir / "question_investigation_report.json") if report_dir is not None else None
+
+    def persist_live_report(
+        *,
+        phase: str,
+        summary: str,
+        current_question_id: str = "",
+        current_action: str = "",
+        action_round: int = 0,
+    ) -> None:
+        if live_report_path is None:
+            return
+        live_report = QuestionInvestigationReport(
+            enabled=True,
+            summary=summary,
+            questions=list(all_questions.values()),
+            script_requests=[req.custom_python for req in all_requests if req.custom_python.python_code],
+            tool_requests=all_requests,
+            step_results=all_results,
+            answers=answers,
+            unresolved_questions=list(dict.fromkeys(unresolved_questions))[:80],
+            context_routing_notes=list(dict.fromkeys(routing_notes))[:80],
+            question_records=_question_records_for_prompt(question_records),
+            action_history=action_history[:200],
+            action_digest_cards=action_digest_cards[:200],
+            working_memory_cards=list(working_memory_cards.values()),
+            progress={
+                "phase": phase,
+                "current_question_id": current_question_id,
+                "current_action": current_action,
+                "action_round": action_round,
+                "queued_questions": len(queue),
+                "total_questions": len(question_records),
+                "resolved_questions": len(answers),
+                "unresolved_questions": len(
+                    [record for record in question_records.values() if record.get("status") == "unresolved"]
+                ),
+                "actions": len(action_history),
+                "script_attempts": len(all_results),
+            },
+        )
+        _write_report(live_report_path, live_report.model_dump())
+
+    persist_live_report(
+        phase="planning",
+        summary="QDI 正在根据数据认知结果规划需要进一步核实的问题。",
+    )
+
     stable, dynamic = stable_dynamic_prompt(
         stable=context,
         dynamic={
@@ -213,6 +261,9 @@ def _run_question_investigator_inner(
                 "module.data_cognition.investigator",
                 "AUTO_ENTITY_ALIAS_QUESTION_QUEUED",
                 question_id=qid,
+                question=str(question_records[qid].get("question") or "")[:500],
+                category=str(question_records[qid].get("category") or ""),
+                priority=str(question_records[qid].get("priority") or "medium"),
                 depth=0,
             )
 
@@ -227,7 +278,16 @@ def _run_question_investigator_inner(
             max_total_questions=max_total_questions,
         )
         if qid:
-            log_event(logger, "module.data_cognition.investigator", "QUESTION_QUEUED", question_id=qid, depth=0)
+            log_event(
+                logger,
+                "module.data_cognition.investigator",
+                "QUESTION_QUEUED",
+                question_id=qid,
+                question=str(question_records[qid].get("question") or "")[:500],
+                category=str(question_records[qid].get("category") or ""),
+                priority=str(question_records[qid].get("priority") or "medium"),
+                depth=0,
+            )
 
     if not queue and (plan.script_requests or plan.tool_requests):
         for script in (plan.script_requests or [])[:max_total_questions]:
@@ -248,6 +308,11 @@ def _run_question_investigator_inner(
                 max_total_questions=max_total_questions,
             )
 
+    persist_live_report(
+        phase="questions_queued",
+        summary=f"QDI 已规划 {len(question_records)} 个调查问题，准备逐项核实。",
+    )
+
     seen_request_keys: set[str] = set()
     while queue:
         qid = queue.pop(0)
@@ -256,6 +321,21 @@ def _run_question_investigator_inner(
         if not record or question is None or record.get("status") not in {"pending", "refined"}:
             continue
         record["status"] = "investigating"
+        log_event(
+            logger,
+            "module.data_cognition.investigator",
+            "QUESTION_STARTED",
+            question_id=qid,
+            question=str(record.get("question") or "")[:500],
+            category=str(record.get("category") or ""),
+            priority=str(record.get("priority") or "medium"),
+            depth=int(record.get("depth", 0) or 0),
+        )
+        persist_live_report(
+            phase="investigating",
+            summary=f"QDI 正在调查问题：{str(record.get('question') or qid)[:300]}",
+            current_question_id=qid,
+        )
         current_result: InvestigationStepResult | None = None
         current_request: InvestigationToolRequest | None = None
         scripts_for_question = 0
@@ -294,6 +374,13 @@ def _run_question_investigator_inner(
             )
             if action_round >= max_actions_per_question:
                 available_actions = _terminal_qdi_actions(available_actions)
+            persist_live_report(
+                phase="deciding_action",
+                summary=f"QDI 正在为问题 {qid} 决定第 {action_round} 个调查动作。",
+                current_question_id=qid,
+                current_action="decide_next_action",
+                action_round=action_round,
+            )
             pending_digest_requests = _pending_action_digest_requests(
                 action_history,
                 action_digest_cards,
@@ -354,6 +441,15 @@ def _run_question_investigator_inner(
                 dynamic_user_prompt=dynamic,
             )
             action_name = str(action.action or "").strip().lower()
+            log_event(
+                logger,
+                "module.data_cognition.investigator",
+                "ACTION_SELECTED",
+                question_id=qid,
+                action=action_name,
+                action_round=action_round,
+                notes=str(action.notes or "")[:500],
+            )
             applied_digest_sequences = _apply_action_digest_updates(
                 action_history,
                 action_digest_cards,
@@ -393,6 +489,13 @@ def _run_question_investigator_inner(
                 max_chars=int(getattr(cfg.investigation, "working_memory_max_chars", 12000)),
             )
             working_memory_cards[qid] = working_memory
+            persist_live_report(
+                phase="executing_action",
+                summary=f"QDI 正在执行问题 {qid} 的动作：{action_name or 'unknown'}。",
+                current_question_id=qid,
+                current_action=action_name,
+                action_round=action_round,
+            )
             if action_name not in available_actions:
                 entry["status"] = "illegal_action"
                 live_entry["observation"] = {"status": "illegal_action", "available_actions": available_actions}
@@ -720,12 +823,39 @@ def _run_question_investigator_inner(
                     attempts=len(attempt_results),
                     error=current_result.error[:240],
                 )
+                persist_live_report(
+                    phase="script_completed" if current_result.status == "completed" else "script_failed",
+                    summary=(
+                        f"问题 {qid} 的只读脚本已完成，正在分析结果。"
+                        if current_result.status == "completed"
+                        else f"问题 {qid} 的只读脚本失败，正在决定修复或改用其他证据。"
+                    ),
+                    current_question_id=qid,
+                    current_action=action_name,
+                    action_round=action_round,
+                )
                 continue
 
         if record.get("status") in {"investigating", "refined"}:
             record["status"] = "unresolved"
             record["unresolved_reason"] = "QDI action rounds exhausted before a final answer."
             unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
+
+        log_event(
+            logger,
+            "module.data_cognition.investigator",
+            "QUESTION_COMPLETED",
+            question_id=qid,
+            question=str(record.get("question") or "")[:500],
+            question_status=str(record.get("status") or ""),
+            short_answer=str(record.get("short_answer") or "")[:500],
+            unresolved_reason=str(record.get("unresolved_reason") or "")[:500],
+        )
+        persist_live_report(
+            phase="question_completed",
+            summary=f"QDI 已完成问题 {qid}，状态：{str(record.get('status') or 'unknown')}。",
+            current_question_id=qid,
+        )
 
     summary = (
         f"问题驱动研究完成：初始问题 {len(plan.questions or [])} 个，"
@@ -747,6 +877,20 @@ def _run_question_investigator_inner(
         action_history=action_history[:200],
         action_digest_cards=action_digest_cards[:200],
         working_memory_cards=list(working_memory_cards.values()),
+        progress={
+            "phase": "completed",
+            "current_question_id": "",
+            "current_action": "",
+            "action_round": 0,
+            "queued_questions": 0,
+            "total_questions": len(question_records),
+            "resolved_questions": len(answers),
+            "unresolved_questions": len(
+                [record for record in question_records.values() if record.get("status") == "unresolved"]
+            ),
+            "actions": len(action_history),
+            "script_attempts": len(all_results),
+        },
     )
     log_event(
         logger,
