@@ -245,7 +245,26 @@ def _run_question_investigator_inner(
         static_context_prompt=stable,
         dynamic_user_prompt=dynamic,
     )
-    for q in _entity_alias_verification_questions(context):
+    if bool(getattr(cfg.investigation, "adaptive_budgeting", True)):
+        if int(plan.recommended_max_questions or 0) > 0:
+            max_total_questions = min(max_total_questions, max(1, int(plan.recommended_max_questions)))
+        if int(plan.recommended_max_actions_per_question or 0) > 0:
+            max_actions_per_question = min(
+                max_actions_per_question,
+                max(1, int(plan.recommended_max_actions_per_question)),
+            )
+        max_scripts_total = max_total_questions * max_scripts_per_question
+    automatic_questions = _select_auto_verification_questions(
+        entity_alias_questions=_entity_alias_verification_questions(context),
+        population_questions=_population_verification_questions(context),
+        relation_questions=_relation_verification_questions(context),
+        reading_strategy_questions=_reading_strategy_verification_questions(context),
+        limit=min(
+            max(0, int(getattr(cfg.investigation, "automatic_verification_question_limit", 4))),
+            max(0, max_total_questions - (1 if plan.questions and not plan.ready_to_answer else 0)),
+        ),
+    )
+    for q in automatic_questions:
         qid = _add_question_record(
             question=q,
             all_questions=all_questions,
@@ -259,7 +278,7 @@ def _run_question_investigator_inner(
             log_event(
                 logger,
                 "module.data_cognition.investigator",
-                "AUTO_ENTITY_ALIAS_QUESTION_QUEUED",
+                "AUTO_VERIFICATION_QUESTION_QUEUED",
                 question_id=qid,
                 question=str(question_records[qid].get("question") or "")[:500],
                 category=str(question_records[qid].get("category") or ""),
@@ -267,7 +286,8 @@ def _run_question_investigator_inner(
                 depth=0,
             )
 
-    for q in (plan.questions or [])[: max(0, max_total_questions - len(question_records))]:
+    planner_questions = [] if plan.ready_to_answer else (plan.questions or [])
+    for q in planner_questions[: max(0, max_total_questions - len(question_records))]:
         qid = _add_question_record(
             question=q,
             all_questions=all_questions,
@@ -1079,23 +1099,32 @@ def _entity_alias_verification_questions(context: dict[str, Any]) -> list[Invest
     for group in groups[:6]:
         if not isinstance(group, dict):
             continue
+        routing = group.get("qdi_routing") if isinstance(group.get("qdi_routing"), dict) else {}
+        if routing and not bool(routing.get("recommended")):
+            continue
         raw_fields = group.get("candidate_fields")
         fields = [item for item in raw_fields if isinstance(item, dict)] if isinstance(raw_fields, list) else []
-        alias_families = {
-            str(item.get("alias_family", "")).strip()
-            for item in fields
-            if str(item.get("alias_family", "")).strip()
-        }
         value_kinds = {
             str(item.get("value_kind", "")).strip()
             for item in fields
             if str(item.get("value_kind", "")).strip()
         }
-        if len(fields) < 2 or len(alias_families) < 2:
+        distinct_field_refs = {
+            (
+                str(item.get("source_collection", "") or item.get("source_file", "")),
+                str(item.get("field", "")),
+            )
+            for item in fields
+        }
+        if len(distinct_field_refs) < 2:
             continue
 
         candidate_files = _dedupe_qdi_strings(
             [str(item.get("source_file", "")) for item in fields],
+            limit=12,
+        )
+        source_collections = _dedupe_qdi_strings(
+            [str(item.get("source_collection", "")) for item in fields],
             limit=12,
         )
         field_refs = []
@@ -1108,6 +1137,11 @@ def _entity_alias_verification_questions(context: dict[str, Any]) -> list[Invest
             table_ref = f"{source}::{sheet}" if sheet else source
             field_refs.append(f"{table_ref}.{field}")
         label = str(group.get("label") or "实体别名候选字段").strip()
+        semantic_reason = str(group.get("reason", "") or "").strip()
+        evidence_status = str(group.get("evidence_status", "semantic_candidate") or "semantic_candidate")
+        relevance = str(group.get("task_relevance", "medium") or "medium")
+        deterministic_coverage = group.get("deterministic_group_coverage") if isinstance(group.get("deterministic_group_coverage"), dict) else {}
+        directional_coverage = deterministic_coverage.get("directional_coverage") if isinstance(deterministic_coverage.get("directional_coverage"), list) else []
         concept_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(group.get("concept_id") or len(out) + 1)).strip("_")
         question_id = f"auto_entity_alias_{concept_id or len(out) + 1}"
         out.append(
@@ -1116,22 +1150,189 @@ def _entity_alias_verification_questions(context: dict[str, Any]) -> list[Invest
                 question=(
                     f"验证 `{label}` 是否可以作为同一实体键使用：对候选字段 "
                     f"{'、'.join(field_refs) if field_refs else '见 entity_alias_candidates'} "
-                    "分别统计非空数量、唯一值数量、两两唯一值交集、left/right coverage 和 join coverage。"
-                    "特别检查成本/合同侧字段能否覆盖车辆、订单或资源侧字段；如果存在起点、终点、车型、线路或成本字段，"
-                    "进一步检查线路/车型/成本可行性覆盖率。不要预设这些字段等价；覆盖率不足时记录未确认映射、"
-                    "无可用合同线路或需要人工确认的原因。"
+                    f"分别统计非空数量、唯一值数量、两两唯一值交集、left/right coverage 和 join coverage。"
+                    f"候选来源集合为 {source_collections or candidate_files}；先在每个 source_collection 内按 alias_family "
+                    "读取全部成员文件并对唯一值取并集，再计算集合之间的方向性覆盖率，不能用单个文件代表整个集合。"
+                    f"程序已计算的集合并集方向性覆盖证据为 {directional_coverage[:8]}；先复核并解释该证据，"
+                    "只有 read_errors 或缺少目标集合时才重新编写脚本计算实体键覆盖。"
+                    f"LLM 提出候选的语义理由为：{semantic_reason or '字段语义和来源角色可能相关'}。"
+                    f"当前 evidence_status={evidence_status}，task_relevance={relevance}。"
+                    "不要预设这些字段等价；覆盖率不足或方向明显不对称时，记录未确认映射及其对下游 join/筛选的影响。"
+                    "脚本应使用 pathlib/pandas，先对实际列名做 strip 后保留原名映射，"
+                    "并分别输出 `left_covered_by_right_ratio` 与 `right_covered_by_left_ratio` 的明确分母。"
                 ),
                 category="join_key",
                 why_blocking=(
-                    "承运商代码、结算方代码、承运商名称、结算方名称这类字段可能指向同一业务实体，"
-                    "也可能只是承运主体/结算主体的候选别名；错误等价会直接导致合同线路覆盖率、"
-                    "可行车辆池、动作 mask 和优化评分错误。"
+                    "名称不同但语义相近的字段可能表示同一实体，也可能只是相关但不等价的属性；"
+                    "错误合并会使跨表 join、覆盖口径、特征构造或约束判断失真。"
                 ),
                 candidate_files=candidate_files,
-                priority="high" if "code" in value_kinds else "medium",
+                priority="high" if relevance == "high" or "code" in value_kinds else "medium",
             )
         )
     return out
+
+
+def _population_verification_questions(context: dict[str, Any]) -> list[InvestigationQuestion]:
+    candidates = context.get("population_verification_queue") if isinstance(context, dict) else []
+    if not isinstance(candidates, list):
+        return []
+    out: list[InvestigationQuestion] = []
+    for idx, item in enumerate(candidates[:4], start=1):
+        if not isinstance(item, dict):
+            continue
+        table_id = str(item.get("table_id", "") or "").strip()
+        sensitive = item.get("population_sensitive_fields") if isinstance(item.get("population_sensitive_fields"), list) else []
+        if not table_id or not sensitive:
+            continue
+        out.append(
+            InvestigationQuestion(
+                question_id=f"auto_population_{idx}",
+                question=(
+                    f"核验 `{table_id}` 的评估/决策人口口径。程序证据：verified_row_count={item.get('verified_row_count')}，"
+                    f"最佳统计主键候选={item.get('best_statistical_key_candidate')}，人口敏感字段={sensitive}。"
+                    "结合权威任务文本判断：评估应覆盖全部主键，还是只覆盖必需字段有效的实体；给出 eligibility rule、"
+                    "eligible count、excluded count、逐类排除原因与无法派生时的处理。异常日期只能作为 sentinel 候选，"
+                    "不得未经原文或分布核验直接排除。不要混用 worksheet used range、解析行数、唯一主键数和非空行数。"
+                ),
+                category="evaluation_population",
+                why_blocking=(
+                    "人口口径会同时决定输出完整性、未分配/缺失惩罚、评估分母和最终分数；"
+                    "若把物理行数、唯一实体数或必需字段有效数混为一谈，后续评价不可复现。"
+                ),
+                candidate_files=[table_id.split("::", 1)[0]],
+                priority="high",
+            )
+        )
+    return out
+
+
+def _relation_verification_questions(context: dict[str, Any]) -> list[InvestigationQuestion]:
+    candidates = context.get("relation_verification_queue") if isinstance(context, dict) else []
+    if not isinstance(candidates, list):
+        return []
+    out: list[InvestigationQuestion] = []
+    for idx, item in enumerate(candidates[:6], start=1):
+        if not isinstance(item, dict):
+            continue
+        left_file = str(item.get("left_file", "") or "")
+        right_file = str(item.get("right_file", "") or "")
+        left_field = str(item.get("left_field", "") or "")
+        right_field = str(item.get("right_field", "") or "")
+        if not left_file or not right_file or not left_field or not right_field:
+            continue
+        out.append(
+            InvestigationQuestion(
+                question_id=f"auto_relation_{idx}",
+                question=(
+                    f"核验 `{left_file}`.`{left_field}` 与 `{right_file}`.`{right_field}` 是否是当前任务可用的关联键。"
+                    "必须计算双向非空唯一值覆盖率、交集、重复/基数和匹配行比例，并区分业务同义、部分映射与偶然值重叠。"
+                ),
+                category="join_key",
+                why_blocking="错误关联会污染约束、评估人口、输出映射和下游 join。",
+                candidate_files=[left_file.split("::", 1)[0], right_file.split("::", 1)[0]],
+                priority="high",
+            )
+        )
+    return out
+
+
+def _reading_strategy_verification_questions(context: dict[str, Any]) -> list[InvestigationQuestion]:
+    cards = context.get("table_cards") if isinstance(context, dict) else []
+    if not isinstance(cards, list):
+        return []
+    markers = [
+        "header",
+        "skiprows",
+        "inspect",
+        "sheet",
+        "dialect",
+        "encoding",
+        "表头",
+        "工作表",
+        "读取",
+        "解析",
+        "文档式",
+    ]
+    out: list[InvestigationQuestion] = []
+    for idx, card in enumerate(cards, start=1):
+        if not isinstance(card, dict):
+            continue
+        table_id = str(card.get("table_id", "") or "")
+        notes = [str(x) for x in (card.get("reading_notes") or [])]
+        warnings = [str(x) for x in (card.get("warnings") or [])]
+        evidence = notes + warnings
+        text = " ".join(evidence).lower()
+        if not table_id or not evidence or not any(marker in text for marker in markers):
+            continue
+        out.append(
+            InvestigationQuestion(
+                question_id=f"auto_reading_{idx}",
+                question=(
+                    f"核验 `{table_id}` 的实际读取合同。当前候选提示为：{evidence[:6]}。"
+                    "请确认精确 sheet、header/skiprows、编码或分隔符；必须通过试读后的真实列稳定性和数据行证据验证。"
+                ),
+                category="data_access",
+                why_blocking="读取参数错误会使后续所有字段语义、关系和评估结论建立在错误表格上。",
+                candidate_files=[table_id.split("::", 1)[0]],
+                priority="high",
+            )
+        )
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _select_auto_verification_questions(
+    *,
+    entity_alias_questions: list[InvestigationQuestion],
+    population_questions: list[InvestigationQuestion],
+    limit: int,
+    relation_questions: list[InvestigationQuestion] | None = None,
+    reading_strategy_questions: list[InvestigationQuestion] | None = None,
+) -> list[InvestigationQuestion]:
+    """Reserve a small, diverse part of the QDI budget for evidence checks."""
+
+    if limit <= 0:
+        return []
+    pools = [
+        list(entity_alias_questions or []),
+        list(population_questions or []),
+        list(relation_questions or []),
+        list(reading_strategy_questions or []),
+    ]
+    selected: list[InvestigationQuestion] = []
+    seen: set[str] = set()
+
+    # Take one from each evidence family first, then fill any remaining slots.
+    for pool in pools:
+        if not pool:
+            continue
+        question = pool.pop(0)
+        signature = re.sub(r"\s+", "", str(question.question or "")).casefold()
+        if signature and signature not in seen:
+            seen.add(signature)
+            selected.append(question)
+        if len(selected) >= limit:
+            return selected
+
+    remaining = [question for pool in pools for question in pool]
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    remaining.sort(
+        key=lambda question: (
+            priority_rank.get(str(question.priority or "medium").lower(), 1),
+            str(question.question_id or ""),
+        )
+    )
+    for question in remaining:
+        signature = re.sub(r"\s+", "", str(question.question or "")).casefold()
+        if not signature or signature in seen:
+            continue
+        seen.add(signature)
+        selected.append(question)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _dedupe_qdi_strings(values: list[str], *, limit: int = 12) -> list[str]:

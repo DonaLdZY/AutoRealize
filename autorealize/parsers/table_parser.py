@@ -206,6 +206,14 @@ class TableParser(BaseParser):
         if estimated:
             summary += "（CSV 行数快速估计，字段类型基于预览切片）"
         dialect = infer_csv_dialect(path) if path.suffix.lower() == ".csv" else None
+        encoding = detect_csv_encoding(path) if path.suffix.lower() == ".csv" else ""
+        read_contract = self._csv_read_contract(
+            path=path,
+            df=df,
+            row_count=row_count,
+            dialect=dialect,
+            encoding=encoding,
+        ) if dialect else {}
         return ParsedFile(
             path=path,
             kind=self.kind,
@@ -218,9 +226,75 @@ class TableParser(BaseParser):
                 "preview_rows_used": int(len(df)),
                 "dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
                 "csv_dialect": dialect.__dict__ if dialect else None,
-                "csv_encoding": detect_csv_encoding(path) if path.suffix.lower() == ".csv" else "",
+                "csv_encoding": encoding,
+                "csv_read_contract": read_contract,
                 "excel_sheet_names": excel_sheet_names,
                 "excel_default_sheet": excel_sheet_names[0] if excel_sheet_names else "",
                 "source_format": path.suffix.lower().lstrip("."),
             },
         )
+
+    def _csv_read_contract(
+        self,
+        *,
+        path: Path,
+        df: pd.DataFrame,
+        row_count: int,
+        dialect: Any,
+        encoding: str,
+    ) -> dict[str, Any]:
+        pandas_kwargs: dict[str, Any] = {
+            "sep": dialect.sep,
+            "encoding": encoding or "utf-8-sig",
+        }
+        if dialect.engine:
+            pandas_kwargs["engine"] = dialect.engine
+        if dialect.decimal:
+            pandas_kwargs["decimal"] = dialect.decimal
+
+        boolean_like: dict[str, dict[str, Any]] = {}
+        nullable_observed: list[str] = []
+        boolean_tokens = {"0", "1", "true", "false", "yes", "no", "y", "n"}
+        for column in df.columns:
+            series = df[column]
+            if bool(series.isna().any()):
+                nullable_observed.append(str(column))
+            values = [str(value).strip().lower() for value in series.dropna().unique()[:12]]
+            normalized = set(values)
+            name = str(column).strip().lower()
+            singleton_boolean_hint = any(
+                token in name
+                for token in [" is ", " has ", "flag", "bool", "multiple", "enabled", "active", "valid"]
+            )
+            if (
+                normalized
+                and len(normalized) <= 8
+                and normalized <= boolean_tokens
+                and (len(normalized) > 1 or singleton_boolean_hint)
+            ):
+                representation = (
+                    "numeric_0_1" if normalized <= {"0", "1"} else "string_boolean_tokens"
+                )
+                boolean_like[str(column)] = {
+                    "representation": representation,
+                    "observed_values": values,
+                }
+
+        return {
+            "schema_version": "autorealize.csv_read_contract.v1",
+            "verified": True,
+            "path": str(path.name),
+            "reader": "pandas.read_csv",
+            "pandas_kwargs": pandas_kwargs,
+            "validated_shape": [int(row_count), int(df.shape[1])],
+            "validated_columns_exact": [str(column) for column in df.columns],
+            "validated_dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
+            "preview_rows_validated": int(len(df)),
+            "nullable_columns_observed": nullable_observed,
+            "boolean_like_columns": boolean_like,
+            "validation_rules": [
+                "Use these pandas_kwargs for this source file.",
+                "After reading, compare df.columns.tolist() with validated_columns_exact before renaming.",
+                "Treat boolean_like_columns according to observed representation; do not assume string values.",
+            ],
+        }

@@ -30,7 +30,7 @@
 - 如有“总样本数/订单数/可评估订单数”依赖某个日期、场景或有效性字段，必须说明该数量的来源和过滤条件；不得把原始行数、唯一主键数或非空日期行数混为一谈。
 - 如有硬约束、可行性约束、非法动作或非法输出，要在 invalid_solution_rules 中明确处理方式，例如整份提交无效、该行/该订单视为未分配、施加惩罚、动作被屏蔽或 episode 终止；如果问题没有硬约束，就不要编造非法解规则。
 - 如有训练/验证/测试、时间切分、仿真回放、episode、随机环境或外部评分服务，要在 validation_protocol 中明确可重复的验证协议；如果任务不需要训练/验证切分，就说明使用固定测试实例、官方回放环境或外部评估器。
-- 如有权重、惩罚系数、上界或外部配置值缺失，普通 review 轮可以 passed=false 并写 issues/fixes；最终合同生成轮必须把它转成明确的评估假设、外部评估配置参数或可由输入数据上界推导的默认规则，同时在 rationale/evidence 中说明来源和假设性质。
+- 如有权重、惩罚系数、上界或外部配置值缺失，可以把它转成明确的评估假设、外部评估配置参数或可由输入数据上界推导的默认规则，同时在 assumptions、rationale 和 evidence 中说明来源和假设性质。不得把 AutoRealize 假设伪装成官方规则。
 
 多目标和主次目标的强约束：
 - 如果原始任务包含主次优先级、字典序、tie-break、约束优先级或多个业务目标，不要把其中某个中间量写成主指标。必须在 `metric_formula` 中写成一个完整可比较标量，且 `primary_metric` 命名为这个最终分数。
@@ -47,6 +47,8 @@
 
 输出字段说明：
 - passed: 合同是否已足够严格。
+- executable: 当前合同是否已经可以由代码执行。它与是否来自官方规则是两个维度。
+- authority_status: `official`、`autorealize_assumption` 或 `unresolved`。
 - primary_metric: 唯一最终评分指标名称；必须对应 `metric_formula` 的最终分数。
 - metric_direction: 只能是 minimize 或 maximize。
 - metric_formula: 最终排序使用的唯一数值公式。不要写中间指标、基础指标或另一个与最终排名不同的 reward/score。
@@ -62,6 +64,8 @@
 - invalid_solution_rules: 非法解/异常输出处理规则。
 - tie_break_rules: 只有在已经被 `metric_formula` 等价吸收后才可保留为解释；不得与 `metric_formula` 矛盾。
 - audit_metrics: 只用于诊断、不改变排名的指标。
+- assumptions: 当前可执行公式中由 AutoRealize 定义、由数据上界推导或要求外部配置提供的假设。
+- residual_issues: 合同虽然可执行，但仍需要使用者知晓的证据风险或正式部署前确认事项。
 - issues/fixes/evidence/rationale: 审查依据、问题与修复说明。
 
 判定原则：
@@ -73,9 +77,12 @@
 
 最终合同生成轮：
 - 如果动态输入包含 `finalizer_instruction`，你不再是只负责指出问题的 reviewer，而是最终评估合同作者。
-- 最终合同生成轮必须设置 `passed=true`，并给出完整、可执行、面向人类可读的合同字段。
+- 最终合同生成轮应尽量给出完整、可执行、面向人类可读的合同字段，但不得为了通过而隐瞒证据缺口。
+- 如果公式在明确 assumptions 或外部配置下可执行，设置 `executable=true`、`passed=true`、`authority_status=autorealize_assumption`，并保留 assumptions/residual_issues。
+- 如果官方材料已经完整定义口径，设置 `executable=true`、`passed=true`、`authority_status=official`。
+- 如果缺失信息导致任何合理假设下仍无法形成唯一标量，设置 `executable=false`、`passed=false`、`authority_status=unresolved`，并保留 issues/fixes。
 - 如果官方材料缺少唯一公式、权重、惩罚、非法解处理或提交校验，必须把缺口转化为明确的 AutoRealize-defined evaluation assumption、外部评估配置参数或可由数据上界推导的默认规则；不要留下空字段。
-- 最终合同生成轮的 `issues` 和 `fixes` 必须为空；已发现的问题要吸收到 `metric_formula`、`validation_protocol`、`submission_checks`、`leakage_guards`、`invalid_solution_rules`、`tie_break_rules`、`audit_metrics`、`evidence` 或 `rationale` 中。
+- 不要清空仍然真实存在的问题。已经通过 assumptions 解决的缺口进入 assumptions/residual_issues；仍阻塞执行的缺口保留在 issues/fixes。
 - 仍然不能编造不存在的数据字段、官方样例列、车牌号、车辆唯一 ID 或官方规则；缺少实体 ID 时，只能描述方案输出中的确定性派生 ID、占位资源 ID 或外部配置 ID。
 
 只输出 JSON。

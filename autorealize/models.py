@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 ShortReviewText = Annotated[str, StringConstraints(max_length=240)]
 
@@ -72,10 +72,29 @@ class PipelinePlan(BaseModel):
     submission_spec: str
 
 
+class RLFormulationCandidate(BaseModel):
+    """Evidence-grounded way to turn a decision problem into an RL process."""
+
+    formulation_type: str = "constructive_policy"
+    state_candidates: list[str] = Field(default_factory=list)
+    action_candidates: list[str] = Field(default_factory=list)
+    transition_description: str = ""
+    action_mask_basis: list[str] = Field(default_factory=list)
+    reward_alignment: str = ""
+    terminal_condition: str = ""
+    episode_generation: str = ""
+    generalization_target: str = "instance_specific"
+    evidence_refs: list[str] = Field(default_factory=list)
+    unresolved_points: list[str] = Field(default_factory=list)
+
+
 class ProblemParadigmReview(BaseModel):
-    """Problem paradigm routing result used before writing description.md."""
+    """Problem-structure and method-policy routing result."""
 
     problem_paradigm: str = "unknown_but_executable"
+    problem_structure: str = "unknown"
+    decision_temporality: str = "not_applicable"
+    environment_source: str = "not_applicable"
     confidence: float = 0.0
     reasoning: str = ""
     evidence: list[str] = Field(default_factory=list)
@@ -84,8 +103,12 @@ class ProblemParadigmReview(BaseModel):
     output_contract_source: str = ""
     explicit_rl_requested: bool = False
     rl_as_required_paradigm: bool = False
+    rl_required: bool = False
+    required_method_families: list[str] = Field(default_factory=list)
+    allowed_method_families: list[str] = Field(default_factory=list)
     recommended_solver_families: list[str] = Field(default_factory=list)
     method_routing_notes: list[str] = Field(default_factory=list)
+    rl_formulation_candidates: list[RLFormulationCandidate] = Field(default_factory=list)
 
 
 class DataAccessFileProtocol(BaseModel):
@@ -95,6 +118,7 @@ class DataAccessFileProtocol(BaseModel):
     file_role: str = ""
     read_method: str = ""
     read_example: str = ""
+    read_contract: dict[str, Any] = Field(default_factory=dict)
     row_grain: str = ""
     key_fields: list[str] = Field(default_factory=list)
     target_fields: list[str] = Field(default_factory=list)
@@ -230,6 +254,12 @@ class DescriptionProtocolBundle(BaseModel):
     """Structured source of truth used to render the final Kaggle-style description."""
 
     problem_paradigm: str = "unknown_but_executable"
+    problem_structure: str = "unknown"
+    decision_temporality: str = "not_applicable"
+    environment_source: str = "not_applicable"
+    required_method_families: list[str] = Field(default_factory=list)
+    allowed_method_families: list[str] = Field(default_factory=list)
+    rl_formulation_candidates: list[RLFormulationCandidate] = Field(default_factory=list)
     overview: str = ""
     task_goal: str = ""
     data_access: DataAccessProtocol = Field(default_factory=DataAccessProtocol)
@@ -242,6 +272,13 @@ class DescriptionProtocolBundle(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
+    @field_validator("ml_dl", "optimization", "rl", "hybrid", mode="before")
+    @classmethod
+    def normalize_null_protocol_branches(cls, value: Any) -> Any:
+        """Treat an LLM's null inactive branch like an omitted default branch."""
+
+        return {} if value is None else value
+
 
 class DescriptionTaskProtocolDraft(BaseModel):
     """LLM-authored task/evaluation/output protocol without deterministic file access details.
@@ -251,6 +288,12 @@ class DescriptionTaskProtocolDraft(BaseModel):
     """
 
     problem_paradigm: str = "unknown_but_executable"
+    problem_structure: str = "unknown"
+    decision_temporality: str = "not_applicable"
+    environment_source: str = "not_applicable"
+    required_method_families: list[str] = Field(default_factory=list)
+    allowed_method_families: list[str] = Field(default_factory=list)
+    rl_formulation_candidates: list[RLFormulationCandidate] = Field(default_factory=list)
     overview: str = ""
     task_goal: str = ""
     ml_dl: MLDLProtocol = Field(default_factory=MLDLProtocol)
@@ -261,6 +304,13 @@ class DescriptionTaskProtocolDraft(BaseModel):
     evaluation_summary: str = ""
     constraints: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("ml_dl", "optimization", "rl", "hybrid", mode="before")
+    @classmethod
+    def normalize_null_protocol_branches(cls, value: Any) -> Any:
+        """Treat an LLM's null inactive branch like an omitted default branch."""
+
+        return {} if value is None else value
 
 
 class InvestigationQuestion(BaseModel):
@@ -311,6 +361,9 @@ class QuestionInvestigationPlan(BaseModel):
 
     ready_to_answer: bool = False
     planning_notes: str = ""
+    routing_reasons: list[str] = Field(default_factory=list)
+    recommended_max_questions: int = 0
+    recommended_max_actions_per_question: int = 0
     questions: list[InvestigationQuestion] = Field(default_factory=list)
     script_requests: list[ReadonlyPythonRequest] = Field(default_factory=list)
     # Compatibility field. Planners should leave this empty and use
@@ -504,6 +557,8 @@ class EvaluationContractReview(BaseModel):
     """Structured contract produced by the evaluation rigor agent."""
 
     passed: bool = False
+    executable: bool = False
+    authority_status: str = "unresolved"  # official/autorealize_assumption/unresolved
     primary_metric: str = ""
     metric_direction: str = ""  # minimize/maximize
     metric_formula: str = ""
@@ -521,6 +576,8 @@ class EvaluationContractReview(BaseModel):
     audit_metrics: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
     fixes: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    residual_issues: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
     rationale: str = ""
 
@@ -553,6 +610,18 @@ class SubmissionContract(BaseModel):
     unresolved_questions: list[str] = Field(default_factory=list)
 
 
+class RequirementFactItem(BaseModel):
+    """One routed document statement with conflict/supersession status."""
+
+    statement: str = ""
+    fact_type: str = "current_rule"  # current_rule/current_answer/question/future_roadmap/example
+    status: str = "current"  # current/resolved/superseded/unresolved/not_current
+    topics: list[str] = Field(default_factory=list)
+    source: str = ""
+    evidence: str = ""
+    resolved_or_superseded_by: str = ""
+
+
 class AuthoritativeTaskMemory(BaseModel):
     """High-priority task memory extracted from original/official/user task docs."""
 
@@ -570,6 +639,7 @@ class AuthoritativeTaskMemory(BaseModel):
     authority_conflicts: list[dict[str, str]] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     context_routing_notes: list[str] = Field(default_factory=list)
+    requirement_fact_matrix: list[RequirementFactItem] = Field(default_factory=list)
 
 
 class CognitionProbePlan(BaseModel):
@@ -686,6 +756,32 @@ class ConstraintItem(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     related_fields: list[str] = Field(default_factory=list)
     priority: str = "medium"  # high/medium/low
+    status: str = "current_candidate"  # current_candidate/superseded/not_current/unresolved
+    status_reason: str = ""
+
+
+class EntityAliasFieldCandidate(BaseModel):
+    """One exact physical field referenced by an LLM alias hypothesis."""
+
+    source_file: str = ""
+    sheet_name: str = ""
+    field: str = ""
+    semantic_role: str = ""
+    value_kind: str = "unknown"  # code/name/id/category/unknown
+    evidence: str = ""
+
+
+class EntityAliasCandidateGroup(BaseModel):
+    """Cross-source semantic alias hypothesis; never authoritative by itself."""
+
+    concept_id: str = ""
+    label: str = ""
+    reason: str = ""
+    confidence: str = "low"
+    task_relevance: str = "medium"  # high/medium/low
+    relevance_reason: str = ""
+    candidate_fields: list[EntityAliasFieldCandidate] = Field(default_factory=list)
+    caution: str = ""
 
 
 class ConstraintMemory(BaseModel):
@@ -693,6 +789,8 @@ class ConstraintMemory(BaseModel):
 
     summary: str = ""
     items: list[ConstraintItem] = Field(default_factory=list)
+    entity_alias_candidates: list[EntityAliasCandidateGroup] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
 
 
 class TaskClassification(BaseModel):
@@ -712,12 +810,18 @@ class AutoMLContextPack(BaseModel):
     purpose: str = "Concise facts that supplement description.md without prescribing an AutoML strategy."
     priority_rules: list[str] = Field(default_factory=list)
     problem_paradigm: str = "unknown_but_executable"
+    problem_structure: str = "unknown"
+    decision_temporality: str = "not_applicable"
+    environment_source: str = "not_applicable"
     task_goal: str = ""
     data_orchestration: list[str] = Field(default_factory=list)
     data_access: list[dict[str, Any]] = Field(default_factory=list)
     data_schema_contract: dict[str, Any] = Field(default_factory=dict)
     source_alias_guard: list[dict[str, Any]] = Field(default_factory=list)
     entity_alias_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    source_coverage_ledger: dict[str, Any] = Field(default_factory=dict)
+    relation_verification_queue: list[dict[str, Any]] = Field(default_factory=list)
+    requirement_fact_matrix: list[dict[str, Any]] = Field(default_factory=list)
     output_contract: dict[str, Any] = Field(default_factory=dict)
     evaluation_contract: dict[str, Any] = Field(default_factory=dict)
     method_strategy: dict[str, Any] = Field(default_factory=dict)
@@ -729,3 +833,98 @@ class AutoMLContextPack(BaseModel):
     leakage_guards: list[str] = Field(default_factory=list)
     pitfalls: list[str] = Field(default_factory=list)
     source_artifacts: dict[str, str] = Field(default_factory=dict)
+
+
+class CrossStageMemorySummary(BaseModel):
+    """Lossy prompt memory whose source evidence remains artifact-backed."""
+
+    schema_version: str = "autorealize.cross_stage_memory.v1"
+    task_state: str = ""
+    confirmed_facts: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    evidence_artifact_ids: list[str] = Field(default_factory=list)
+    stage_summaries: list[str] = Field(default_factory=list)
+
+
+class CrossStageRetrievalRequest(BaseModel):
+    artifact_id: str = ""
+    json_path: str = ""
+    reason: str = ""
+    max_chars: int = 4000
+
+
+class CrossStageRetrievalPlan(BaseModel):
+    needs_retrieval: bool = False
+    reason: str = ""
+    requests: list[CrossStageRetrievalRequest] = Field(default_factory=list)
+
+
+class KnowledgeRerankItem(BaseModel):
+    candidate_id: str = ""
+    relevance: str = "irrelevant"
+    score: float = 0.0
+    reason: str = ""
+
+
+class KnowledgeRerankDecision(BaseModel):
+    items: list[KnowledgeRerankItem] = Field(default_factory=list)
+    missing_topics: list[str] = Field(default_factory=list)
+
+
+class DownstreamContextResolutionItem(BaseModel):
+    """One bounded semantic choice from deterministic downstream candidates."""
+
+    dimension: str = ""
+    candidate_id: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    remain_unresolved: bool = False
+
+
+class DownstreamContextResolution(BaseModel):
+    """LLM disambiguation result; candidate IDs are validated locally."""
+
+    choices: list[DownstreamContextResolutionItem] = Field(default_factory=list)
+    unresolved_dimensions: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+
+
+class SourceFieldAliasResolutionItem(BaseModel):
+    output_column: str = ""
+    alias: str = ""
+    candidate_id: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    remain_unresolved: bool = False
+
+
+class SourceFieldAliasResolution(BaseModel):
+    choices: list[SourceFieldAliasResolutionItem] = Field(default_factory=list)
+    unresolved_aliases: list[str] = Field(default_factory=list)
+
+
+class ArtifactConsistencyIssue(BaseModel):
+    issue_id: str = ""
+    severity: str = "warning"
+    category: str = ""
+    artifact: str = ""
+    section: str = ""
+    message: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    repair_target: str = "none"
+    repair_instruction: str = ""
+
+
+class ArtifactConsistencyReview(BaseModel):
+    passed: bool = True
+    summary: str = ""
+    issues: list[ArtifactConsistencyIssue] = Field(default_factory=list)
+
+
+class ArtifactConsistencyPatch(BaseModel):
+    revised_sections: dict[str, str] = Field(default_factory=dict)
+    addressed_issue_ids: list[str] = Field(default_factory=list)
+    unresolved_issue_ids: list[str] = Field(default_factory=list)

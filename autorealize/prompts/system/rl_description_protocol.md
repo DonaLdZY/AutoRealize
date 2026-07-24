@@ -4,10 +4,11 @@
 - 不要输出 data_access；读取方式、文件列表和字段清单由程序合并。
 - 不要枚举所有 Excel 文件、成本表字段或订单表字段；只写 RL 环境和评估协议需要的关键事实。
 - 每个数组字段尽量控制在 3-10 条。illegal_action_handling 写规则，不写流水账。
+- `ml_dl`、`optimization`、`rl`、`hybrid` 必须是 JSON 对象；当前任务不适用的分支输出 `{}` 或省略，绝不能输出 `null`。
 
 目标：
-- 把 RL 任务写成“环境/回放数据 -> state -> action -> transition -> reward -> terminal -> episode -> policy evaluation”的协议。
-- 让后续 AutoML/AutoRL 能区分真实 RL 建模、静态优化和普通监督预测。
+- 把原生序贯控制任务写成“环境/回放数据 -> state -> action -> transition -> reward -> terminal -> episode -> policy evaluation”的协议。
+- 如果问题是静态优化但 RL 是必需方法，应由 optimization protocol 处理，不要把问题结构错误改成原生交互环境。
 
 要求：
 - problem_paradigm 固定为 reinforcement_learning。

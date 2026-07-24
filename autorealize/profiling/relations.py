@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 import re
 from typing import Any
 
@@ -36,7 +37,19 @@ def detect_relations(
     """
 
     summary_index = _build_summary_index(file_summaries or [])
-    items = list(file_columns.items())
+    relation_columns = {str(path): [str(column) for column in columns] for path, columns in file_columns.items()}
+    workbook_paths_with_sheets = {
+        path.split("::", 1)[0]
+        for path in summary_index
+        if "::" in path
+    }
+    for workbook_path in workbook_paths_with_sheets:
+        relation_columns.pop(workbook_path, None)
+    for path, summary in summary_index.items():
+        columns = [str(column) for column in (summary.get("columns") or []) if str(column).strip()]
+        if columns:
+            relation_columns[path] = columns
+    items = list(relation_columns.items())
     pairs: list[tuple[tuple[str, list[str]], tuple[str, list[str]]]] = []
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
@@ -72,7 +85,7 @@ def detect_relations(
             hints.extend(_work(p))
 
     hints.sort(key=lambda h: (-float(h.confidence or 0), h.left_file, h.right_file, h.left_field, h.right_field))
-    return _dedupe_hints(hints)[:500]
+    return _select_diverse_hints(_dedupe_hints(hints), limit=500)
 
 
 def _build_summary_index(file_summaries: list[Any]) -> dict[str, dict[str, Any]]:
@@ -100,6 +113,39 @@ def _build_summary_index(file_summaries: list[Any]) -> dict[str, dict[str, Any]]
             "semantics": semantics,
             "source_metadata": getattr(fs, "source_metadata", {}) or {},
         }
+        meta = getattr(fs, "source_metadata", {}) or {}
+        sheets = meta.get("excel_sheet_profiles") if isinstance(meta.get("excel_sheet_profiles"), list) else []
+        sheet_meanings = meta.get("sheet_field_descriptions") if isinstance(meta.get("sheet_field_descriptions"), dict) else {}
+        for sheet in sheets:
+            if not isinstance(sheet, dict):
+                continue
+            sheet_name = str(sheet.get("sheet_name", "") or "")
+            if not sheet_name:
+                continue
+            table_id = f"{path}::{sheet_name}"
+            sheet_profiles = {}
+            for profile in sheet.get("column_profiles") or []:
+                if not isinstance(profile, dict):
+                    continue
+                name = str(profile.get("name", "") or "")
+                if name:
+                    sheet_profiles[_norm_field(name)] = profile
+            meanings = sheet_meanings.get(sheet_name, {}) if isinstance(sheet_meanings, dict) else {}
+            out[table_id] = {
+                "path": table_id,
+                "columns": [str(x) for x in (sheet.get("columns") or [])],
+                "profiles": sheet_profiles,
+                "semantics": {
+                    _norm_field(str(key)): str(value)
+                    for key, value in (meanings.items() if isinstance(meanings, dict) else [])
+                    if str(key).strip()
+                },
+                "source_metadata": {
+                    **meta,
+                    "source_workbook": path,
+                    "sheet_name": sheet_name,
+                },
+            }
     return out
 
 
@@ -121,9 +167,13 @@ def _candidate_field_pairs(
             continue
         left_tok = _field_tokens(left, left_summary)
         for right, rtok in right_tokens.items():
-            score = _token_similarity(left_tok, rtok)
+            right_name = right_by_norm.get(right, right)
+            score = max(
+                _token_similarity(left_tok, rtok),
+                _field_name_similarity(str(left), str(right_name)),
+            )
             if score >= 0.72:
-                candidates.append((str(left), right_by_norm.get(right, right), "字段名/语义近似匹配", score))
+                candidates.append((str(left), str(right_name), "字段名/语义近似匹配", score))
     candidates.sort(key=lambda x: -x[3])
     seen: set[tuple[str, str]] = set()
     out: list[tuple[str, str, str]] = []
@@ -189,7 +239,9 @@ def _build_relation_hint(
     return RelationHint(
         left_file=left_file,
         right_file=right_file,
-        shared_columns=sorted({_norm_field(left_field), _norm_field(right_field)}),
+        # Keep physical column names for backward compatibility and downstream reads.
+        # Normalized names are only for matching and deduplication.
+        shared_columns=list(dict.fromkeys([left_field, right_field])),
         reason=evidence,
         left_field=left_field,
         right_field=right_field,
@@ -360,8 +412,69 @@ def _token_similarity(left: set[str], right: set[str]) -> float:
     return len(left & right) / max(1, len(left | right))
 
 
+def _field_name_similarity(left: str, right: str) -> float:
+    """Unicode-aware similarity for compact Chinese and mixed-language fields."""
+
+    left_norm = _norm_field(left)
+    right_norm = _norm_field(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    left_semantic = _semantic_field_core(left_norm)
+    right_semantic = _semantic_field_core(right_norm)
+    semantic_bonus = 0.0
+    if left_semantic and right_semantic and left_semantic == right_semantic:
+        semantic_bonus = 0.9
+    shorter, longer = sorted((left_norm, right_norm), key=len)
+    containment = len(shorter) / max(1, len(longer)) if len(shorter) >= 3 and shorter in longer else 0.0
+    sequence = SequenceMatcher(None, left_norm, right_norm).ratio()
+    left_grams = _char_ngrams(left_norm)
+    right_grams = _char_ngrams(right_norm)
+    ngram = len(left_grams & right_grams) / max(1, len(left_grams | right_grams))
+    return max(containment, sequence, ngram, semantic_bonus)
+
+
+def _char_ngrams(value: str, *, size: int = 2) -> set[str]:
+    if len(value) <= size:
+        return {value} if value else set()
+    return {value[idx : idx + size] for idx in range(len(value) - size + 1)}
+
+
+def _semantic_field_core(value: str) -> str:
+    """Remove generic qualifiers without mapping any domain-specific fields."""
+
+    text = _norm_field(value)
+    qualifiers = [
+        "primary",
+        "secondary",
+        "source",
+        "target",
+        "origin",
+        "destination",
+        "input",
+        "output",
+        "main",
+        "auxiliary",
+        "主",
+        "副",
+        "原始",
+        "备用",
+        "输入",
+        "输出",
+        "源",
+        "目标",
+    ]
+    separators = ["-", "_", "/", "\\"]
+    for separator in separators:
+        text = text.replace(separator, "")
+    for qualifier in qualifiers:
+        text = text.replace(qualifier, "")
+    return text if len(text) >= 2 else ""
+
+
 def _norm_field(value: str) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip().lower())
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(value or "").strip().lower())
 
 
 def _dedupe_hints(hints: list[RelationHint]) -> list[RelationHint]:
@@ -380,3 +493,61 @@ def _dedupe_hints(hints: list[RelationHint]) -> list[RelationHint]:
         seen.add(key)
         out.append(hint)
     return out
+
+
+def _select_diverse_hints(hints: list[RelationHint], *, limit: int) -> list[RelationHint]:
+    """Prevent repeated same-field file-family relations from hiding other joins."""
+
+    buckets: dict[tuple[str, str], list[RelationHint]] = {}
+    for hint in hints:
+        left_collection = _relation_source_collection(hint.left_file)
+        right_collection = _relation_source_collection(hint.right_file)
+        pair = tuple(sorted((left_collection, right_collection)))
+        buckets.setdefault(pair, []).append(hint)
+
+    # Round-robin source-collection pairs. A directory containing hundreds of
+    # repeated tables can no longer consume the complete global relation budget.
+    ordered_pairs = sorted(
+        buckets,
+        key=lambda pair: (
+            0 if pair[0] != pair[1] else 1,
+            pair,
+        ),
+    )
+    out: list[RelationHint] = []
+    field_signature_counts: dict[tuple[str, str, str], int] = {}
+    file_pair_counts: dict[tuple[str, str], int] = {}
+    cursor = {pair: 0 for pair in ordered_pairs}
+    while len(out) < max(1, int(limit)):
+        progressed = False
+        for collection_pair in ordered_pairs:
+            bucket = buckets[collection_pair]
+            while cursor[collection_pair] < len(bucket):
+                hint = bucket[cursor[collection_pair]]
+                cursor[collection_pair] += 1
+                signature = (
+                    _norm_field(hint.left_field),
+                    _norm_field(hint.right_field),
+                    str(hint.relation_type or ""),
+                )
+                file_pair = tuple(sorted((str(hint.left_file), str(hint.right_file))))
+                if field_signature_counts.get(signature, 0) >= 12:
+                    continue
+                if file_pair_counts.get(file_pair, 0) >= 8:
+                    continue
+                field_signature_counts[signature] = field_signature_counts.get(signature, 0) + 1
+                file_pair_counts[file_pair] = file_pair_counts.get(file_pair, 0) + 1
+                out.append(hint)
+                progressed = True
+                break
+            if len(out) >= max(1, int(limit)):
+                break
+        if not progressed:
+            break
+    return out
+
+
+def _relation_source_collection(path: str) -> str:
+    source = str(path or "").replace("\\", "/").split("::", 1)[0]
+    parent = source.rsplit("/", 1)[0] if "/" in source else ""
+    return parent or source

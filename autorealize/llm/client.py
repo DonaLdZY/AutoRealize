@@ -10,6 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 from threading import Lock, BoundedSemaphore
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -17,23 +18,99 @@ from pydantic import BaseModel, ValidationError
 from ..config import AutoRealizeConfig
 from ..logging_utils import log_event
 from ..models import LLMTrace
+from ..prompt_cache import estimate_text_tokens
 from ..utils.safe_json import append_jsonl_safe, write_json_safe
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 NETWORK_RETRY_MAX_ATTEMPTS = 5
 NETWORK_RETRY_MAX_SLEEP_SECONDS = 30.0
-DEEPSEEK_RMB_PER_1M_CACHE_HIT_INPUT = 0.025
-DEEPSEEK_RMB_PER_1M_CACHE_MISS_INPUT = 3.0
-DEEPSEEK_RMB_PER_1M_OUTPUT = 6.0
+DEEPSEEK_USD_PRICING_PER_1M: dict[str, dict[str, float]] = {
+    "deepseek-v4-flash": {
+        "cache_hit_input": 0.0028,
+        "cache_miss_input": 0.14,
+        "output": 0.28,
+    },
+    "deepseek-v4-pro": {
+        "cache_hit_input": 0.003625,
+        "cache_miss_input": 0.435,
+        "output": 0.87,
+    },
+}
+DEEPSEEK_MODEL_PRICING_ALIASES = {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-flash",
+}
+CACHE_FRIENDLY_SYSTEM_PROMPT = (
+    "你是 AutoRealize，一个以证据为依据的数据认知与任务定义智能体。"
+    "最前面的稳定任务/数据上下文是当前调用的权威背景；后续出现的阶段指令和输出 schema "
+    "规定本次具体行为；当前错误、最新结果和本轮请求位于消息末尾。保留来源证据、文件、"
+    "Sheet、字段、JSON schema 和代码标识符的原始形式。"
+)
+AGENT_INSTRUCTIONS_TITLE = "本次调用的最新阶段 system 指令："
+
+_CACHE_FRIENDLY_SYSTEM_PROMPT_EN = (
+    "You are AutoRealize, an evidence-grounded data cognition and task-definition agent. "
+    "Treat the stable task/data context in the first user message as authoritative. Follow the "
+    "agent-specific instructions and output schema that appear later, and keep current errors or "
+    "round-specific requests in the final messages. Preserve source evidence and exact identifiers."
+)
+_AGENT_INSTRUCTIONS_TITLE_EN = "Latest stage system instructions for this call:"
+
+
+def _control_prompt_labels(config: AutoRealizeConfig) -> dict[str, str]:
+    language = str(getattr(config.prompt, "control_language", "zh") or "zh").strip().lower()
+    if language == "en":
+        return {
+            "cache_system": _CACHE_FRIENDLY_SYSTEM_PROMPT_EN,
+            "agent_title": _AGENT_INSTRUCTIONS_TITLE_EN,
+            "json_prefix": (
+                "Return exactly one valid JSON object. Do not output Markdown fences or explanatory text.\n"
+                "The word json is intentionally included for providers that require it in JSON output mode."
+            ),
+            "json_suffix": "Output the JSON object only: no Markdown, prose, or code fences.",
+            "json_example": "JSON example",
+            "json_schema": "Required JSON Schema",
+            "stable_context": "Stable task/data context",
+            "dynamic_input": "Latest dynamic input payload",
+            "fewshot": "Few-shot examples",
+            "retry_invalid": "The previous response did not match the required JSON schema.",
+            "error": "Error",
+            "retry_now": "Return exactly one valid JSON object now. No Markdown, prose, or code fences.",
+        }
+    return {
+        "cache_system": CACHE_FRIENDLY_SYSTEM_PROMPT,
+        "agent_title": AGENT_INSTRUCTIONS_TITLE,
+        "json_prefix": (
+            "只返回一个有效 JSON 对象，不要输出 Markdown 围栏或解释性文字。\n"
+            "此处明确包含 json 一词，以兼容要求在 JSON 输出模式指令中出现该词的服务商。"
+        ),
+        "json_suffix": "仅输出 JSON 对象，不要输出 Markdown、说明文字或代码围栏。",
+        "json_example": "JSON 示例",
+        "json_schema": "Required JSON Schema / 必需 JSON Schema",
+        "stable_context": "稳定任务/数据上下文",
+        "dynamic_input": "最新动态输入载荷",
+        "fewshot": "少样本示例",
+        "retry_invalid": "上一次响应不是符合所需 JSON schema 的有效对象。",
+        "error": "错误",
+        "retry_now": "现在只返回一个有效 JSON 对象，不要输出 Markdown、说明文字或代码围栏。",
+    }
 
 
 def _is_deepseek_model(model_name: str) -> bool:
     return (model_name or "").strip().lower().startswith("deepseek")
 
 
-def _estimate_deepseek_rmb(
+def _deepseek_pricing_usd_per_1m(model_name: str) -> dict[str, float] | None:
+    normalized = str(model_name or "").strip().lower()
+    normalized = DEEPSEEK_MODEL_PRICING_ALIASES.get(normalized, normalized)
+    pricing = DEEPSEEK_USD_PRICING_PER_1M.get(normalized)
+    return dict(pricing) if pricing else None
+
+
+def _estimate_deepseek_usd(
     *,
+    pricing: dict[str, float],
     prompt_tokens: int,
     cached_tokens: int,
     miss_tokens: int,
@@ -43,35 +120,42 @@ def _estimate_deepseek_rmb(
     unknown_prompt_tokens = max(0, prompt_tokens - cached_tokens - miss_tokens)
     billed_miss_tokens = miss_tokens + (unknown_prompt_tokens if unknown_prompt_as_miss else 0)
     return (
-        cached_tokens * DEEPSEEK_RMB_PER_1M_CACHE_HIT_INPUT
-        + billed_miss_tokens * DEEPSEEK_RMB_PER_1M_CACHE_MISS_INPUT
-        + completion_tokens * DEEPSEEK_RMB_PER_1M_OUTPUT
+        cached_tokens * float(pricing["cache_hit_input"])
+        + billed_miss_tokens * float(pricing["cache_miss_input"])
+        + completion_tokens * float(pricing["output"])
     ) / 1_000_000.0
 
 
 def _deepseek_cost_breakdown(
     *,
+    model_name: str = "deepseek-v4-pro",
     prompt_tokens: int,
     cached_tokens: int,
     miss_tokens: int,
     completion_tokens: int,
 ) -> dict[str, float | int]:
+    pricing = _deepseek_pricing_usd_per_1m(model_name)
+    if pricing is None:
+        return {}
     unknown_prompt_tokens = max(0, int(prompt_tokens) - int(cached_tokens) - int(miss_tokens))
-    cache_hit_rmb = int(cached_tokens) * DEEPSEEK_RMB_PER_1M_CACHE_HIT_INPUT / 1_000_000.0
-    cache_miss_rmb = int(miss_tokens) * DEEPSEEK_RMB_PER_1M_CACHE_MISS_INPUT / 1_000_000.0
-    unknown_as_miss_rmb = unknown_prompt_tokens * DEEPSEEK_RMB_PER_1M_CACHE_MISS_INPUT / 1_000_000.0
-    output_rmb = int(completion_tokens) * DEEPSEEK_RMB_PER_1M_OUTPUT / 1_000_000.0
+    cache_hit_usd = int(cached_tokens) * pricing["cache_hit_input"] / 1_000_000.0
+    cache_miss_usd = int(miss_tokens) * pricing["cache_miss_input"] / 1_000_000.0
+    unknown_as_miss_usd = unknown_prompt_tokens * pricing["cache_miss_input"] / 1_000_000.0
+    output_usd = int(completion_tokens) * pricing["output"] / 1_000_000.0
     return {
         "cache_hit_input_tokens": int(cached_tokens),
         "cache_miss_input_tokens": int(miss_tokens),
         "unknown_input_tokens": unknown_prompt_tokens,
         "output_tokens": int(completion_tokens),
-        "cache_hit_input_rmb": round(cache_hit_rmb, 6),
-        "cache_miss_input_rmb": round(cache_miss_rmb, 6),
-        "unknown_input_as_miss_rmb": round(unknown_as_miss_rmb, 6),
-        "output_rmb": round(output_rmb, 6),
-        "total_cache_known_only_rmb": round(cache_hit_rmb + cache_miss_rmb + output_rmb, 6),
-        "total_unknown_as_miss_rmb": round(cache_hit_rmb + cache_miss_rmb + unknown_as_miss_rmb + output_rmb, 6),
+        "cache_hit_input_usd": round(cache_hit_usd, 9),
+        "cache_miss_input_usd": round(cache_miss_usd, 9),
+        "unknown_input_as_miss_usd": round(unknown_as_miss_usd, 9),
+        "output_usd": round(output_usd, 9),
+        "total_cache_known_only_usd": round(cache_hit_usd + cache_miss_usd + output_usd, 9),
+        "total_unknown_as_miss_usd": round(
+            cache_hit_usd + cache_miss_usd + unknown_as_miss_usd + output_usd,
+            9,
+        ),
     }
 
 
@@ -99,7 +183,7 @@ def _prompt_stage(prompt_name: str) -> str:
 
 
 def _normalize_base_url(model_name: str, base_url: str) -> str:
-    base = (base_url or "").strip()
+    base = str(base_url or "").strip()
     if _is_deepseek_model(model_name) and base.rstrip("/") in {
         "https://api.deepseek.com",
         "https://api.deepseek.com/v1",
@@ -108,19 +192,56 @@ def _normalize_base_url(model_name: str, base_url: str) -> str:
     return base
 
 
-def _example_from_schema(schema: dict) -> Any:
+def _is_official_openai_base_url(base_url: str) -> bool:
+    try:
+        return (urlparse(str(base_url or "").strip()).hostname or "").lower() == "api.openai.com"
+    except ValueError:
+        return False
+
+
+def _is_official_deepseek_base_url(base_url: str) -> bool:
+    try:
+        return (urlparse(str(base_url or "").strip()).hostname or "").lower() == "api.deepseek.com"
+    except ValueError:
+        return False
+
+
+def _provider_prompt_cache_key(
+    *,
+    config: AutoRealizeConfig,
+    base_url: str,
+    stable_prefix: str,
+) -> str | None:
+    """Build a routing key only when a reusable stable prefix is present."""
+    prefix = str(stable_prefix or "").strip()
+    if not prefix:
+        return None
+    mode = str(getattr(config.llm, "prompt_cache_key_mode", "auto") or "auto").strip().lower()
+    if mode == "disabled":
+        return None
+    if mode != "enabled" and (mode != "auto" or not _is_official_openai_base_url(base_url)):
+        return None
+    digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:32]
+    return f"autorealize:{digest}"
+
+
+def _example_from_schema(schema: dict, *, definitions: dict[str, Any] | None = None) -> Any:
     if not isinstance(schema, dict):
         return ""
-    if "anyOf" in schema and schema["anyOf"]:
-        return _example_from_schema(schema["anyOf"][0])
-    if "$defs" in schema and "$ref" in schema:
+    active_definitions = definitions or (schema.get("$defs", {}) if isinstance(schema.get("$defs"), dict) else {})
+    if "$ref" in schema:
         ref = str(schema["$ref"]).split("/")[-1]
-        return _example_from_schema(schema.get("$defs", {}).get(ref, {}))
+        return _example_from_schema(active_definitions.get(ref, {}), definitions=active_definitions)
+    if "anyOf" in schema and schema["anyOf"]:
+        return _example_from_schema(schema["anyOf"][0], definitions=active_definitions)
     schema_type = schema.get("type")
     if schema_type == "object":
-        return {str(k): _example_from_schema(v) for k, v in (schema.get("properties", {}) or {}).items()}
+        return {
+            str(k): _example_from_schema(v, definitions=active_definitions)
+            for k, v in (schema.get("properties", {}) or {}).items()
+        }
     if schema_type == "array":
-        return [_example_from_schema(schema.get("items", {}))]
+        return [_example_from_schema(schema.get("items", {}), definitions=active_definitions)]
     if schema_type == "boolean":
         return False
     if schema_type in {"integer", "number"}:
@@ -128,6 +249,27 @@ def _example_from_schema(schema: dict) -> Any:
     if schema.get("enum"):
         return schema["enum"][0]
     return ""
+
+
+def _prune_schema_for_prompt(value: Any) -> Any:
+    """Remove human-facing metadata while preserving validation structure."""
+
+    if isinstance(value, dict):
+        return {
+            key: _prune_schema_for_prompt(item)
+            for key, item in value.items()
+            if key not in {"title", "description", "default", "examples", "$schema"}
+        }
+    if isinstance(value, list):
+        return [_prune_schema_for_prompt(item) for item in value]
+    return value
+
+
+def _schema_text_for_prompt(schema: dict[str, Any], *, compact: bool) -> str:
+    payload = _prune_schema_for_prompt(schema) if compact else schema
+    if compact:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _normalize_deepseek_reasoning_effort(effort: str | None) -> str | None:
@@ -147,17 +289,43 @@ def _normal_max_tokens(value: Any) -> int | None:
     return tokens if tokens > 0 else None
 
 
-def _deepseek_extra_body(config: AutoRealizeConfig, *, structured: bool) -> dict[str, Any]:
+def _effective_output_max_tokens(
+    requested: Any,
+    *,
+    config: Any,
+) -> int | None:
+    """Apply the configured floor to normal business LLM requests."""
+    requested_tokens = _normal_max_tokens(requested)
+    minimum_tokens = _normal_max_tokens(getattr(config, "minimum_output_tokens", 32768))
+    effective = max(int(requested_tokens or 0), int(minimum_tokens or 0))
+    return effective or None
+
+
+def _apply_deepseek_request_options(
+    create_kwargs: dict[str, Any],
+    config: AutoRealizeConfig,
+    *,
+    structured: bool,
+    force_disable_thinking: bool = False,
+) -> None:
     if not _is_deepseek_model(config.llm.model_name):
-        return {}
-    body: dict[str, Any] = {}
-    thinking = False if structured and config.llm.structured_disable_thinking else config.llm.enable_thinking
-    if thinking is not None:
-        body["thinking"] = {"type": "enabled" if thinking else "disabled"}
+        return
+    thinking = (
+        False
+        if force_disable_thinking or (structured and config.llm.structured_disable_thinking)
+        else config.llm.enable_thinking
+    )
+    thinking_active = thinking is not False
+    if thinking_active:
+        for ignored_parameter in ["temperature", "top_p", "presence_penalty", "frequency_penalty"]:
+            create_kwargs.pop(ignored_parameter, None)
         effort = _normalize_deepseek_reasoning_effort(config.llm.reasoning_effort)
-        if thinking and effort:
-            body["reasoning_effort"] = effort
-    return body
+        if effort:
+            create_kwargs["reasoning_effort"] = effort
+    if thinking is not None:
+        body = dict(create_kwargs.get("extra_body") or {})
+        body["thinking"] = {"type": "enabled" if thinking else "disabled"}
+        create_kwargs["extra_body"] = body
 
 
 def _is_provider_parameter_error(exc: Exception) -> bool:
@@ -177,6 +345,8 @@ def _is_provider_parameter_error(exc: Exception) -> bool:
             "json_object",
             "reasoning_effort",
             "thinking",
+            "prompt_cache_key",
+            "unexpected keyword argument",
             "extra fields not permitted",
         ]
     )
@@ -188,6 +358,18 @@ def _degraded_request_kwargs(create_kwargs: dict[str, Any], exc: Exception) -> t
         return None, ""
 
     msg = str(exc).lower()
+    if "reasoning_effort" in create_kwargs and "reasoning_effort" in msg:
+        degraded = dict(create_kwargs)
+        degraded.pop("reasoning_effort", None)
+        return degraded, "reasoning_effort"
+
+    if "prompt_cache_key" in create_kwargs and any(
+        key in msg for key in ["prompt_cache_key", "unexpected keyword argument"]
+    ):
+        degraded = dict(create_kwargs)
+        degraded.pop("prompt_cache_key", None)
+        return degraded, "prompt_cache_key"
+
     if "extra_body" in create_kwargs and any(
         key in msg for key in ["extra_body", "thinking", "reasoning_effort", "unknown parameter", "invalid parameter"]
     ):
@@ -201,6 +383,20 @@ def _degraded_request_kwargs(create_kwargs: dict[str, Any], exc: Exception) -> t
         degraded = dict(create_kwargs)
         degraded.pop("response_format", None)
         return degraded, "response_format"
+
+    if "prompt_cache_key" in create_kwargs and any(
+        key in msg for key in ["unsupported parameter", "unknown parameter", "invalid parameter"]
+    ):
+        degraded = dict(create_kwargs)
+        degraded.pop("prompt_cache_key", None)
+        return degraded, "prompt_cache_key"
+
+    if "reasoning_effort" in create_kwargs and any(
+        key in msg for key in ["unsupported parameter", "unknown parameter", "invalid parameter"]
+    ):
+        degraded = dict(create_kwargs)
+        degraded.pop("reasoning_effort", None)
+        return degraded, "reasoning_effort"
 
     return None, ""
 
@@ -362,6 +558,17 @@ def _format_parse_error(exc: Exception, *, finish_reason: str, max_tokens: int, 
     return message
 
 
+def _next_structured_length_retry_max_tokens(
+    *,
+    current_max_tokens: int | None,
+    config: Any,
+) -> int | None:
+    retry_max = _normal_max_tokens(
+        getattr(config, "structured_length_retry_max_tokens", 32768)
+    ) or 32768
+    return max(int(current_max_tokens or 0), retry_max)
+
+
 def _usage_to_dict(usage: Any) -> dict[str, Any]:
     if usage is None:
         return {}
@@ -381,11 +588,12 @@ def _usage_to_dict(usage: Any) -> dict[str, Any]:
         "prompt_cache_hit_tokens",
         "prompt_cache_miss_tokens",
         "cached_tokens",
+        "cache_write_tokens",
     ]:
         value = getattr(usage, key, None)
         if value is not None:
             out[key] = value
-    for key in ["prompt_tokens_details", "completion_tokens_details"]:
+    for key in ["prompt_tokens_details", "input_tokens_details", "completion_tokens_details"]:
         details = getattr(usage, key, None)
         if details is None:
             continue
@@ -399,10 +607,33 @@ def _usage_to_dict(usage: Any) -> dict[str, Any]:
     return out
 
 
+def _response_reasoning_tokens(response: Any) -> int:
+    usage = _usage_to_dict(getattr(response, "usage", None))
+    return _usage_int(usage, "reasoning_tokens") or 0
+
+
+def _should_disable_structured_thinking_after_length(
+    *,
+    response: Any,
+    finish_reason: str,
+    ratio_threshold: float,
+) -> bool:
+    if finish_reason != "length":
+        return False
+    usage = _usage_to_dict(getattr(response, "usage", None))
+    completion_tokens = _usage_int(usage, "completion_tokens") or 0
+    reasoning_tokens = _usage_int(usage, "reasoning_tokens") or 0
+    if completion_tokens <= 0 or reasoning_tokens <= 0:
+        return False
+    threshold = max(0.0, min(1.0, float(ratio_threshold)))
+    return reasoning_tokens / completion_tokens >= threshold
+
+
 def _usage_int(usage: dict[str, Any], *keys: str) -> int | None:
     details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
     completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
-    pools = [usage, details, completion_details]
+    pools = [usage, details, input_details, completion_details]
     for key in keys:
         for pool in pools:
             value = pool.get(key) if isinstance(pool, dict) else None
@@ -433,26 +664,17 @@ def _usage_cache_tokens(usage: dict[str, Any]) -> tuple[int | None, int | None]:
     return cached, missed
 
 
+def _usage_cache_write_tokens(usage: dict[str, Any]) -> int | None:
+    return _usage_int(usage, "cache_write_tokens")
+
+
 def _estimate_text_tokens(text: str) -> int:
     """Cheap local estimate for locating large prompt parts.
 
     Provider usage reports exact totals only. This estimate is intentionally
     lightweight and dependency-free; use it for relative attribution, not billing.
     """
-    if not text:
-        return 0
-    cjk = 0
-    for ch in text:
-        code = ord(ch)
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3040 <= code <= 0x30FF
-            or 0xAC00 <= code <= 0xD7AF
-        ):
-            cjk += 1
-    non_cjk = max(0, len(text) - cjk)
-    return max(1, int(round(cjk + non_cjk / 4)))
+    return estimate_text_tokens(text)
 
 
 def _prompt_part_stats(
@@ -548,13 +770,19 @@ class LLMClient:
             "cache_hits_local": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "reasoning_tokens": 0,
             "total_tokens": 0,
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
+            "cache_write_tokens": 0,
+            "provider_cache_write_known_calls": 0,
+            "provider_cache_write_unknown_calls": 0,
             "provider_cache_known_prompt_tokens": 0,
             "provider_cache_unknown_prompt_tokens": 0,
             "provider_usage_missing_calls": 0,
             "estimated_prompt_tokens": 0,
+            "provider_response_models": {},
+            "system_fingerprints": {},
             "by_prompt_part": {},
             "by_prompt": {},
         }
@@ -585,9 +813,12 @@ class LLMClient:
             {"name": "system_prompt", "role": "system", "content": "You are a health check endpoint."},
             {"name": "user_prompt", "role": "user", "content": "Return OK."},
         ]
-        extra_body = _deepseek_extra_body(self.config, structured=False)
-        if extra_body:
-            create_kwargs["extra_body"] = extra_body
+        _apply_deepseek_request_options(
+            create_kwargs,
+            self.config,
+            structured=False,
+            force_disable_thinking=True,
+        )
         try:
             t0 = time.perf_counter()
             response = self._chat_completion_with_network_retry(
@@ -615,8 +846,12 @@ class LLMClient:
     def _cache_key(self, *, prompt_name: str, system_prompt: str, user_prompt: str, schema: str = "") -> str:
         payload = json.dumps(
             {
+                "base_url": self.base_url,
                 "model": self.config.llm.model_name,
                 "temperature": self.config.llm.temperature,
+                "enable_thinking": self.config.llm.enable_thinking,
+                "reasoning_effort": self.config.llm.reasoning_effort,
+                "structured_disable_thinking": self.config.llm.structured_disable_thinking,
                 "prompt_name": prompt_name,
                 "system": system_prompt,
                 "user": user_prompt,
@@ -673,9 +908,12 @@ class LLMClient:
             "model": self.config.llm.model_name,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "reasoning_tokens": 0,
             "total_tokens": 0,
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
+            "cache_write_tokens": 0,
+            "provider_cache_write_tokens_known": False,
             "estimated_prompt_tokens": estimated_prompt_tokens,
             "prompt_parts": part_rows,
         }
@@ -693,9 +931,13 @@ class LLMClient:
                     "cache_hits_local": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "reasoning_tokens": 0,
                     "total_tokens": 0,
                     "prompt_cache_hit_tokens": 0,
                     "prompt_cache_miss_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "provider_cache_write_known_calls": 0,
+                    "provider_cache_write_unknown_calls": 0,
                     "provider_cache_known_prompt_tokens": 0,
                     "provider_cache_unknown_prompt_tokens": 0,
                     "provider_usage_missing_calls": 0,
@@ -741,8 +983,10 @@ class LLMClient:
         usage_available = bool(usage)
         prompt_tokens = _usage_int(usage, "prompt_tokens") or 0
         completion_tokens = _usage_int(usage, "completion_tokens") or 0
+        reasoning_tokens = _usage_int(usage, "reasoning_tokens") or 0
         total_tokens = _usage_int(usage, "total_tokens") or (prompt_tokens + completion_tokens)
         cached_tokens, miss_tokens = _usage_cache_tokens(usage)
+        cache_write_tokens = _usage_cache_write_tokens(usage)
         cache_tokens_known = cached_tokens is not None or miss_tokens is not None
         part_rows, estimated_prompt_tokens = _prompt_part_stats(
             prompt_parts,
@@ -754,6 +998,9 @@ class LLMClient:
             "mode": mode,
             "source": source,
             "model": model_name or self.config.llm.model_name,
+            "response_id": str(getattr(response, "id", "") or ""),
+            "response_model": str(getattr(response, "model", "") or ""),
+            "system_fingerprint": str(getattr(response, "system_fingerprint", "") or ""),
             "attempt": attempt,
             "seconds": round(float(seconds), 4),
             "finish_reason": finish_reason,
@@ -761,10 +1008,13 @@ class LLMClient:
             "parsed_ok": parsed_ok,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
             "total_tokens": total_tokens,
             "prompt_cache_hit_tokens": cached_tokens or 0,
             "prompt_cache_miss_tokens": miss_tokens or 0,
+            "cache_write_tokens": cache_write_tokens or 0,
             "provider_cache_tokens_known": cache_tokens_known,
+            "provider_cache_write_tokens_known": cache_write_tokens is not None,
             "usage_available": usage_available,
             "estimated_prompt_tokens": estimated_prompt_tokens,
             "prompt_parts": part_rows,
@@ -777,17 +1027,34 @@ class LLMClient:
                 self._usage_summary["provider_usage_missing_calls"] = (
                     int(self._usage_summary.get("provider_usage_missing_calls", 0)) + 1
                 )
+            cache_write_calls_key = (
+                "provider_cache_write_known_calls"
+                if cache_write_tokens is not None
+                else "provider_cache_write_unknown_calls"
+            )
+            self._usage_summary[cache_write_calls_key] = (
+                int(self._usage_summary.get(cache_write_calls_key, 0)) + 1
+            )
             for key in [
                 "prompt_tokens",
                 "completion_tokens",
+                "reasoning_tokens",
                 "total_tokens",
                 "prompt_cache_hit_tokens",
                 "prompt_cache_miss_tokens",
+                "cache_write_tokens",
             ]:
                 self._usage_summary[key] = int(self._usage_summary.get(key, 0)) + int(row.get(key, 0) or 0)
             self._usage_summary["estimated_prompt_tokens"] = (
                 int(self._usage_summary.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
             )
+            for summary_key, value in [
+                ("provider_response_models", row["response_model"]),
+                ("system_fingerprints", row["system_fingerprint"]),
+            ]:
+                if value:
+                    counts = self._usage_summary.setdefault(summary_key, {})
+                    counts[value] = int(counts.get(value, 0)) + 1
             self._accumulate_prompt_parts_locked(prompt_name=prompt_name, part_rows=part_rows)
             cache_bucket = (
                 "provider_cache_known_prompt_tokens"
@@ -804,9 +1071,13 @@ class LLMClient:
                     "cache_hits_local": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "reasoning_tokens": 0,
                     "total_tokens": 0,
                     "prompt_cache_hit_tokens": 0,
                     "prompt_cache_miss_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "provider_cache_write_known_calls": 0,
+                    "provider_cache_write_unknown_calls": 0,
                     "provider_cache_known_prompt_tokens": 0,
                     "provider_cache_unknown_prompt_tokens": 0,
                     "provider_usage_missing_calls": 0,
@@ -818,12 +1089,15 @@ class LLMClient:
             item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
             if not usage_available:
                 item["provider_usage_missing_calls"] = int(item.get("provider_usage_missing_calls", 0)) + 1
+            item[cache_write_calls_key] = int(item.get(cache_write_calls_key, 0)) + 1
             for key in [
                 "prompt_tokens",
                 "completion_tokens",
+                "reasoning_tokens",
                 "total_tokens",
                 "prompt_cache_hit_tokens",
                 "prompt_cache_miss_tokens",
+                "cache_write_tokens",
             ]:
                 item[key] = int(item.get(key, 0)) + int(row.get(key, 0) or 0)
             item[cache_bucket] = int(item.get(cache_bucket, 0)) + prompt_tokens
@@ -832,13 +1106,15 @@ class LLMClient:
             self._append_usage_row_locked(row)
             self._write_usage_summary_locked()
         logger.info(
-            "[llm_usage] prompt=%s mode=%s source=%s input=%s cached=%s miss=%s output=%s total=%s est_input=%s usage_available=%s cache_known=%s",
+            "[llm_usage] prompt=%s mode=%s source=%s input=%s cached=%s miss=%s cache_write=%s reasoning=%s output=%s total=%s est_input=%s usage_available=%s cache_known=%s",
             prompt_name,
             mode,
             source,
             prompt_tokens,
             cached_tokens or 0,
             miss_tokens or 0,
+            cache_write_tokens or 0,
+            reasoning_tokens,
             completion_tokens,
             total_tokens,
             estimated_prompt_tokens,
@@ -856,6 +1132,8 @@ class LLMClient:
             prompt_tokens=prompt_tokens,
             cached_tokens=cached_tokens or 0,
             miss_tokens=miss_tokens or 0,
+            cache_write_tokens=cache_write_tokens or 0,
+            reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             estimated_prompt_tokens=estimated_prompt_tokens,
@@ -925,37 +1203,37 @@ class LLMClient:
         )
         completion_tokens = int(summary.get("completion_tokens", 0) or 0)
         model_name = str(self.config.llm.model_name or "")
-        if _is_deepseek_model(model_name):
-            summary["deepseek_pricing_rmb_per_1m"] = {
-                "cache_hit_input": DEEPSEEK_RMB_PER_1M_CACHE_HIT_INPUT,
-                "cache_miss_input": DEEPSEEK_RMB_PER_1M_CACHE_MISS_INPUT,
-                "output": DEEPSEEK_RMB_PER_1M_OUTPUT,
-            }
-            summary["deepseek_cost_breakdown_rmb"] = _deepseek_cost_breakdown(
+        deepseek_pricing = _deepseek_pricing_usd_per_1m(model_name)
+        if deepseek_pricing is not None:
+            summary["deepseek_pricing_usd_per_1m"] = deepseek_pricing
+            summary["deepseek_cost_breakdown_usd"] = _deepseek_cost_breakdown(
+                model_name=model_name,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached,
                 miss_tokens=missed,
                 completion_tokens=completion_tokens,
             )
-            summary["estimated_deepseek_rmb_cache_known_only"] = round(
-                _estimate_deepseek_rmb(
+            summary["estimated_deepseek_usd_cache_known_only"] = round(
+                _estimate_deepseek_usd(
+                    pricing=deepseek_pricing,
                     prompt_tokens=prompt_tokens,
                     cached_tokens=cached,
                     miss_tokens=missed,
                     completion_tokens=completion_tokens,
                     unknown_prompt_as_miss=False,
                 ),
-                6,
+                9,
             )
-            summary["estimated_deepseek_rmb_unknown_prompt_as_miss"] = round(
-                _estimate_deepseek_rmb(
+            summary["estimated_deepseek_usd_unknown_prompt_as_miss"] = round(
+                _estimate_deepseek_usd(
+                    pricing=deepseek_pricing,
                     prompt_tokens=prompt_tokens,
                     cached_tokens=cached,
                     miss_tokens=missed,
                     completion_tokens=completion_tokens,
                     unknown_prompt_as_miss=True,
                 ),
-                6,
+                9,
             )
         by_part = summary.get("by_prompt_part", {})
         if isinstance(by_part, dict):
@@ -973,36 +1251,39 @@ class LLMClient:
         by_prompt = summary.get("by_prompt", {})
         if isinstance(by_prompt, dict):
             for prompt_item in by_prompt.values():
-                if _is_deepseek_model(model_name):
+                if deepseek_pricing is not None:
                     prompt_prompt_tokens = int(prompt_item.get("prompt_tokens", 0) or 0)
                     prompt_cached = int(prompt_item.get("prompt_cache_hit_tokens", 0) or 0)
                     prompt_missed = int(prompt_item.get("prompt_cache_miss_tokens", 0) or 0)
                     prompt_completion = int(prompt_item.get("completion_tokens", 0) or 0)
-                    prompt_item["deepseek_cost_breakdown_rmb"] = _deepseek_cost_breakdown(
+                    prompt_item["deepseek_cost_breakdown_usd"] = _deepseek_cost_breakdown(
+                        model_name=model_name,
                         prompt_tokens=prompt_prompt_tokens,
                         cached_tokens=prompt_cached,
                         miss_tokens=prompt_missed,
                         completion_tokens=prompt_completion,
                     )
-                    prompt_item["estimated_deepseek_rmb_cache_known_only"] = round(
-                        _estimate_deepseek_rmb(
+                    prompt_item["estimated_deepseek_usd_cache_known_only"] = round(
+                        _estimate_deepseek_usd(
+                            pricing=deepseek_pricing,
                             prompt_tokens=prompt_prompt_tokens,
                             cached_tokens=prompt_cached,
                             miss_tokens=prompt_missed,
                             completion_tokens=prompt_completion,
                             unknown_prompt_as_miss=False,
                         ),
-                        6,
+                        9,
                     )
-                    prompt_item["estimated_deepseek_rmb_unknown_prompt_as_miss"] = round(
-                        _estimate_deepseek_rmb(
+                    prompt_item["estimated_deepseek_usd_unknown_prompt_as_miss"] = round(
+                        _estimate_deepseek_usd(
+                            pricing=deepseek_pricing,
                             prompt_tokens=prompt_prompt_tokens,
                             cached_tokens=prompt_cached,
                             miss_tokens=prompt_missed,
                             completion_tokens=prompt_completion,
                             unknown_prompt_as_miss=True,
                         ),
-                        6,
+                        9,
                     )
                 prompt_est = int(prompt_item.get("estimated_prompt_tokens", 0) or 0)
                 prompt_parts = prompt_item.get("by_part", {})
@@ -1028,8 +1309,8 @@ class LLMClient:
                 if not isinstance(item, dict):
                     continue
                 cost_breakdown = (
-                    item.get("deepseek_cost_breakdown_rmb")
-                    if isinstance(item.get("deepseek_cost_breakdown_rmb"), dict)
+                    item.get("deepseek_cost_breakdown_usd")
+                    if isinstance(item.get("deepseek_cost_breakdown_usd"), dict)
                     else {}
                 )
                 prompt_rows.append(
@@ -1042,15 +1323,17 @@ class LLMClient:
                         "input_tokens": int(item.get("prompt_tokens", 0) or 0),
                         "cache_hit_tokens": int(item.get("prompt_cache_hit_tokens", 0) or 0),
                         "cache_miss_tokens": int(item.get("prompt_cache_miss_tokens", 0) or 0),
+                        "cache_write_tokens": int(item.get("cache_write_tokens", 0) or 0),
+                        "reasoning_tokens": int(item.get("reasoning_tokens", 0) or 0),
                         "unknown_input_tokens": int(cost_breakdown.get("unknown_input_tokens", 0) or 0),
                         "output_tokens": int(item.get("completion_tokens", 0) or 0),
-                        "deepseek_cost_breakdown_rmb": cost_breakdown,
-                        "estimated_deepseek_rmb": item.get("estimated_deepseek_rmb_unknown_prompt_as_miss"),
+                        "deepseek_cost_breakdown_usd": cost_breakdown,
+                        "estimated_deepseek_usd": item.get("estimated_deepseek_usd_unknown_prompt_as_miss"),
                     }
                 )
         prompt_rows.sort(
             key=lambda row: (
-                float(row.get("estimated_deepseek_rmb") or 0.0),
+                float(row.get("estimated_deepseek_usd") or 0.0),
                 int(row.get("cache_miss_tokens", 0) or 0),
                 int(row.get("output_tokens", 0) or 0),
             ),
@@ -1069,9 +1352,11 @@ class LLMClient:
                     "input_tokens": 0,
                     "cache_hit_tokens": 0,
                     "cache_miss_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 0,
                     "unknown_input_tokens": 0,
                     "output_tokens": 0,
-                    "estimated_deepseek_rmb": 0.0,
+                    "estimated_deepseek_usd": 0.0,
                 },
             )
             item["calls"] = int(item.get("calls", 0)) + int(row.get("calls", 0) or 0)
@@ -1081,39 +1366,53 @@ class LLMClient:
                 "input_tokens",
                 "cache_hit_tokens",
                 "cache_miss_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
                 "unknown_input_tokens",
                 "output_tokens",
             ]:
                 item[key] = int(item.get(key, 0)) + int(row.get(key, 0) or 0)
-            item["estimated_deepseek_rmb"] = round(
-                float(item.get("estimated_deepseek_rmb", 0.0) or 0.0)
-                + float(row.get("estimated_deepseek_rmb", 0.0) or 0.0),
-                6,
+            item["estimated_deepseek_usd"] = round(
+                float(item.get("estimated_deepseek_usd", 0.0) or 0.0)
+                + float(row.get("estimated_deepseek_usd", 0.0) or 0.0),
+                9,
             )
         stage_rows = sorted(
             stage_rows_by_name.values(),
             key=lambda row: (
-                float(row.get("estimated_deepseek_rmb") or 0.0),
+                float(row.get("estimated_deepseek_usd") or 0.0),
                 int(row.get("cache_miss_tokens", 0) or 0),
                 int(row.get("output_tokens", 0) or 0),
             ),
             reverse=True,
         )
         return {
-            "schema_version": "autorealize.llm_usage_brief.v1",
+            "schema_version": "autorealize.llm_usage_brief.v2",
             "model": self.config.llm.model_name,
             "calls": int(summary.get("calls", 0) or 0),
             "llm_seconds": round(float(summary.get("seconds", 0.0) or 0.0), 4),
             "input_tokens": int(summary.get("prompt_tokens", 0) or 0),
             "cache_hit_tokens": int(summary.get("prompt_cache_hit_tokens", 0) or 0),
             "cache_miss_tokens": int(summary.get("prompt_cache_miss_tokens", 0) or 0),
+            "cache_write_tokens": int(summary.get("cache_write_tokens", 0) or 0),
+            "provider_cache_write_known_calls": int(
+                summary.get("provider_cache_write_known_calls", 0) or 0
+            ),
+            "provider_cache_write_unknown_calls": int(
+                summary.get("provider_cache_write_unknown_calls", 0) or 0
+            ),
+            "reasoning_tokens": int(summary.get("reasoning_tokens", 0) or 0),
             "output_tokens": int(summary.get("completion_tokens", 0) or 0),
+            "provider_response_models": summary.get("provider_response_models", {}),
+            "system_fingerprints": summary.get("system_fingerprints", {}),
             "provider_cache_hit_ratio": summary.get("provider_cache_hit_ratio", 0.0),
             "provider_cache_miss_ratio": summary.get("provider_cache_miss_ratio", 0.0),
-            "estimated_deepseek_rmb_cache_known_only": summary.get("estimated_deepseek_rmb_cache_known_only"),
-            "estimated_deepseek_rmb_unknown_prompt_as_miss": summary.get("estimated_deepseek_rmb_unknown_prompt_as_miss"),
-            "deepseek_cost_breakdown_rmb": summary.get("deepseek_cost_breakdown_rmb", {}),
-            "deepseek_pricing_rmb_per_1m": summary.get("deepseek_pricing_rmb_per_1m", {}),
+            "estimated_deepseek_usd_cache_known_only": summary.get("estimated_deepseek_usd_cache_known_only"),
+            "estimated_deepseek_usd_unknown_prompt_as_miss": summary.get(
+                "estimated_deepseek_usd_unknown_prompt_as_miss"
+            ),
+            "deepseek_cost_breakdown_usd": summary.get("deepseek_cost_breakdown_usd", {}),
+            "deepseek_pricing_usd_per_1m": summary.get("deepseek_pricing_usd_per_1m", {}),
             "by_stage": stage_rows,
             "top_prompts_by_estimated_cost": prompt_rows[:20],
         }
@@ -1153,6 +1452,7 @@ class LLMClient:
                 "绉瀬鎷掔粷",
                 "temporary failure",
                 "temporarily unavailable",
+                "insufficient_system_resource",
                 "bad gateway",
                 "502",
                 "503",
@@ -1185,7 +1485,12 @@ class LLMClient:
         for net_attempt in range(1, NETWORK_RETRY_MAX_ATTEMPTS + 1):
             try:
                 with self._request_gate:
-                    return self.client.chat.completions.create(**active_kwargs)
+                    response = self.client.chat.completions.create(**active_kwargs)
+                choices = getattr(response, "choices", None) or []
+                finish_reason = str(getattr(choices[0], "finish_reason", "") or "") if choices else ""
+                if _is_deepseek_model(self.config.llm.model_name) and finish_reason == "insufficient_system_resource":
+                    raise RuntimeError("DeepSeek returned finish_reason=insufficient_system_resource")
+                return response
             except Exception as exc:
                 last_exc = exc
                 degraded, degraded_key = _degraded_request_kwargs(active_kwargs, exc)
@@ -1264,15 +1569,27 @@ class LLMClient:
         keeps large task/data context in a provider-cache-friendly position while
         preserving backwards compatibility with the old single user prompt.
         """
+        labels = _control_prompt_labels(self.config)
         if static_user_prompt or dynamic_user_prompt is not None:
             static_user = str(static_user_prompt or "").strip()
             dynamic_user = str(dynamic_user_prompt if dynamic_user_prompt is not None else user_prompt)
             base_user = "\n\n".join(x for x in [static_user, dynamic_user] if x.strip())
-            messages = [{"role": "system", "content": system_prompt}]
-            prompt_parts = [{"name": "system_prompt", "role": "system", "content": system_prompt}]
+            messages = [{"role": "system", "content": labels["cache_system"]}]
+            prompt_parts = [
+                {
+                    "name": "cache_friendly_system",
+                    "role": "system",
+                    "content": labels["cache_system"],
+                }
+            ]
             if static_user:
                 messages.append({"role": "user", "content": static_user})
                 prompt_parts.append({"name": "static_user_prompt", "role": "user", "content": static_user})
+            agent_instructions = f"{labels['agent_title']}\n{system_prompt}"
+            messages.append({"role": "user", "content": agent_instructions})
+            prompt_parts.append(
+                {"name": "system_prompt", "role": "user", "content": agent_instructions}
+            )
             messages.append({"role": "user", "content": dynamic_user})
             prompt_parts.append({"name": "dynamic_user_prompt", "role": "user", "content": dynamic_user})
         else:
@@ -1306,7 +1623,10 @@ class LLMClient:
         logger.info("[LLM] generating text: prompt=%s model=%s", prompt_name, self.config.llm.model_name)
         log_event(logger, "llm.client", "REQUEST_STARTED", prompt=prompt_name, mode="text", model=self.config.llm.model_name)
         t0 = time.perf_counter()
-        text_max_tokens = _normal_max_tokens(self.config.llm.max_tokens)
+        text_max_tokens = _effective_output_max_tokens(
+            self.config.llm.max_tokens,
+            config=self.config.llm,
+        )
         create_kwargs = {
             "model": self.config.llm.model_name,
             "temperature": self.config.llm.temperature,
@@ -1316,17 +1636,19 @@ class LLMClient:
         }
         if text_max_tokens is not None:
             create_kwargs["max_tokens"] = text_max_tokens
-        extra_body = _deepseek_extra_body(self.config, structured=False)
-        if extra_body:
-            create_kwargs["extra_body"] = extra_body
-        try:
-            response = self._chat_completion_with_network_retry(
-                prompt_name=prompt_name,
-                mode="text",
-                create_kwargs=create_kwargs,
-            )
-        except Exception as exc:
-            raise
+        provider_cache_key = _provider_prompt_cache_key(
+            config=self.config,
+            base_url=self.base_url,
+            stable_prefix=static_user_prompt,
+        )
+        if provider_cache_key:
+            create_kwargs["prompt_cache_key"] = provider_cache_key
+        _apply_deepseek_request_options(create_kwargs, self.config, structured=False)
+        response = self._chat_completion_with_network_retry(
+            prompt_name=prompt_name,
+            mode="text",
+            create_kwargs=create_kwargs,
+        )
         text = response.choices[0].message.content or ""
         dt = time.perf_counter() - t0
         logger.info("[LLM] text completed: prompt=%s | %.2fs", prompt_name, dt)
@@ -1352,9 +1674,11 @@ class LLMClient:
             finish_reason=finish_reason,
             prompt_tokens=usage_row.get("prompt_tokens", 0),
             completion_tokens=usage_row.get("completion_tokens", 0),
+            reasoning_tokens=usage_row.get("reasoning_tokens", 0),
             total_tokens=usage_row.get("total_tokens", 0),
             cached_tokens=usage_row.get("prompt_cache_hit_tokens", 0),
             miss_tokens=usage_row.get("prompt_cache_miss_tokens", 0),
+            cache_write_tokens=usage_row.get("cache_write_tokens", 0),
         )
         self._cache_put(cache_key, text)
         self._log_trace(
@@ -1378,35 +1702,48 @@ class LLMClient:
         static_context_prompt: str = "",
         dynamic_user_prompt: str | None = None,
     ) -> T:
+        labels = _control_prompt_labels(self.config)
         schema = model_cls.model_json_schema()
-        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
-        schema_example = json.dumps(_example_from_schema(schema), ensure_ascii=False, indent=2)
-        json_rules_prefix = (
-            "Return one valid JSON object only. Do not output markdown fences or explanatory text.\n"
-            "The word json is intentionally included for JSON Output mode."
+        compact_schema = bool(getattr(self.config.llm, "compact_structured_schema", True))
+        include_json_example = bool(getattr(self.config.llm, "structured_include_json_example", False)) or bool(
+            _is_deepseek_model(self.config.llm.model_name)
+            and _is_official_deepseek_base_url(self.base_url)
+            and getattr(self.config.llm, "deepseek_json_mode_include_example", True)
         )
-        json_rules_suffix = "Only output the JSON object. No markdown, no prose, no code fences."
+        schema_text = _schema_text_for_prompt(schema, compact=compact_schema)
+        schema_example = (
+            json.dumps(_example_from_schema(schema), ensure_ascii=False, separators=(",", ":"))
+            if include_json_example
+            else ""
+        )
+        json_rules_prefix = labels["json_prefix"]
+        json_rules_suffix = labels["json_suffix"]
         # Keep the schema and JSON rules as a stable prefix, then put run-specific
         # payload in the final user message. This mirrors Claude Code/Codex-style
         # prompt-cache hygiene while still preserving a deterministic local cache key.
-        static_user = (
-            f"{json_rules_prefix}\n"
-            f"JSON example:\n{schema_example}\n\n"
-            f"Required JSON Schema:\n{schema_text}\n"
-            f"{json_rules_suffix}"
-        )
+        static_parts = [json_rules_prefix]
+        if schema_example:
+            static_parts.append(f"{labels['json_example']}:\n{schema_example}")
+        static_parts.append(f"{labels['json_schema']}:\n{schema_text}")
+        static_parts.append(json_rules_suffix)
+        static_user = "\n\n".join(static_parts)
         if fewshot:
-            static_user = f"Few-shot examples:\n{fewshot}\n\n{static_user}"
+            static_user = f"{labels['fewshot']}:\n{fewshot}\n\n{static_user}"
         stable_context_user = ""
         if static_context_prompt:
-            stable_context_user = f"Stable task/data context:\n{static_context_prompt}"
-        dynamic_user = f"Dynamic input payload:\n{dynamic_user_prompt if dynamic_user_prompt is not None else user_prompt}"
+            stable_context_user = f"{labels['stable_context']}:\n{static_context_prompt}"
+        dynamic_user = f"{labels['dynamic_input']}:\n{dynamic_user_prompt if dynamic_user_prompt is not None else user_prompt}"
         base_user = "\n\n".join(x for x in [static_user, stable_context_user, dynamic_user] if x.strip())
-        output_max_tokens = (
+        requested_output_max_tokens = (
             _normal_max_tokens(max_tokens)
             or _normal_max_tokens(getattr(self.config.llm, "structured_max_tokens", None))
             or _normal_max_tokens(self.config.llm.max_tokens)
         )
+        output_max_tokens = _effective_output_max_tokens(
+            requested_output_max_tokens,
+            config=self.config.llm,
+        )
+        active_output_max_tokens = output_max_tokens
 
         cache_key = self._cache_key(
             prompt_name=prompt_name,
@@ -1421,21 +1758,39 @@ class LLMClient:
                 logger.info("[LLM] structured cache hit: prompt=%s", prompt_name)
                 log_event(logger, "llm.client", "CACHE_HIT", prompt=prompt_name, mode="structured")
                 cache_prompt_parts = [
-                    {"name": "system_prompt", "role": "system", "content": system_prompt},
+                    (
+                        {
+                            "name": "cache_friendly_system",
+                            "role": "system",
+                            "content": labels["cache_system"],
+                        }
+                        if stable_context_user
+                        else {
+                            "name": "system_prompt",
+                            "role": "system",
+                            "content": system_prompt,
+                        }
+                    )
                 ]
-                if fewshot:
-                    cache_prompt_parts.append({"name": "fewshot", "role": "user", "content": str(fewshot)})
-                cache_prompt_parts.extend(
-                    [
-                        {"name": "json_rules", "role": "user", "content": f"{json_rules_prefix}\n{json_rules_suffix}"},
-                        {"name": "json_example", "role": "user", "content": schema_example},
-                        {"name": "json_schema", "role": "user", "content": schema_text},
-                    ]
-                )
                 if stable_context_user:
                     cache_prompt_parts.append(
                         {"name": "stable_context", "role": "user", "content": stable_context_user}
                     )
+                    cache_prompt_parts.append(
+                        {
+                            "name": "system_prompt",
+                            "role": "user",
+                            "content": f"{labels['agent_title']}\n{system_prompt}",
+                        }
+                    )
+                if fewshot:
+                    cache_prompt_parts.append({"name": "fewshot", "role": "user", "content": str(fewshot)})
+                cache_prompt_parts.extend(
+                    [{"name": "json_rules", "role": "user", "content": f"{json_rules_prefix}\n{json_rules_suffix}"}]
+                )
+                if schema_example:
+                    cache_prompt_parts.append({"name": "json_example", "role": "user", "content": schema_example})
+                cache_prompt_parts.append({"name": "json_schema", "role": "user", "content": schema_text})
                 cache_prompt_parts.append({"name": "dynamic_payload", "role": "user", "content": dynamic_user})
                 self._log_local_cache_usage(
                     prompt_name=prompt_name,
@@ -1466,7 +1821,9 @@ class LLMClient:
                 pass
 
         last_error = ""
+        force_disable_structured_thinking = False
         for attempt in range(1, self.config.llm.max_retries + 1):
+            attempt_output_max_tokens = active_output_max_tokens
             logger.info(
                 "[LLM] generating structured output: prompt=%s attempt=%s/%s model=%s",
                 prompt_name,
@@ -1484,32 +1841,52 @@ class LLMClient:
                 model=self.config.llm.model_name,
             )
             t0 = time.perf_counter()
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": static_user},
-            ]
-            prompt_parts = [
-                {"name": "system_prompt", "role": "system", "content": system_prompt},
-            ]
+            if stable_context_user:
+                messages = [
+                    {"role": "system", "content": labels["cache_system"]},
+                    {"role": "user", "content": stable_context_user},
+                    {
+                        "role": "user",
+                        "content": f"{labels['agent_title']}\n{system_prompt}",
+                    },
+                    {"role": "user", "content": static_user},
+                ]
+                prompt_parts = [
+                    {
+                        "name": "cache_friendly_system",
+                        "role": "system",
+                        "content": labels["cache_system"],
+                    },
+                    {"name": "stable_context", "role": "user", "content": stable_context_user},
+                    {
+                        "name": "system_prompt",
+                        "role": "user",
+                        "content": f"{labels['agent_title']}\n{system_prompt}",
+                    },
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": static_user},
+                ]
+                prompt_parts = [
+                    {"name": "system_prompt", "role": "system", "content": system_prompt},
+                ]
             if fewshot:
                 prompt_parts.append({"name": "fewshot", "role": "user", "content": str(fewshot)})
             prompt_parts.extend(
-                [
-                    {"name": "json_rules", "role": "user", "content": f"{json_rules_prefix}\n{json_rules_suffix}"},
-                    {"name": "json_example", "role": "user", "content": schema_example},
-                    {"name": "json_schema", "role": "user", "content": schema_text},
-                ]
+                [{"name": "json_rules", "role": "user", "content": f"{json_rules_prefix}\n{json_rules_suffix}"}]
             )
-            if stable_context_user:
-                messages.append({"role": "user", "content": stable_context_user})
-                prompt_parts.append({"name": "stable_context", "role": "user", "content": stable_context_user})
+            if schema_example:
+                prompt_parts.append({"name": "json_example", "role": "user", "content": schema_example})
+            prompt_parts.append({"name": "json_schema", "role": "user", "content": schema_text})
             messages.append({"role": "user", "content": dynamic_user})
             prompt_parts.append({"name": "dynamic_payload", "role": "user", "content": dynamic_user})
             if last_error and self.config.llm.enforce_json_retry:
                 retry_error_prompt = (
-                    "The previous response was not a valid JSON object for the schema.\n"
-                    f"Error:\n{last_error}\n"
-                    "Return exactly one valid JSON object now. No markdown, no prose, no code fences."
+                    f"{labels['retry_invalid']}\n"
+                    f"{labels['error']}:\n{last_error}\n"
+                    f"{labels['retry_now']}"
                 )
                 messages.append(
                     {
@@ -1526,20 +1903,27 @@ class LLMClient:
                 "timeout": self.config.llm.request_timeout_seconds,
                 "response_format": {"type": "json_object"},
             }
-            if output_max_tokens is not None:
-                create_kwargs["max_tokens"] = output_max_tokens
-            extra_body = _deepseek_extra_body(self.config, structured=True)
-            if extra_body:
-                create_kwargs["extra_body"] = extra_body
-            try:
-                response = self._chat_completion_with_network_retry(
-                    prompt_name=prompt_name,
-                    mode="structured",
-                    parse_attempt=attempt,
-                    create_kwargs=create_kwargs,
-                )
-            except Exception as exc:
-                raise
+            if attempt_output_max_tokens is not None:
+                create_kwargs["max_tokens"] = attempt_output_max_tokens
+            provider_cache_key = _provider_prompt_cache_key(
+                config=self.config,
+                base_url=self.base_url,
+                stable_prefix=static_context_prompt,
+            )
+            if provider_cache_key:
+                create_kwargs["prompt_cache_key"] = provider_cache_key
+            _apply_deepseek_request_options(
+                create_kwargs,
+                self.config,
+                structured=True,
+                force_disable_thinking=force_disable_structured_thinking,
+            )
+            response = self._chat_completion_with_network_retry(
+                prompt_name=prompt_name,
+                mode="structured",
+                parse_attempt=attempt,
+                create_kwargs=create_kwargs,
+            )
             choice = response.choices[0]
             text = choice.message.content or ""
             finish_reason = str(getattr(choice, "finish_reason", "") or "")
@@ -1555,7 +1939,7 @@ class LLMClient:
                     seconds=dt,
                     attempt=attempt,
                     finish_reason=finish_reason,
-                    max_tokens=output_max_tokens,
+                    max_tokens=attempt_output_max_tokens,
                     parsed_ok=True,
                     prompt_parts=prompt_parts,
                 )
@@ -1568,12 +1952,14 @@ class LLMClient:
                     attempt=attempt,
                     seconds=f"{dt:.2f}",
                     finish_reason=finish_reason,
-                    max_tokens=output_max_tokens,
+                    max_tokens=attempt_output_max_tokens,
                     prompt_tokens=usage_row.get("prompt_tokens", 0),
                     completion_tokens=usage_row.get("completion_tokens", 0),
+                    reasoning_tokens=usage_row.get("reasoning_tokens", 0),
                     total_tokens=usage_row.get("total_tokens", 0),
                     cached_tokens=usage_row.get("prompt_cache_hit_tokens", 0),
                     miss_tokens=usage_row.get("prompt_cache_miss_tokens", 0),
+                    cache_write_tokens=usage_row.get("cache_write_tokens", 0),
                 )
                 if repair_note:
                     log_event(
@@ -1604,17 +1990,67 @@ class LLMClient:
                     seconds=dt,
                     attempt=attempt,
                     finish_reason=finish_reason,
-                    max_tokens=output_max_tokens,
+                    max_tokens=attempt_output_max_tokens,
                     parsed_ok=False,
                     prompt_parts=prompt_parts,
                 )
                 last_error = _format_parse_error(
                     exc,
                     finish_reason=finish_reason,
-                    max_tokens=output_max_tokens,
+                    max_tokens=attempt_output_max_tokens,
                     text=text,
                 )
                 will_retry = attempt < self.config.llm.max_retries
+                reasoning_fallback = bool(
+                    will_retry
+                    and not force_disable_structured_thinking
+                    and bool(getattr(self.config.llm, "structured_reasoning_fallback_on_length", True))
+                    and _is_deepseek_model(self.config.llm.model_name)
+                    and _should_disable_structured_thinking_after_length(
+                        response=response,
+                        finish_reason=finish_reason,
+                        ratio_threshold=float(
+                            getattr(self.config.llm, "structured_reasoning_fallback_ratio", 0.75) or 0.75
+                        ),
+                    )
+                )
+                if reasoning_fallback:
+                    force_disable_structured_thinking = True
+                    reasoning_tokens = _response_reasoning_tokens(response)
+                    last_error = (
+                        f"{last_error}; next_retry_disables_thinking=true; "
+                        f"reasoning_tokens={reasoning_tokens}"
+                    )
+                    log_event(
+                        logger,
+                        "llm.client",
+                        "STRUCTURED_THINKING_DOWNGRADED",
+                        prompt=prompt_name,
+                        attempt=attempt,
+                        finish_reason=finish_reason,
+                        reasoning_tokens=reasoning_tokens,
+                        completion_tokens=usage_row.get("completion_tokens", 0),
+                    )
+                if will_retry and finish_reason == "length":
+                    next_max_tokens = _next_structured_length_retry_max_tokens(
+                        current_max_tokens=active_output_max_tokens,
+                        config=self.config.llm,
+                    )
+                    if next_max_tokens is not None and next_max_tokens != active_output_max_tokens:
+                        previous_max_tokens = active_output_max_tokens
+                        active_output_max_tokens = next_max_tokens
+                        last_error = (
+                            f"{last_error}; next_retry_max_tokens={active_output_max_tokens}"
+                        )
+                        log_event(
+                            logger,
+                            "llm.client",
+                            "STRUCTURED_MAX_TOKENS_EXPANDED",
+                            prompt=prompt_name,
+                            attempt=attempt,
+                            previous_max_tokens=previous_max_tokens,
+                            next_max_tokens=active_output_max_tokens,
+                        )
                 self._log_trace(
                     LLMTrace(
                         prompt_name=prompt_name,
@@ -1633,12 +2069,17 @@ class LLMClient:
                     mode="structured",
                     attempt=attempt,
                     finish_reason=finish_reason,
-                    max_tokens=output_max_tokens,
+                    max_tokens=attempt_output_max_tokens,
+                    next_retry_max_tokens=(
+                        active_output_max_tokens if will_retry and finish_reason == "length" else None
+                    ),
                     prompt_tokens=usage_row.get("prompt_tokens", 0),
                     completion_tokens=usage_row.get("completion_tokens", 0),
+                    reasoning_tokens=usage_row.get("reasoning_tokens", 0),
                     total_tokens=usage_row.get("total_tokens", 0),
                     cached_tokens=usage_row.get("prompt_cache_hit_tokens", 0),
                     miss_tokens=usage_row.get("prompt_cache_miss_tokens", 0),
+                    cache_write_tokens=usage_row.get("cache_write_tokens", 0),
                     error=last_error[:180],
                 )
         raise RuntimeError(f"LLM structured output failed: {last_error}")

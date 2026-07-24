@@ -174,6 +174,7 @@ def _extract_constraint_memory(
     prompt_mgr: PromptManager,
     file_summaries: list[FileSummary],
     task_hint: str,
+    authoritative_memory: dict | None = None,
 ) -> dict:
     """抽取跨阶段复用的关键约束记忆。"""
     # 规则先验：先从字段和摘要里抓明显约束线索。
@@ -213,16 +214,52 @@ def _extract_constraint_memory(
     system = (
         "你是约束抽取器。请仅输出 JSON，结构必须满足给定 schema。"
         "你的任务是从文件摘要与字段中提取对任务有决定作用的业务约束、数据约束、评估约束。"
+        "你还要在独立的 entity_alias_candidates 中提出跨表实体别名候选；候选不是约束，也不是等价结论。"
+    )
+    alias_schema = _compact_entity_alias_schema(
+        file_summaries,
+        max_fields=int(
+            getattr(
+                getattr(getattr(llm_client, "config", None), "llm", None),
+                "entity_alias_schema_max_fields",
+                600,
+            )
+            or 600
+        ),
     )
     stable, dynamic = stable_dynamic_prompt(
         stable={
             "task_hint": task_hint,
-            "file_summaries": [fs.model_dump() for fs in file_summaries][:80],
+            "file_summaries": _compact_constraint_source_summaries(file_summaries),
+            "entity_alias_schema": alias_schema,
+            "requirement_fact_matrix": [
+                item
+                for item in ((authoritative_memory or {}).get("requirement_fact_matrix", []) or [])
+                if isinstance(item, dict)
+            ][:80],
         },
-        dynamic={"instruction": "提炼可执行约束，不要泛泛而谈；每条约束给证据与相关字段。"},
+        dynamic={
+            "instruction": (
+                "提炼当前可执行约束，不要泛泛而谈；每条约束给证据与相关字段。"
+                "必须区分当前规则、问题清单、后续回答、未来规划和示例。"
+                "如果早期文档说某类数据缺失，但后续解释文档指出其所在文件/字段，或文件摘要明确显示该数据存在，"
+                "将旧缺失说法标为 superseded，不得写入当前约束。未来能力和举例标为 not_current。"
+                "requirement_fact_matrix 已完成文档冲突路由：只把 status=current 的规则当当前约束；"
+                "status=unresolved 只能作为待确认项，resolved/superseded/not_current 不得进入约束。"
+                "另外检查 entity_alias_schema：如果不同文件或 Sheet 中名称不同的物理字段可能表示同一业务实体，"
+                "把它们写入 entity_alias_candidates。每个候选必须逐项引用 schema 中真实存在的 source_file、"
+                "sheet_name、field，并给出 semantic_role、value_kind 和基于字段语义/文件角色的 evidence。"
+                "每组还必须给出 task_relevance=high/medium/low 与 relevance_reason；只有会影响当前任务 join、"
+                "约束、评估或输出的候选才能标 high。"
+                "这里只提出待验证假设，不得断言字段等价，不得把候选放入 items，不得杜撰 schema 中不存在的字段。"
+                "如果没有足够证据或只有一个字段，返回空候选；宁缺毋滥。"
+                "如果 entity_alias_schema.truncated=true，不得据此断言遗漏区域没有别名；将需要继续核验的范围写入 unresolved_questions。"
+                "严格控制输出：summary 不超过 300 字；items 最多 12 条，每条 evidence 最多 4 项；"
+                "entity_alias_candidates 最多 8 组，每组 candidate_fields 最多 8 个，reason/caution/evidence 均只写一句短句。"
+            )
+        },
         stable_title="Stable constraint extraction context",
         dynamic_title="Dynamic constraint extraction request",
-        stable_limit=12000,
     )
     mem = llm_client.ask_structured(
         model_cls=ConstraintMemory,
@@ -231,6 +268,14 @@ def _extract_constraint_memory(
         prompt_name="constraint_memory_extractor",
         static_context_prompt=stable,
         dynamic_user_prompt=dynamic,
+        max_tokens=int(
+            getattr(
+                getattr(getattr(llm_client, "config", None), "llm", None),
+                "constraint_memory_max_tokens",
+                32768,
+            )
+            or 32768
+        ),
     )
     out = mem.model_dump()
     # Rule hints may enrich the LLM result, but they are never a replacement for LLM extraction.
@@ -239,7 +284,137 @@ def _extract_constraint_memory(
         for it in rule_items:
             if it.get("name") not in exist:
                 out.setdefault("items", []).append(it)
+    out["items"] = [
+        item
+        for item in out.get("items", [])
+        if not isinstance(item, dict)
+        or str(item.get("status", "current_candidate") or "current_candidate")
+        not in {"superseded", "not_current", "resolved"}
+    ]
+    out["entity_alias_candidates"] = [
+        group
+        for group in out.get("entity_alias_candidates", [])
+        if isinstance(group, dict) and len(group.get("candidate_fields") or []) >= 2
+    ][:12]
+    out["entity_alias_schema_telemetry"] = {
+        key: alias_schema.get(key)
+        for key in [
+            "truncated",
+            "visible_field_count",
+            "total_field_count",
+            "omitted_field_count",
+            "visible_schema_count",
+            "omitted_schema_count",
+            "omitted_sources",
+        ]
+    }
     return out
+
+
+def _compact_entity_alias_schema(file_summaries: list[FileSummary], *, max_fields: int = 600) -> dict:
+    """Compact identical physical schemas without guessing which fields are entities."""
+
+    buckets: dict[tuple[str, tuple[str, ...]], dict] = {}
+    for fs in file_summaries or []:
+        if fs.role != FileRole.raw_data_table:
+            continue
+        meta = fs.source_metadata if isinstance(fs.source_metadata, dict) else {}
+        sheets = meta.get("excel_sheet_profiles") if isinstance(meta.get("excel_sheet_profiles"), list) else []
+        table_rows = []
+        if sheets:
+            for sheet in sheets:
+                if not isinstance(sheet, dict):
+                    continue
+                table_rows.append(
+                    (
+                        str(sheet.get("sheet_name", "") or ""),
+                        [str(column) for column in (sheet.get("columns") or []) if str(column).strip()],
+                    )
+                )
+        else:
+            table_rows.append(("", [str(column) for column in (fs.columns or []) if str(column).strip()]))
+        for sheet_name, columns in table_rows:
+            if not columns:
+                continue
+            signature = (sheet_name, tuple(columns))
+            bucket = buckets.setdefault(
+                signature,
+                {
+                    "source_files": [],
+                    "sheet_name": sheet_name,
+                    "fields": columns,
+                    "field_meanings": {},
+                },
+            )
+            bucket["source_files"].append(fs.path)
+            for column in columns:
+                meaning = str((fs.column_semantics or {}).get(column, "") or "").strip()
+                if meaning and column not in bucket["field_meanings"]:
+                    bucket["field_meanings"][column] = meaning[:180]
+
+    total_schema_count = len(buckets)
+    total_fields = sum(len(item.get("fields") or []) for item in buckets.values())
+    visible_groups: list[dict] = []
+    visible_fields = 0
+    omitted_sources: list[str] = []
+    field_budget = max(0, int(max_fields))
+    for item in buckets.values():
+        all_sources = list(dict.fromkeys(str(path) for path in item.get("source_files", [])))
+        all_fields = [str(field) for field in (item.get("fields") or [])]
+        remaining = max(0, field_budget - visible_fields)
+        if len(visible_groups) >= 120 or remaining <= 0:
+            omitted_sources.extend(all_sources)
+            continue
+        visible_columns = all_fields[:remaining]
+        field_meanings = {
+            column: meaning
+            for column, meaning in (item.get("field_meanings") or {}).items()
+            if column in visible_columns
+        }
+        visible_group = {
+            "source_files": all_sources[:20],
+            "sheet_name": item.get("sheet_name", ""),
+            "fields": visible_columns,
+            "total_field_count": len(all_fields),
+            "fields_truncated": len(visible_columns) < len(all_fields),
+            "omitted_field_count": max(0, len(all_fields) - len(visible_columns)),
+        }
+        if field_meanings:
+            visible_group["field_meanings"] = field_meanings
+        visible_groups.append(visible_group)
+        visible_fields += len(visible_columns)
+        if len(visible_columns) < len(all_fields) or len(all_sources) > 20:
+            omitted_sources.extend(all_sources)
+
+    omitted_schema_count = max(0, total_schema_count - len(visible_groups))
+    omitted_field_count = max(0, total_fields - visible_fields)
+    return {
+        "schema_version": "autorealize.entity_alias_schema.v1",
+        "groups": visible_groups,
+        "truncated": bool(omitted_field_count or omitted_schema_count),
+        "visible_field_count": visible_fields,
+        "total_field_count": total_fields,
+        "omitted_field_count": omitted_field_count,
+        "visible_schema_count": len(visible_groups),
+        "omitted_schema_count": omitted_schema_count,
+        "omitted_sources": list(dict.fromkeys(omitted_sources))[:40],
+        "policy": "Only visible exact fields may be referenced. Truncation means absence of an alias cannot be concluded.",
+    }
+
+
+def _compact_constraint_source_summaries(file_summaries: list[FileSummary]) -> list[dict]:
+    """Keep semantic navigation while excluding raw metadata and profile payloads."""
+
+    return [
+        {
+            "path": fs.path,
+            "role": fs.role.value if isinstance(fs.role, FileRole) else str(fs.role),
+            "summary": str(fs.summary or "")[:320],
+            "key_facts": [str(item)[:240] for item in (fs.extracted_knowledge or [])[:5]],
+            "warnings": [str(item)[:240] for item in (fs.warnings or [])[:5]],
+        }
+        for fs in (file_summaries or [])[:60]
+    ]
 
 
 class AutoRealizePipeline:
@@ -1737,10 +1912,25 @@ def _infer_downstream_context(
     """Infer train/predict/label semantics and non-binding submission hints."""
     table_paths = [p for p in walk_files(data_root) if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}]
     hint_lower = task_hint.lower()
-    placeholders = {"", "nan", "none", "null", "na", "n/a", "unknown", "?"}
-    label_priority = ["target", "label", "y"]
+    placeholders = {
+        "",
+        "nan",
+        "none",
+        "null",
+        "na",
+        "n/a",
+        "unknown",
+        "?",
+        "-",
+        "--",
+        "待预测",
+        "待填",
+        "未标注",
+        "未知",
+    }
+    label_priority = ["target", "label", "y", "标签", "目标", "预测目标", "结果"]
 
-    def _read_small_table(path: Path, nrows: int = 200) -> pd.DataFrame:
+    def _read_small_table(path: Path, nrows: int = 200, sheet_name: str = "") -> pd.DataFrame:
         if path.suffix.lower() == ".csv":
             return read_csv_auto(path, nrows=nrows)
         if path.suffix.lower() == ".json":
@@ -1753,7 +1943,7 @@ def _infer_downstream_context(
                 keep_raw_nested_columns=cfg.data.json_keep_raw_nested_columns,
             )
             return df.head(nrows)
-        return pd.read_excel(path, nrows=nrows)
+        return pd.read_excel(path, nrows=nrows, sheet_name=sheet_name or 0)
 
     def _label_score(series: pd.Series) -> float:
         if series is None or len(series) == 0:
@@ -1854,17 +2044,39 @@ def _infer_downstream_context(
         return ""
 
     def _is_train_filename(name_lower: str) -> bool:
-        return re.search(r"(^|[_\-.])(train|training)([_\-.]|$)", name_lower) is not None
+        return (
+            re.search(r"(^|[_\-.\s])(train|training)([_\-.\s]|$)", name_lower) is not None
+            or any(token in name_lower for token in ["训练", "历史标注", "有标签"])
+        )
 
     def _is_test_filename(name_lower: str) -> bool:
-        return re.search(r"(^|[_\-.])(test|testing)([_\-.]|$)", name_lower) is not None
+        return (
+            re.search(
+                r"(^|[_\-.\s])(test|testing|predict|prediction|inference|scoring)([_\-.\s]|$)",
+                name_lower,
+            )
+            is not None
+            or any(token in name_lower for token in ["测试", "预测", "待预测", "推理"])
+        )
 
     table_infos: list[dict] = []
     # Only official sample/submission files may populate this hard contract.
     submission_columns: list[str] = []
+    table_units: list[tuple[Path, str]] = []
     for table in table_paths:
+        if table.suffix.lower() in {".xlsx", ".xls"}:
+            try:
+                sheet_names = [str(name) for name in pd.ExcelFile(table).sheet_names]
+            except Exception:  # noqa: BLE001
+                sheet_names = [""]
+            table_units.extend((table, sheet_name) for sheet_name in sheet_names)
+        else:
+            table_units.append((table, ""))
+
+    file_summary_by_name = {Path(str(fs.path)).name.lower(): fs for fs in file_summaries}
+    for table, sheet_name in table_units:
         try:
-            df = _read_small_table(table, nrows=500)
+            df = _read_small_table(table, nrows=500, sheet_name=sheet_name)
         except Exception:  # noqa: BLE001
             continue
         if df is None or df.empty:
@@ -1872,7 +2084,7 @@ def _infer_downstream_context(
 
         columns = [str(c) for c in df.columns.tolist()]
         lower_cols = {c.lower(): c for c in columns}
-        name_lower = table.name.lower()
+        name_lower = " ".join(part for part in [table.name.lower(), sheet_name.lower()] if part)
         is_train_name = _is_train_filename(name_lower)
         is_test_name = _is_test_filename(name_lower)
         is_submission = (
@@ -1884,20 +2096,35 @@ def _infer_downstream_context(
         if is_submission and not submission_columns:
             submission_columns = columns
 
-        label_candidates: list[tuple[str, float]] = []
+        label_candidates: list[tuple[str, float, str]] = []
         for lp in label_priority:
             if lp in lower_cols:
                 col = lower_cols[lp]
-                label_candidates.append((col, _label_score(df[col])))
+                label_candidates.append((col, _label_score(df[col]), "exact_label_name"))
         for c in columns:
             lc = c.lower()
             if lc in {"target", "label", "y"} and lc not in label_priority:
-                label_candidates.append((c, _label_score(df[c])))
-        label_candidates = [(c, s) for c, s in label_candidates if s > 0.0]
+                label_candidates.append((c, _label_score(df[c]), "exact_label_name"))
+        summary = file_summary_by_name.get(table.name.lower())
+        semantic_map = getattr(summary, "column_semantics", {}) if summary is not None else {}
+        for c in columns:
+            semantic_text = str(semantic_map.get(c, "") or "").lower()
+            if any(token in semantic_text for token in ["target", "label", "ground truth", "监督标签", "预测目标", "真实值"]):
+                label_candidates.append((c, _label_score(df[c]), "file_cognition_semantic"))
+        deduped_label_candidates: dict[str, tuple[float, str]] = {}
+        for candidate, score, evidence in label_candidates:
+            if score <= 0.0:
+                continue
+            previous = deduped_label_candidates.get(candidate)
+            if previous is None or score > previous[0]:
+                deduped_label_candidates[candidate] = (score, evidence)
         label_col = ""
         label_score = 0.0
-        if label_candidates:
-            label_col, label_score = sorted(label_candidates, key=lambda x: (-x[1], x[0]))[0]
+        label_evidence = ""
+        if deduped_label_candidates:
+            label_col, (label_score, label_evidence) = sorted(
+                deduped_label_candidates.items(), key=lambda x: (-x[1][0], x[0])
+            )[0]
 
         entity_id_key = _best_col_by_keywords(
             columns,
@@ -1923,6 +2150,9 @@ def _infer_downstream_context(
             {
                 "path": str(table),
                 "name": table.name,
+                "source_file": table.name,
+                "sheet_name": sheet_name,
+                "table_ref": f"{table.name}::{sheet_name}" if sheet_name else table.name,
                 "rows": int(df.shape[0]),
                 "cols": int(df.shape[1]),
                 "columns": columns,
@@ -1937,6 +2167,7 @@ def _infer_downstream_context(
                 "is_submission": is_submission,
                 "label_col": label_col,
                 "label_score": float(label_score),
+                "label_evidence": label_evidence,
                 "has_usable_label": bool(label_col),
             }
         )
@@ -1955,12 +2186,27 @@ def _infer_downstream_context(
         if len(train_only) == 1:
             label_col = train_only[0]
             train_schema_hint["label_col"] = label_col
-            train_schema_hint["label_score"] = _label_score(_read_small_table(Path(train_schema_hint["path"]), nrows=500)[label_col])
+            train_schema_hint["label_score"] = _label_score(
+                _read_small_table(
+                    Path(train_schema_hint["path"]),
+                    nrows=500,
+                    sheet_name=str(train_schema_hint.get("sheet_name") or ""),
+                )[label_col]
+            )
+            train_schema_hint["label_evidence"] = "train_predict_schema_difference"
             train_schema_hint["has_usable_label"] = True
         else:
             scored_same_name: list[tuple[float, str]] = []
-            test_df = _read_small_table(Path(test_schema_hint["path"]), nrows=500)
-            train_df = _read_small_table(Path(train_schema_hint["path"]), nrows=500)
+            test_df = _read_small_table(
+                Path(test_schema_hint["path"]),
+                nrows=500,
+                sheet_name=str(test_schema_hint.get("sheet_name") or ""),
+            )
+            train_df = _read_small_table(
+                Path(train_schema_hint["path"]),
+                nrows=500,
+                sheet_name=str(train_schema_hint.get("sheet_name") or ""),
+            )
             for c in train_schema_hint["columns"]:
                 if c not in test_cols or c not in train_df.columns or c not in test_df.columns:
                     continue
@@ -1971,7 +2217,8 @@ def _infer_downstream_context(
             if scored_same_name:
                 _, label_col = sorted(scored_same_name, key=lambda x: (-x[0], x[1]))[0]
                 train_schema_hint["label_col"] = label_col
-                train_schema_hint["label_score"] = float(_label_score(_read_small_table(Path(train_schema_hint["path"]), nrows=500)[label_col]))
+                train_schema_hint["label_score"] = float(_label_score(train_df[label_col]))
+                train_schema_hint["label_evidence"] = "train_value_present_predict_placeholder"
                 train_schema_hint["has_usable_label"] = True
 
     train_table = None
@@ -2084,6 +2331,200 @@ def _infer_downstream_context(
         if evidence.endswith("_heuristic") or "heuristic" in evidence
     ]
 
+    def _table_candidates(kind: str) -> list[dict]:
+        candidates: list[dict] = []
+        for idx, table in enumerate(table_infos):
+            if table.get("is_submission"):
+                continue
+            evidence: list[str] = []
+            raw_score = 0.0
+            if kind == "train_table":
+                if table.get("is_train_name"):
+                    raw_score += 4.0
+                    evidence.append("filename_or_sheet_matches_train")
+                if table.get("has_usable_label"):
+                    raw_score += 4.0
+                    evidence.append(str(table.get("label_evidence") or "usable_label_values"))
+                if table.get("is_test_name"):
+                    raw_score -= 3.0
+                if table is train_table:
+                    raw_score += 1.0
+                    evidence.append("selected_by_deterministic_rules")
+            else:
+                if table.get("is_test_name"):
+                    raw_score += 4.0
+                    evidence.append("filename_or_sheet_matches_predict")
+                if not table.get("has_usable_label"):
+                    raw_score += 3.0
+                    evidence.append("no_usable_label_in_sample")
+                if table.get("is_train_name"):
+                    raw_score -= 3.0
+                if table is pred_table:
+                    raw_score += 1.0
+                    evidence.append("selected_by_deterministic_rules")
+            if raw_score <= 0:
+                continue
+            candidates.append(
+                {
+                    "candidate_id": f"{kind}:{idx}",
+                    "value": str(table.get("name") or ""),
+                    "source_file": str(table.get("source_file") or table.get("name") or ""),
+                    "sheet_name": str(table.get("sheet_name") or ""),
+                    "table_ref": str(table.get("table_ref") or table.get("name") or ""),
+                    "score": round(min(1.0, max(0.0, raw_score / 8.0)), 4),
+                    "evidence": list(dict.fromkeys(evidence)),
+                    "columns": list(table.get("columns") or [])[:200],
+                }
+            )
+        return sorted(candidates, key=lambda item: (-float(item["score"]), item["table_ref"]))
+
+    def _field_candidates(kind: str, preferred_table: dict | None) -> list[dict]:
+        candidates: list[dict] = []
+        table_order = [preferred_table] if preferred_table else []
+        table_order.extend(table for table in table_infos if table is not preferred_table and not table.get("is_submission"))
+        for table_idx, table in enumerate(table_order[:6]):
+            if not table:
+                continue
+            columns = list(table.get("columns") or [])
+            for column_idx, column in enumerate(columns):
+                name = str(column)
+                lower = name.lower()
+                evidence: list[str] = []
+                score = 0.0
+                if kind == "target_column":
+                    if name == str(table.get("label_col") or ""):
+                        score = max(score, 0.95)
+                        evidence.append(str(table.get("label_evidence") or "label_population"))
+                    if lower in {"target", "label", "y"} or name in {"标签", "目标", "预测目标"}:
+                        score = max(score, 0.9)
+                        evidence.append("canonical_target_name")
+                    if train_table and name in train_only_columns and table is train_table:
+                        score = max(score, 0.82)
+                        evidence.append("present_in_train_not_predict")
+                else:
+                    if name == str(table.get("id_col") or ""):
+                        score = max(score, 0.92)
+                        evidence.append("deterministic_id_score")
+                    if lower == "id" or lower.endswith("_id") or any(
+                        token in name for token in ["编号", "编码", "代码", "单号", "主键"]
+                    ):
+                        score = max(score, 0.82)
+                        evidence.append("identifier_name_pattern")
+                if score <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "candidate_id": f"{kind}:{table_idx}:{column_idx}",
+                        "value": name,
+                        "source_file": str(table.get("source_file") or table.get("name") or ""),
+                        "sheet_name": str(table.get("sheet_name") or ""),
+                        "table_ref": str(table.get("table_ref") or table.get("name") or ""),
+                        "score": round(score, 4),
+                        "evidence": list(dict.fromkeys(evidence)),
+                    }
+                )
+        deduped: dict[tuple[str, str, str], dict] = {}
+        for candidate in candidates:
+            key = (candidate["source_file"], candidate["sheet_name"], candidate["value"])
+            current = deduped.get(key)
+            if current is None or float(candidate["score"]) > float(current["score"]):
+                deduped[key] = candidate
+        return sorted(deduped.values(), key=lambda item: (-float(item["score"]), item["table_ref"], item["value"]))
+
+    train_candidates = _table_candidates("train_table")
+    predict_candidates = _table_candidates("predict_table")
+    target_candidates = _field_candidates("target_column", train_table)
+    id_candidates = _field_candidates("id_column", pred_table or train_table)
+    task_type_candidates = [
+        {
+            "candidate_id": f"task_type_hint:{task_type_hint}",
+            "value": task_type_hint,
+            "score": 0.86 if task_type_hint != "optimization_or_rl" else 0.52,
+            "evidence": [evidence_levels["task_type_hint"]],
+        }
+    ]
+    for value in ["regression", "binary_classification", "time_series_regression", "optimization", "reinforcement_learning"]:
+        if value != task_type_hint:
+            task_type_candidates.append(
+                {
+                    "candidate_id": f"task_type_hint:{value}",
+                    "value": value,
+                    "score": 0.25,
+                    "evidence": ["bounded_semantic_alternative"],
+                }
+            )
+
+    inference_candidates = {
+        "train_table": train_candidates,
+        "predict_table": predict_candidates,
+        "id_column": id_candidates,
+        "target_column": target_candidates,
+        "task_type_hint": task_type_candidates,
+    }
+
+    def _resolution(
+        dimension: str,
+        selected_value: str,
+        selected_source: str = "",
+        selected_sheet: str = "",
+    ) -> dict:
+        candidates = list(inference_candidates.get(dimension) or [])
+        selected = next(
+            (
+                item
+                for item in candidates
+                if str(item.get("value") or "") == str(selected_value or "")
+                and (not selected_source or str(item.get("source_file") or "") == selected_source)
+                and (not selected_sheet or str(item.get("sheet_name") or "") == selected_sheet)
+            ),
+            None,
+        )
+        if selected is None and candidates and not selected_value:
+            selected = candidates[0]
+        alternatives = [item for item in candidates if item is not selected][:5]
+        selected_score = float(selected.get("score") or 0.0) if selected else 0.0
+        runner_up = max((float(item.get("score") or 0.0) for item in alternatives), default=0.0)
+        unresolved = selected is None or selected_score < 0.72 or (runner_up > 0 and selected_score - runner_up < 0.12)
+        return {
+            "selected_candidate_id": str(selected.get("candidate_id") or "") if selected else "",
+            "selected_value": str(selected.get("value") or selected_value or "") if selected else str(selected_value or ""),
+            "confidence": round(selected_score, 4),
+            "evidence": list(selected.get("evidence") or []) if selected else [],
+            "alternatives": [str(item.get("candidate_id") or "") for item in alternatives],
+            "unresolved": unresolved,
+        }
+
+    inference_resolution = {
+        "train_table": _resolution(
+            "train_table",
+            str(train_table.get("name") or "") if train_table else "",
+            str(train_table.get("source_file") or "") if train_table else "",
+            str(train_table.get("sheet_name") or "") if train_table else "",
+        ),
+        "predict_table": _resolution(
+            "predict_table",
+            str(pred_table.get("name") or "") if pred_table else "",
+            str(pred_table.get("source_file") or "") if pred_table else "",
+            str(pred_table.get("sheet_name") or "") if pred_table else "",
+        ),
+        "id_column": _resolution(
+            "id_column",
+            id_column,
+            str((pred_table or train_table or {}).get("source_file") or ""),
+            str((pred_table or train_table or {}).get("sheet_name") or ""),
+        ),
+        "target_column": _resolution(
+            "target_column",
+            target_column,
+            str((train_table or {}).get("source_file") or ""),
+            str((train_table or {}).get("sheet_name") or ""),
+        ),
+        "task_type_hint": _resolution("task_type_hint", task_type_hint),
+    }
+    unresolved_inferences = [
+        dimension for dimension, resolution in inference_resolution.items() if bool(resolution.get("unresolved"))
+    ]
+
     return {
         "task_hint": task_hint,
         "id_column": id_column,
@@ -2101,9 +2542,23 @@ def _infer_downstream_context(
         "detected_tables": [t["name"] for t in table_infos][:20]
         or [fs.path for fs in file_summaries if fs.role == FileRole.raw_data_table][:20],
         "train_table": train_table["name"] if train_table else "",
+        "train_sheet": str(train_table.get("sheet_name") or "") if train_table else "",
         "predict_table": pred_table["name"] if pred_table else "",
+        "predict_sheet": str(pred_table.get("sheet_name") or "") if pred_table else "",
         "evidence_levels": evidence_levels,
         "heuristic_fields": heuristic_fields,
+        "inference_candidates": inference_candidates,
+        "inference_resolution": inference_resolution,
+        "unresolved_inferences": unresolved_inferences,
+        "detected_table_units": [
+            {
+                "source_file": str(table.get("source_file") or table.get("name") or ""),
+                "sheet_name": str(table.get("sheet_name") or ""),
+                "table_ref": str(table.get("table_ref") or table.get("name") or ""),
+                "columns": list(table.get("columns") or [])[:200],
+            }
+            for table in table_infos[:80]
+        ],
         "train_columns": train_columns[:200],
         "predict_columns": predict_columns[:200],
         "train_only_columns": train_only_columns[:200],

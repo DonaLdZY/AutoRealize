@@ -22,9 +22,14 @@
 - 同义词纠错规则：如果用户/说明文档使用的业务词和真实物理列名不一致，要写成“业务概念，对应物理字段 `精确列名`”；不得把业务词单独列为源字段。
 - 可评估口径规则：不要把原始行数、唯一 ID 数、非空日期行数混成同一个概念。如果某章节提到样本数、订单数或覆盖范围，必须说明它是全量原始记录、唯一主键集合，还是满足必需字段的可评估集合；缺少必需字段时必须写明排除或兜底规则。
 - 多 sheet Excel 规则：只有精确 `sheet_name` 可以用于 `pd.read_excel(..., sheet_name=...)`；文件角色、业务角色、章节标题或表的自然语言类别不能写成 Sheet 名。
+- 来源覆盖规则：`source_coverage_ledger.entries` 是完整来源清单。`coverage_status=required/supporting` 的每个单文件、Sheet 或目录集合都必须在数据说明中出现；若不参与任务，必须给出基于证据的排除原因，不能静默遗漏。
+- 行数优先级规则：`verified_row_count` 是完成全量解析时的业务数据行数；`worksheet_used_range_shape` 只是 Excel 物理 used range。两者冲突时不得把 used range 行数写成记录数、样本数或实体数。
+- 主键规则：`primary_key_candidates` 只是由完整度与唯一率得到的统计候选。正文声称“主键/唯一标识”时，必须选择高完整度、高唯一率且语义吻合的候选；不得选择大量为空或大量重复的字段。
+- Sheet 角色校验：Sheet 用途必须由该 Sheet 自己的 `schema_signature_fields` / `fields` 和读取证据支撑。文件级 summary 只是导航，若与 Sheet 物理字段冲突，以 Sheet 精确字段为准。
 
 章节特定要求：
 - `数据说明`：只写输入文件/文件组作用、shape、必要读取方式和重要注意事项；不要把字段说明铺在最前，不要展开完整 preview。
+- `数据说明` 必须逐项覆盖 `source_coverage_ledger`；目录集合可以合并介绍，但必须列出成员数量、共通字段与 schema 变体，不能因为文件多而只介绍代表文件。
 - `数据说明` 若涉及重复文件组、同结构文件组或共用文件说明，必须同时写组内共通字段和差异字段：优先使用 `shared_fields` / `shared_physical_columns_exact` 表达共通字段，使用 `variant_fields_by_file` / `field_presence` 表达各文件或 schema 变体的非共通字段。不要把 union 字段误写成每个文件都存在。
 - `关键字段说明`：按任务相关性说明关键字段，不要求罗列所有列；每个字段条目必须保留精确物理字段名；多 sheet Excel 要能指出 sheet 级字段边界；必须优先使用 `table_field_details[].fields[].meaning` 写字段语义；如果 meaning 缺失，只能保守写“含义未确认，可能由字段名/类型推断为……”，不要编造业务规则。
 - `关键字段说明` 若字段来自文件组，必须标注它是“全组共通字段”还是“仅部分文件/某个 schema 变体存在的字段”；读取代码必须先做列存在性检查，不得直接按 union 字段切片所有文件。

@@ -35,10 +35,12 @@ class LLMConfig:
     max_retries: int = 3
     # 温度，默认尽量稳定。
     temperature: float = 0.0
-    # 单次输出最大 token。None/0 表示不传 max_tokens，由 API/provider 默认决定。
-    max_tokens: int | None = None
-    # 结构化 JSON 输出默认最大 token。None/0 表示不传 max_tokens，由 API/provider 默认决定。
-    structured_max_tokens: int | None = None
+    # 正常业务 LLM 调用的输出 token 下限。阶段级低值会在发送请求前抬高到该值。
+    minimum_output_tokens: int = 32768
+    # 单次文本输出最大 token；模型仍只按实际生成量计费。
+    max_tokens: int | None = 32768
+    # 结构化 JSON 输出默认最大 token。
+    structured_max_tokens: int | None = 32768
     # 单次 LLM 请求超时时间（秒）。DeepSeek 偶尔会慢，设置超时可避免系统长时间看似卡死。
     # 例子: 180 表示 3 分钟仍未返回则失败并写入事件流。
     request_timeout_seconds: float = 180.0
@@ -49,6 +51,8 @@ class LLMConfig:
     enforce_json_retry: bool = True
     # 是否启用 LLM 响应缓存。开启后相同 prompt/schema/model 会直接复用历史结果，便于调试与加速重复运行。
     enable_cache: bool = True
+    # Provider 侧 prompt_cache_key：auto 仅对 api.openai.com 启用；enabled 强制发送；disabled 关闭。
+    prompt_cache_key_mode: str = "auto"
     # 命中缓存时是否也写入 llm_traces.jsonl，方便前端还原完整调用轨迹。
     trace_cache_hits: bool = True
     # DeepSeek thinking 开关；None 表示使用服务端默认。
@@ -57,6 +61,22 @@ class LLMConfig:
     reasoning_effort: str | None = None
     # 结构化 JSON 输出时是否关闭 thinking。分类/探查规划等小任务关闭 thinking 更稳定也更快。
     structured_disable_thinking: bool = True
+    # 发送给模型前压缩 JSON schema；本地仍使用完整 Pydantic schema 校验。
+    compact_structured_schema: bool = True
+    # 是否为结构化调用额外发送空值 JSON 示例；默认关闭以减少固定前缀。
+    structured_include_json_example: bool = False
+    # DeepSeek 官方 JSON mode 按文档建议附带紧凑 JSON 示例；其他 provider 不受影响。
+    deepseek_json_mode_include_example: bool = True
+    # 结构化输出因 reasoning 耗尽长度时，重试自动关闭 thinking。
+    structured_reasoning_fallback_on_length: bool = True
+    # reasoning token 占 completion 的比例达到该值时触发降级。
+    structured_reasoning_fallback_ratio: float = 0.75
+    # 任意结构化输出因长度截断时，下一轮直接使用的 token 上限。
+    structured_length_retry_max_tokens: int = 32768
+    # 约束与实体别名联合抽取的输出上限。
+    constraint_memory_max_tokens: int = 32768
+    # 实体别名候选调用中最多暴露的去重后物理字段数。
+    entity_alias_schema_max_fields: int = 600
 
 
 @dataclass
@@ -141,7 +161,7 @@ class DataConfig:
     document_cognition_chunk_overlap_chars: int = 300
     document_cognition_memory_items_per_section: int = 12
     document_cognition_memory_max_chars: int = 18000
-    document_cognition_chunk_max_tokens: int = 4096
+    document_cognition_chunk_max_tokens: int = 32768
     # 超过该字节数的 CSV 被视为大文件，只读取前 table_profile_sample_rows 行并记录 sampling 标记。
     large_table_threshold_bytes: int = 256 * 1024 * 1024
     # 类别列展示 top-k 值。若唯一值不足 top-k，画像会尽量完整列出。
@@ -259,6 +279,10 @@ class InvestigationConfig:
     tool_sample_rows: int | None = 50000
     # Maximum rows returned in samples.
     max_sample_rows: int = 20
+    # Let the initial QDI planner reduce question/action budgets when evidence is already sufficient.
+    adaptive_budgeting: bool = True
+    # Deterministic high-impact relation/layout checks that may be added beside planner questions.
+    automatic_verification_question_limit: int = 4
 
 
 @dataclass
@@ -303,7 +327,7 @@ class PromptConfig:
     # Evaluation section reflection rounds after applying the contract.
     evaluation_reflection_max_rounds: int = 3
     # description 协议结构化输出的最大 token。None/0 表示不传 max_tokens，由 API/provider 默认决定。
-    description_protocol_max_tokens: int | None = None
+    description_protocol_max_tokens: int | None = 32768
     # description 协议生成时注入的原始需求最大字符数。
     description_protocol_original_chars: int = 10000
     # description 协议生成时注入的数据认知摘要最大字符数。
@@ -315,6 +339,21 @@ class PromptConfig:
     # Final description natural-language output language.
     # zh: Chinese prose; en: English prose; auto: do not add a global language constraint.
     output_language: str = "zh"
+    # Canonical language for control instructions. Source evidence keeps its original language.
+    control_language: str = "zh"
+    # Run a structured semantic consistency audit across final task artifacts.
+    artifact_consistency_enabled: bool = True
+    artifact_consistency_max_rounds: int = 2
+    artifact_consistency_fail_on_blocking: bool = False
+    # Resolve only ambiguous deterministic downstream candidates with an LLM;
+    # every returned candidate is validated against the physical schema.
+    downstream_context_llm_resolution_enabled: bool = True
+    downstream_context_resolution_max_dimensions: int = 5
+    downstream_context_resolution_min_confidence: float = 0.72
+    # A second bounded semantic pass for source-field aliases that fuzzy matching
+    # cannot safely resolve. The LLM may only select exact schema candidates.
+    source_field_alias_llm_resolution_enabled: bool = True
+    source_field_alias_resolution_min_confidence: float = 0.82
     # 是否启用“description 引用文件必须真实存在”的硬失败模式。
     # True: 若检测到不存在文件引用，触发重生成；重试耗尽仍失败则抛错终止该轮。
     # False: 仅做软修复（删除非法引用行）。
@@ -331,18 +370,61 @@ class ContextConfig:
     table_card_sheet_limit: int = 80
     # Maximum fields retained per detailed table card.
     table_card_field_limit: int = 80
-    # Fields retained in each route-only table card placed in stable prompts.
-    stable_table_card_field_limit: int = 3
-    # Maximum route-only table cards placed in stable prompts.
-    stable_table_card_limit: int = 48
+    # Fields retained in each evidence table card placed in stable prompts.
+    stable_table_card_field_limit: int = 80
+    # Maximum evidence table cards placed in stable prompts.
+    stable_table_card_limit: int = 120
     # Maximum cards from the same source file in stable prompts.
-    stable_table_cards_per_source: int = 6
+    stable_table_cards_per_source: int = 80
+    # Total character budget for stable table-card evidence. Raw previews and full
+    # profiles remain local even when this budget is large.
+    stable_table_cards_max_chars: int = 220000
     # Maximum relation cards in stable prompts.
     relation_card_limit: int = 100
     # Maximum filename group cards in stable prompts.
     filename_group_card_limit: int = 80
     # Default visible excerpt length stored in ArtifactRef.
     artifact_visible_excerpt_chars: int = 1200
+    # Shared provider-cache-friendly context used by all task-definition agents.
+    cross_stage_memory_enabled: bool = True
+    # Maximum characters retained in the immutable provider-cache prefix. The
+    # full object is always persisted as a retrievable local artifact.
+    cross_stage_stable_context_chars: int = 32000
+    # Optional token limit for the immutable prefix. None derives a conservative
+    # share from prompt.prompt_token_budget.
+    cross_stage_stable_context_tokens: int | None = None
+    # Approximate character threshold at which accumulated dynamic memory is compacted by the LLM.
+    cross_stage_memory_trigger_chars: int = 48000
+    # Optional token threshold for automatic compaction. None derives it from
+    # prompt.prompt_token_budget and cross_stage_headroom_ratio.
+    cross_stage_memory_trigger_tokens: int | None = None
+    # Match Codex's documented accounting vocabulary: total or body_after_prefix.
+    cross_stage_memory_limit_scope: str = "body_after_prefix"
+    # Fraction of the configured prompt budget that input context may occupy.
+    # The remainder is kept as headroom for schemas, reasoning and output.
+    cross_stage_headroom_ratio: float = 0.72
+    # Target character budget for the compressed memory object.
+    cross_stage_memory_target_chars: int = 16000
+    # Optional compressed-memory token target. None derives it from the live body budget.
+    cross_stage_memory_target_tokens: int | None = None
+    # Per-stage excerpt retained in live context; full payload stays in a local artifact.
+    cross_stage_memory_entry_chars: int = 12000
+    cross_stage_memory_recent_entries: int = 4
+    cross_stage_memory_max_compactions: int = 6
+    # After compaction, allow a small retrieval-planning call to recover exact old evidence.
+    cross_stage_retrieval_enabled: bool = True
+    cross_stage_retrieval_max_artifacts: int = 3
+    cross_stage_retrieval_excerpt_chars: int = 6000
+    # Prefix-matched stages allowed to invoke the retrieval planner. This keeps
+    # retrieval semantic and demand-driven without adding an LLM call everywhere.
+    cross_stage_retrieval_stage_prefixes: tuple[str, ...] = (
+        "description_protocol_",
+        "evaluation_contract_",
+        "description_section_output_spec",
+        "sample_submission_spec_",
+        "source_field_alias_",
+        "artifact_consistency_",
+    )
 
 
 @dataclass
@@ -428,6 +510,10 @@ class KnowledgeConfig:
     write_rag_manifest: bool = True
     # Boost constraints, metrics and field glossary during lexical retrieval.
     boost_structured_knowledge: bool = True
+    # Lexical retrieval remains the deterministic first pass; the LLM only reranks its candidate set.
+    semantic_rerank_enabled: bool = True
+    semantic_rerank_candidate_multiplier: int = 3
+    semantic_rerank_min_candidates: int = 4
 
 
 @dataclass
@@ -488,16 +574,26 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "api_key": "LLM API key，默认从 DEEPSEEK_API_KEY 读取。",
     "max_retries": "LLM 调用或结构化 JSON 解析失败后的最大重试次数。",
     "temperature": "LLM 温度，越低越稳定。",
-    "max_tokens": "单次 LLM 输出最大 token 数；None/0 表示不传该参数，由 API/provider 默认决定。",
-    "structured_max_tokens": "结构化 JSON 输出默认最大 token；None/0 表示不传该参数，由 API/provider 默认决定。",
+    "minimum_output_tokens": "正常业务 LLM 调用的输出 token 下限；所有阶段级低值都会在请求前抬高到该值。",
+    "max_tokens": "普通文本 LLM 输出 token 上限；默认 32768。",
+    "structured_max_tokens": "结构化 JSON 输出 token 上限；默认 32768。",
     "request_timeout_seconds": "单次 LLM API 请求超时时间（秒）。",
     "max_concurrent_requests": "同一进程内 LLM API 最大并发请求数。",
     "enforce_json_retry": "结构化输出不合法时是否追加错误并要求重试。",
     "enable_cache": "是否缓存相同 prompt/schema/model 的 LLM 响应。",
+    "prompt_cache_key_mode": "Provider 侧 prompt_cache_key 模式：auto/enabled/disabled；auto 仅对 OpenAI 官方 API 启用。",
     "trace_cache_hits": "缓存命中时是否仍写入 llm_traces.jsonl。",
     "enable_thinking": "DeepSeek thinking 开关；None 表示使用服务端默认。",
     "reasoning_effort": "DeepSeek thinking effort，可选 high/max。",
     "structured_disable_thinking": "结构化 JSON 输出时是否关闭 thinking，以提升稳定性与速度。",
+    "compact_structured_schema": "是否压缩发送给模型的 JSON schema；本地仍按完整 schema 校验。",
+    "structured_include_json_example": "结构化调用是否发送 JSON 示例；关闭可减少固定输入 token。",
+    "deepseek_json_mode_include_example": "官方 DeepSeek JSON mode 是否附带紧凑 JSON 示例，以降低空响应和格式漂移风险。",
+    "structured_reasoning_fallback_on_length": "结构化输出因 reasoning 耗尽长度时，是否自动关闭 thinking 后重试。",
+    "structured_reasoning_fallback_ratio": "reasoning token 占 completion 的比例达到多少时触发 thinking 降级。",
+    "structured_length_retry_max_tokens": "任意结构化 JSON 因长度截断时，下一轮直接使用的输出 token 上限。",
+    "constraint_memory_max_tokens": "约束与实体别名联合抽取的最大输出 token。",
+    "entity_alias_schema_max_fields": "实体别名候选调用中最多暴露的去重后物理字段数。",
     "run_data_cognition": "是否执行数据认知模块。",
     "run_task_definition": "是否执行任务定义模块并生成 description。",
     "optimize_llm_cost": "是否启用低 token 成本路径：跳过冗余 LLM 阶段并按需触发重型调查。",
@@ -513,7 +609,7 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "base_min_activation_score": "自动路由阶段的最低激活分数。",
     "always_run_task_definition": "是否无条件执行任务定义，确保下游获得 description.md。",
     "probe_retry_max": "探查脚本失败后，LLM 基于报错重规划并重试的最大次数。",
-    "description_protocol_max_tokens": "description 协议结构化输出最大 token；None/0 表示不传该参数，由 API/provider 默认决定。",
+    "description_protocol_max_tokens": "description 协议结构化输出 token 上限；默认 32768。",
     "description_protocol_original_chars": "description 协议生成时注入原始需求的最大字符数。",
     "description_protocol_data_digest_chars": "description 协议生成时注入数据认知摘要的最大字符数。",
     "description_protocol_file_limit": "description 协议生成时传给 LLM 的关键文件数量上限。",
@@ -592,17 +688,36 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "evaluation_reflection_max_rounds": "评估章节反思最大轮数。",
     "tool_sample_rows": "旧版内部调查辅助函数读取表格时最多采样行数；当前 LLM 调查入口只接受只读 Python 脚本。",
     "max_sample_rows": "调查工具返回样例行/键的最大数量。",
+    "adaptive_budgeting": "是否允许 QDI Planner 在证据充分时缩小问题数和每题动作预算。",
+    "automatic_verification_question_limit": "程序自动追加的高影响关系、人口和读取合同验证题上限。",
     "max_images_per_dir": "每个图片目录最多发送给视觉模型的图片数量。",
     "fail_silently": "视觉模型失败时是否降级为仅使用图片元数据而不中断任务。",
     "table_card_file_limit": "本地详细 TableCard 最多覆盖的源文件数量。",
     "table_card_sheet_limit": "本地详细 TableCard 最多覆盖的 Excel sheet 数量。",
     "table_card_field_limit": "每张详细 TableCard 最多保留的字段数量。",
-    "stable_table_card_field_limit": "稳定 prompt 中每张路由 TableCard 最多保留的字段数量。",
-    "stable_table_card_limit": "稳定 prompt 中最多放入的 TableCard 数量。",
-    "stable_table_cards_per_source": "稳定 prompt 中同一源文件最多放入的 TableCard 数量。",
+    "stable_table_card_field_limit": "稳定 prompt 中每张证据 TableCard 最多保留的精确字段数量。",
+    "stable_table_card_limit": "稳定 prompt 中最多放入的证据 TableCard 数量。",
+    "stable_table_cards_per_source": "稳定 prompt 中同一源文件最多放入的证据 TableCard 数量。",
+    "stable_table_cards_max_chars": "稳定 prompt 中全部 TableCard 证据的总字符预算；不包含 raw preview 和完整 profile。",
     "relation_card_limit": "稳定 prompt 中最多放入的 RelationCard 数量。",
     "filename_group_card_limit": "稳定 prompt 中最多放入的 FilenameGroupCard 数量。",
     "artifact_visible_excerpt_chars": "ArtifactRef 默认直接展示的摘要字符数。",
+    "cross_stage_memory_enabled": "是否启用跨阶段共享稳定前缀和 artifact-backed 动态记忆。",
+    "cross_stage_stable_context_chars": "不可变稳定前缀的最大字符数；完整对象仍写入可取回 artifact。",
+    "cross_stage_stable_context_tokens": "不可变稳定前缀的可选估算 token 上限；None 时从 prompt 预算推导。",
+    "cross_stage_memory_trigger_chars": "累计动态记忆触发 LLM 压缩的配置字符阈值。",
+    "cross_stage_memory_trigger_tokens": "自动压缩的可选估算 token 阈值；None 时从 prompt 预算推导。",
+    "cross_stage_memory_limit_scope": "压缩阈值计数范围：total 或 body_after_prefix。",
+    "cross_stage_headroom_ratio": "prompt 预算中允许输入上下文占用的比例，其余为 schema、推理和输出预留。",
+    "cross_stage_memory_target_chars": "跨阶段有损摘要的目标最大字符数。",
+    "cross_stage_memory_target_tokens": "跨阶段有损摘要的可选估算 token 目标。",
+    "cross_stage_memory_entry_chars": "每个近期阶段结果常驻 prompt 的最大字符数。",
+    "cross_stage_memory_recent_entries": "压缩时仍完整保留在近期窗口的阶段结果数量。",
+    "cross_stage_memory_max_compactions": "单次任务允许执行的跨阶段 LLM 压缩次数上限。",
+    "cross_stage_retrieval_enabled": "压缩后是否允许关键阶段规划按 artifact_id 取回精确旧证据。",
+    "cross_stage_retrieval_max_artifacts": "单个关键阶段最多取回的跨阶段 artifact 数量。",
+    "cross_stage_retrieval_excerpt_chars": "单个跨阶段 artifact 取回的最大可见字符数。",
+    "cross_stage_retrieval_stage_prefixes": "允许调用跨阶段取回规划器的关键阶段名称前缀。",
     "level": "AutoRealize 根日志级别：DEBUG/INFO/WARNING/ERROR。",
     "raw_event_log": "是否打印未经压缩的结构化事件字段。",
     "noisy_logger_level": "第三方高噪声 logger 使用的日志级别。",
@@ -630,6 +745,9 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "max_entry_chars": "单条知识最大字符数。",
     "write_rag_manifest": "是否输出 RAG/知识库接入清单。",
     "boost_structured_knowledge": "检索时是否提升约束/指标/字段知识权重。",
+    "semantic_rerank_enabled": "是否使用 LLM 仅对确定性词法知识候选进行语义重排和过滤。",
+    "semantic_rerank_candidate_multiplier": "语义重排前词法候选数量相对最终 top-k 的倍数。",
+    "semantic_rerank_min_candidates": "触发知识语义重排所需的最少词法候选数。",
     "enable_parallel_cognition": "是否并行执行逐文件数据认知。",
     "cognition_max_workers": "数据认知 worker 数。",
     "enable_parallel_relations": "是否并行执行跨文件关系发现。",
@@ -647,6 +765,15 @@ _CONFIG_PATH_DESCRIPTIONS: dict[str, str] = {
     "vllm.api_key": "视觉模型 API key；默认读取 AUTOREALIZE_VISION_API_KEY 或 VLLM_API_KEY。",
     "knowledge.enabled": "是否启用本地知识存储与检索。",
     "telemetry.enabled": "是否启用结构化事件流与当前状态快照。",
+    "prompt.control_language": "LLM 控制指令统一语言：zh/en；来源证据和标识符保持原样。",
+    "prompt.artifact_consistency_enabled": "是否运行最终正文与机器合同的结构化语义一致性审查。",
+    "prompt.artifact_consistency_max_rounds": "最终一致性审查总轮数；修补后至少留一轮复核。",
+    "prompt.artifact_consistency_fail_on_blocking": "是否把审查后仍存在的阻断问题加入最终 defects。",
+    "prompt.downstream_context_llm_resolution_enabled": "是否仅对低置信度下游候选调用 LLM 消歧。",
+    "prompt.downstream_context_resolution_max_dimensions": "单次下游语义消歧最多处理的维度数量。",
+    "prompt.downstream_context_resolution_min_confidence": "接受 LLM 下游候选选择的最低置信度。",
+    "prompt.source_field_alias_llm_resolution_enabled": "是否用受约束 LLM 选择精确源字段别名候选。",
+    "prompt.source_field_alias_resolution_min_confidence": "接受源字段别名语义选择的最低置信度。",
 }
 
 

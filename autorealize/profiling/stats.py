@@ -329,6 +329,27 @@ def infer_excel_sheet_layout(
         risks.append("Pandas default columns look suspicious; verify header handling before modeling.")
     if rows:
         risks.append("Use header=None preview when validating sheet layout; opening rows may contain notes or raw data.")
+    first_row_cells = [str(x).strip() for x in (rows[0] if rows else []) if _cell_text(x)]
+    default_column_cells = [str(x).strip() for x in columns if str(x).strip()]
+    default_columns_equal_first_row = bool(
+        first_row_cells
+        and default_column_cells
+        and default_column_cells[: len(first_row_cells)] == first_row_cells[: len(default_column_cells)]
+    )
+    downstream_pattern_similarity = (
+        max(
+            (_type_pattern_similarity(row_infos[0]["type_pattern"], info["type_pattern"]) for info in row_infos[1:4]),
+            default=0.0,
+        )
+        if row_infos
+        else 0.0
+    )
+    short_code_like_first_row = bool(
+        first_row_cells
+        and len(first_row_cells) <= 4
+        and all(_looks_like_identifier_value(value) for value in first_row_cells)
+        and downstream_pattern_similarity >= 0.75
+    )
 
     layout_kind = "standard_table"
     detected_header_row: int | None = 0
@@ -366,11 +387,18 @@ def infer_excel_sheet_layout(
         detected_header_row = None
         read_strategy_kind = "header_none_inspect"
         risks.append("Sheet is sparse or irregular; do not assume rectangular tabular semantics.")
-    elif default_suspicious or first_score < 2.2 or _first_row_matches_data_pattern(row_infos):
+    elif (
+        default_suspicious
+        or first_score < 2.2
+        or _first_row_matches_data_pattern(row_infos)
+        or (default_columns_equal_first_row and short_code_like_first_row)
+    ):
         layout_kind = "headerless_table"
         detected_header_row = None
         read_strategy_kind = "header_none_table"
         risks.append("First row looks like data rather than field names; use header=None or assign columns explicitly.")
+        if default_columns_equal_first_row and short_code_like_first_row:
+            risks.append("Default pandas columns repeat the first raw row and look like identifier values; the first data row would be lost with header=0.")
     else:
         detected_header_row = 0
         read_strategy_kind = "default_header"
@@ -483,6 +511,22 @@ def _looks_like_note_marker(text: str) -> bool:
         "注意",
     ]
     return any(marker in low for marker in markers)
+
+
+def _looks_like_identifier_value(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or " " in value or len(value) > 36:
+        return False
+    if _cell_kind(value) in {"number", "date"}:
+        return True
+    # Compact code values usually mix letters/digits/separators and contain no
+    # natural-language header suffix. This remains evidence, not a hard schema.
+    header_suffixes = ("代码", "名称", "编号", "时间", "日期", "数量", "类型", "地址", "说明", "规则")
+    if any(value.endswith(suffix) for suffix in header_suffixes):
+        return False
+    has_letter = bool(re.search(r"[A-Za-z]", value))
+    has_digit = bool(re.search(r"\d", value))
+    return (has_letter and has_digit) or bool(re.fullmatch(r"[A-Z]{2,}[A-Z0-9_-]*", value))
 
 
 def _default_columns_look_suspicious(columns: list[str]) -> bool:

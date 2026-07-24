@@ -147,19 +147,6 @@ class DataCognitionModule:
         log_event(logger, "module.data_cognition", "GENERATING_FILE", file="realize_report/data_description.md")
         write_data_description(data_description_path, file_summaries, dir_summaries, relation_hints)
 
-        log_event(logger, "module.data_cognition.constraints", "ACTIVATED")
-        constraint_memory = legacy._extract_constraint_memory(
-            llm_client=self.services.llm_client,
-            prompt_mgr=self.services.prompt_mgr,
-            file_summaries=file_summaries,
-            task_hint=task_hint,
-        )
-        log_event(
-            logger,
-            "module.data_cognition.constraints",
-            "COMPLETED",
-            constraints=len(constraint_memory.get("items", [])) if isinstance(constraint_memory, dict) else 0,
-        )
         log_event(logger, "module.data_cognition.authority", "ACTIVATED")
         authoritative_memory = self._extract_authoritative_memory(
             data_root=data_root,
@@ -175,6 +162,20 @@ class DataCognitionModule:
             has_contract=bool((authoritative_memory.get("submission_contract") or {}).get("is_defined"))
             if isinstance(authoritative_memory, dict)
             else False,
+        )
+        log_event(logger, "module.data_cognition.constraints", "ACTIVATED")
+        constraint_memory = legacy._extract_constraint_memory(
+            llm_client=self.services.llm_client,
+            prompt_mgr=self.services.prompt_mgr,
+            file_summaries=file_summaries,
+            task_hint=task_hint,
+            authoritative_memory=authoritative_memory,
+        )
+        log_event(
+            logger,
+            "module.data_cognition.constraints",
+            "COMPLETED",
+            constraints=len(constraint_memory.get("items", [])) if isinstance(constraint_memory, dict) else 0,
         )
         knowledge_base = self._build_meta_knowledge_base(
             file_summaries=file_summaries,
@@ -1075,7 +1076,13 @@ class DataCognitionModule:
                 "Authority priority is strict: user_hint outranks existing description.md, existing description.md "
                 "outranks README/official/spec/other requirement documents, and all documents outrank data profiles "
                 "or LLM inference. If sources conflict, keep the highest-priority source, preserve evidence, and record "
-                "the conflict in authority_conflicts or context_routing_notes."
+                "the conflict in authority_conflicts or context_routing_notes. "
+                "Also populate requirement_fact_matrix. Classify each important statement as current_rule, "
+                "current_answer, question, future_roadmap, or example, and status as current, resolved, superseded, "
+                "unresolved, or not_current. A question/problem statement such as 'data X is missing' must become "
+                "resolved/superseded when a later answer document identifies where X exists. Prefer an explicit "
+                "answer and verified source inventory over an earlier question or gap hypothesis. Future capabilities, "
+                "illustrative examples, and unresolved questions must not be promoted to current hard constraints."
                 )
             },
             dynamic={"sources": sources[:24]},
@@ -1085,8 +1092,9 @@ class DataCognitionModule:
         memory = self.services.llm_client.ask_structured(
             model_cls=AuthoritativeTaskMemory,
             system_prompt=(
-                "You extract high-priority task contracts from original task documents. "
-                "You must preserve evidence and leave unknown fields empty instead of guessing."
+                "You extract high-priority task contracts from original task documents and route conflicting document facts. "
+                "You must preserve evidence, distinguish current rules from questions/answers/future plans/examples, "
+                "and leave unknown fields empty instead of guessing."
             ),
             user_prompt=dynamic,
             prompt_name="authoritative_task_memory",

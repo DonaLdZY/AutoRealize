@@ -12,10 +12,14 @@ from pathlib import Path
 
 from ..agents.architect import Architect
 from ..config import AutoRealizeConfig
+from ..context_memory import CrossStageContextLedger
 from ..context_compiler import (
     ArtifactStore,
     build_filename_group_cards,
     build_relation_cards,
+    build_relation_verification_queue,
+    build_population_verification_queue,
+    build_source_coverage_ledger,
     build_table_cards,
     compact_authoritative_memory,
     compact_constraint_memory,
@@ -47,6 +51,9 @@ from ..report_writer import (
 from ..utils.safe_json import dumps_json_safe, write_json_safe
 from ..models import (
     AmbiguityReview,
+    ArtifactConsistencyPatch,
+    ArtifactConsistencyReview,
+    DownstreamContextResolution,
     DescriptionProtocolBundle,
     DescriptionSectionDraft,
     DescriptionTaskProtocolDraft,
@@ -59,6 +66,8 @@ from ..models import (
     SampleSubmissionValidationResult,
     SubmissionScriptPlan,
     TaskClassification,
+    KnowledgeRerankDecision,
+    SourceFieldAliasResolution,
 )
 from .types import DataCognitionResult, RuntimeServices, TaskDefinitionResult
 
@@ -76,6 +85,155 @@ class TaskDefinitionModule:
         self.architect = Architect(config, services.llm_client, services.prompt_mgr)
         self._evaluation_contract_revision_log: list[dict] = []
         self._evaluation_reflection_log: list[dict] = []
+        self._cross_stage_context: CrossStageContextLedger | None = None
+
+    def _prompt_language_policy(self) -> dict[str, str]:
+        control = str(getattr(self.config.prompt, "control_language", "zh") or "zh").lower()
+        output = str(getattr(self.config.prompt, "output_language", "zh") or "zh").lower()
+        return {
+            "control_language": control,
+            "reader_output_language": output,
+            "source_evidence_language": "preserve_original",
+            "schema_and_code_identifiers": "preserve_exactly",
+            "policy": (
+                "控制指令统一使用简体中文；保留来源证据的原始语言以及 schema、路径、字段和代码标识符。"
+                if control == "zh"
+                else "Use one control language while preserving source evidence and exact schema/code identifiers."
+            ),
+        }
+
+    @staticmethod
+    def _stage_only_evidence(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        common_keys = {
+            "original_requirements_full",
+            "task_hint",
+            "authoritative_memory",
+            "constraint_memory",
+            "context_policy",
+            "output_language_policy",
+        }
+        return {key: item for key, item in value.items() if key not in common_keys}
+
+    def _stage_prompt(
+        self,
+        *,
+        stage: str,
+        stable: object,
+        dynamic: object,
+        stable_title: str,
+        dynamic_title: str,
+        stable_limit: int | None = None,
+        dynamic_limit: int | None = None,
+    ) -> tuple[str, str]:
+        ledger = self._cross_stage_context
+        if ledger is None:
+            return stable_dynamic_prompt(
+                stable=stable,
+                dynamic=dynamic,
+                stable_title=stable_title,
+                dynamic_title=dynamic_title,
+                stable_limit=stable_limit,
+                dynamic_limit=dynamic_limit,
+            )
+        return ledger.prompt_parts(
+            stage=stage,
+            stage_evidence=self._stage_only_evidence(stable),
+            latest_request=dynamic,
+            dynamic_title=dynamic_title,
+            dynamic_limit=dynamic_limit,
+        )
+
+    def _initialize_cross_stage_context(
+        self,
+        *,
+        task_hint: str,
+        original_text: str,
+        downstream_context: dict,
+        file_summaries: list,
+        relations: list,
+        deterministic_data_access: object,
+    ) -> None:
+        if not bool(getattr(self.config.context, "cross_stage_memory_enabled", True)):
+            return
+        compiled = self._compiled_context_for_sections(
+            file_summaries=file_summaries,
+            downstream_context=downstream_context,
+            relations=relations,
+            table_limit=18,
+            relation_limit=24,
+        )
+        stable_context = {
+            "schema_version": "autorealize.shared_task_context.v1",
+            "context_policy": {
+                "stable_prefix_is_immutable": True,
+                "later_agent_instructions_override_generic_behavior": True,
+                "dynamic_stage_results_are_appended_at_the_end": True,
+                "compressed_memory_is_lossy_but_artifact_retrievable": True,
+                "never_infer_hidden_or_truncated_content": True,
+            },
+            "output_language_policy": self._prompt_language_policy(),
+            "original_requirements_full": original_text,
+            "task_hint": task_hint,
+            "authoritative_memory": compact_authoritative_memory(
+                downstream_context.get("authoritative_memory", {})
+            ),
+            "constraint_memory": compact_constraint_memory(
+                downstream_context.get("constraint_memory", {})
+            ),
+            "question_memory": self._question_memory_pack(downstream_context),
+            "authoritative_submission_contract": downstream_context.get(
+                "authoritative_submission_contract", {}
+            ),
+            "deterministic_data_access": (
+                deterministic_data_access.model_dump()
+                if hasattr(deterministic_data_access, "model_dump")
+                else deterministic_data_access
+            ),
+            "table_index": self._table_card_index_for_task_prompts(
+                compiled["table_cards"], limit=18, field_limit=10
+            ),
+            "verified_relation_cards": compiled["relations"][:24],
+            "retrieved_knowledge": downstream_context.get("retrieved_knowledge", [])[:12],
+            "authority_order": [
+                "用户明确需求",
+                "已有 description.md",
+                "官方说明、规范和样例",
+                "经过程序验证的数据事实",
+                "LLM 推断和启发式候选",
+            ],
+        }
+        self._cross_stage_context = CrossStageContextLedger(
+            config=self.config,
+            llm_client=self.services.llm_client,
+            prompt_mgr=self.services.prompt_mgr,
+            report_dir=self.report_dir,
+            stable_context=stable_context,
+        )
+        log_event(
+            logger,
+            "context.cross_stage",
+            "CREATED",
+            stable_chars=len(self._cross_stage_context.static_context_prompt),
+        )
+
+    def _remember_stage(
+        self,
+        stage: str,
+        payload: object,
+        *,
+        authority: str = "derived",
+        evidence_refs: list[str] | None = None,
+    ) -> None:
+        if self._cross_stage_context is None:
+            return
+        self._cross_stage_context.add(
+            stage,
+            payload,
+            authority=authority,
+            evidence_refs=evidence_refs,
+        )
 
     def _default_pipeline_plan(self, *, task_hint: str) -> PipelinePlan:
         """Cheap compatibility plan for the legacy report shape.
@@ -307,9 +465,10 @@ class TaskDefinitionModule:
                 "artifact_refs": artifact_refs,
             },
         )
-        stable, dynamic = stable_dynamic_prompt(
+        stable, dynamic = self._stage_prompt(
+            stage="problem_paradigm_classifier",
             stable=payload,
-            dynamic={"instruction": "Classify the executable problem paradigm from the evidence above."},
+            dynamic={"instruction": "根据以上证据判断可执行的问题范式。"},
             stable_title="Stable problem paradigm evidence",
             dynamic_title="Dynamic classification request",
         )
@@ -363,153 +522,81 @@ class TaskDefinitionModule:
         original_text: str,
         downstream_context: dict,
     ) -> None:
-        """Keep static decision tasks from being routed into a mandatory-RL template.
+        """Normalize the two-axis problem-structure and method-policy contract.
 
-        A user may request RL as a modeling method for a dispatch/assignment
-        problem, but downstream code still needs one deterministic solution
-        table, evaluator, and scalar objective. In that case the task paradigm is
-        static optimization and RL is a candidate solver family.
+        `problem_paradigm` remains for compatibility. It describes the executable
+        problem shape, while required/allowed method families independently record
+        whether RL must be used to solve a static optimization problem.
         """
-        text_parts = [
-            original_text or "",
-            review.reasoning or "",
-            "\n".join(str(x) for x in review.evidence or []),
-            "\n".join(str(x) for x in review.key_signals or []),
-            str(downstream_context.get("task_hint", "") or ""),
-        ]
-        text = "\n".join(text_parts)
-        rl_signal = self._contains_any(
-            text,
-            (
-                "reinforcement learning",
-                "offline rl",
-                "online rl",
-                "dqn",
-                "ppo",
-                "policy",
-                "reward",
-                "强化学习",
-                "状态",
-                "动作",
-                "奖励",
-                "策略",
-                "轨迹",
-                "课程学习",
-            ),
+        del original_text, downstream_context
+
+        paradigm_to_structure = {
+            "ml_dl_prediction": "prediction",
+            "static_optimization": "decision_optimization",
+            "reinforcement_learning": "native_sequential_control",
+            "hybrid_ml_optimization": "hybrid_prediction_optimization",
+            "unknown_but_executable": "unknown",
+        }
+        allowed_structures = {
+            "prediction",
+            "decision_optimization",
+            "native_sequential_control",
+            "hybrid_prediction_optimization",
+            "unknown",
+        }
+        if review.problem_structure not in allowed_structures:
+            review.problem_structure = paradigm_to_structure.get(review.problem_paradigm, "unknown")
+        if review.problem_structure == "unknown":
+            review.problem_structure = paradigm_to_structure.get(review.problem_paradigm, "unknown")
+
+        required = self._dedupe_strings(list(review.required_method_families or []), limit=12)
+        allowed = self._dedupe_strings(
+            list(review.allowed_method_families or []) + list(review.recommended_solver_families or []),
+            limit=16,
         )
-        static_decision_signal = self._contains_any(
-            text,
-            (
-                "static_optimization",
-                "assignment",
-                "dispatch",
-                "routing",
-                "scheduling",
-                "vehicle",
-                "order",
-                "cost",
-                "constraint",
-                "feasible solution",
-                "solution table",
-                "分配",
-                "调度",
-                "派单",
-                "订单",
-                "车辆",
-                "车型",
-                "承运商",
-                "运输成本",
-                "总成本",
-                "约束",
-                "可行",
-                "方案",
-                "发车",
-                "未分配",
-            ),
-        )
-        official_env_signal = self._contains_any(
-            text,
-            (
-                "gym",
-                "gymnasium",
-                "env.step",
-                "reset(",
-                "step(action",
-                "official simulator",
-                "provided simulator",
-                "benchmark environment",
-                "官方环境",
-                "官方仿真器",
-                "交互式评估接口",
-                "回放评估接口",
-                "评估服务器执行策略",
-                "提交 policy",
-                "提交策略",
-            ),
-        )
-        solution_output_signal = self._contains_any(
-            text,
-            (
-                "assignment 明细",
-                "assignment",
-                "solution",
-                "dispatch plan",
-                "完整方案",
-                "方案输出",
-                "发车记录",
-                "订单号列表",
-                "score_solution",
-                "total_penalized_cost",
-                "transport_cost",
-                "unassigned",
-                "未分配",
-                "运输成本",
-            ),
+        rl_required = bool(review.rl_required or review.explicit_rl_requested)
+        if "reinforcement_learning" in required or "rl" in required:
+            rl_required = True
+        if rl_required:
+            required = self._dedupe_strings(required + ["reinforcement_learning"], limit=12)
+            allowed = self._dedupe_strings(allowed + ["reinforcement_learning"], limit=16)
+        review.rl_required = rl_required
+        review.explicit_rl_requested = rl_required
+        review.required_method_families = required
+        review.allowed_method_families = allowed
+        review.recommended_solver_families = self._dedupe_strings(
+            list(review.recommended_solver_families or []) + allowed,
+            limit=12,
         )
 
-        if rl_signal:
-            review.explicit_rl_requested = True
-
-        recommended = list(review.recommended_solver_families or [])
-        if static_decision_signal:
-            recommended.extend(["greedy_baseline", "repair_heuristic", "local_search"])
-        if rl_signal:
-            recommended.append("rl_candidate")
-        review.recommended_solver_families = self._dedupe_strings(recommended, limit=8)
-
-        if (
-            review.problem_paradigm == "reinforcement_learning"
-            and static_decision_signal
-            and solution_output_signal
-            and not official_env_signal
-        ):
+        if review.problem_structure == "decision_optimization":
             review.problem_paradigm = "static_optimization"
+            if review.decision_temporality in {"", "not_applicable"}:
+                review.decision_temporality = "static_instance"
+            if rl_required and review.environment_source in {"", "not_applicable"}:
+                review.environment_source = "constructed_from_static_data"
             review.rl_as_required_paradigm = False
-            note = (
-                "AutoRealize normalized this as static_optimization: the authoritative deliverable/evaluator "
-                "is a complete dispatch/assignment solution with deterministic constraints and scalar cost. "
-                "RL is recorded as a requested candidate method, not as the problem paradigm."
-            )
-            if note not in review.method_routing_notes:
-                review.method_routing_notes.append(note)
-            review.key_signals = self._dedupe_strings(
-                list(review.key_signals or []) + ["method_only_rl_request", "static_solution_output"],
-                limit=20,
-            )
-            review.evidence = self._dedupe_strings(
-                list(review.evidence or []) + ["Static assignment/dispatch output and deterministic cost/constraint evaluation dominate the executable contract."],
-                limit=20,
-            )
-        elif review.problem_paradigm == "reinforcement_learning":
+        elif review.problem_structure == "native_sequential_control":
+            review.problem_paradigm = "reinforcement_learning"
+            review.rl_required = True
+            review.explicit_rl_requested = True
             review.rl_as_required_paradigm = True
-
-        if static_decision_signal and rl_signal:
-            baseline_note = (
-                "Downstream first solution should implement the deterministic evaluator plus a greedy/repair/local-search baseline; "
-                "if RL is attempted, it must reuse the same score_solution/validate_solution contract and be compared against the baseline."
+            review.required_method_families = self._dedupe_strings(
+                review.required_method_families + ["reinforcement_learning"], limit=12
             )
-            if baseline_note not in review.method_routing_notes:
-                review.method_routing_notes.append(baseline_note)
+            if review.decision_temporality in {"", "not_applicable"}:
+                review.decision_temporality = "sequential"
+            if review.environment_source in {"", "not_applicable"}:
+                review.environment_source = "provided_or_task_defined"
+
+        if rl_required:
+            note = (
+                "Reinforcement learning is a required solver method. The task structure and scalar evaluator remain "
+                "independent of the method; MLEvolve should construct a decision process from grounded task facts when no environment is provided."
+            )
+            review.method_routing_notes = self._dedupe_strings(
+                list(review.method_routing_notes or []) + [note], limit=12
+            )
 
     def _protocol_prompt_for_paradigm(self, paradigm: str) -> str:
         mapping = {
@@ -608,6 +695,7 @@ class TaskDefinitionModule:
         *,
         paradigm: str,
         deterministic_data_access: object,
+        problem_review: ProblemParadigmReview | None = None,
     ) -> DescriptionProtocolBundle:
         if hasattr(deterministic_data_access, "files"):
             data_access = deterministic_data_access
@@ -618,6 +706,24 @@ class TaskDefinitionModule:
             data_access = DataAccessProtocol.model_validate(data if isinstance(data, dict) else {})
         bundle = DescriptionProtocolBundle(
             problem_paradigm=paradigm,
+            problem_structure=(
+                problem_review.problem_structure if problem_review is not None else draft.problem_structure
+            ),
+            decision_temporality=(
+                problem_review.decision_temporality if problem_review is not None else draft.decision_temporality
+            ),
+            environment_source=(
+                problem_review.environment_source if problem_review is not None else draft.environment_source
+            ),
+            required_method_families=(
+                list(problem_review.required_method_families) if problem_review is not None else draft.required_method_families
+            ),
+            allowed_method_families=(
+                list(problem_review.allowed_method_families) if problem_review is not None else draft.allowed_method_families
+            ),
+            rl_formulation_candidates=(
+                list(problem_review.rl_formulation_candidates) if problem_review is not None else draft.rl_formulation_candidates
+            ),
             overview=draft.overview,
             task_goal=draft.task_goal,
             data_access=data_access,  # type: ignore[arg-type]
@@ -662,8 +768,8 @@ class TaskDefinitionModule:
             "context_policy": self._headroom_context_policy(),
             "output_language_policy": self._output_language_policy(),
             "instruction": (
-                "Generate only the task/evaluation/output protocol draft. "
-                "Do not enumerate all files or fields. Do not output data_access; it is generated by code."
+                "只生成任务、评估和输出协议草案。不要枚举全部文件或字段。"
+                "不要输出 data_access；该合同由程序确定性生成。"
             ),
             "original_requirements_full": original_text,
             "description_protocol_pack": description_protocol_pack,
@@ -681,17 +787,18 @@ class TaskDefinitionModule:
         defects: list[str] = []
         for idx in range(max_retries):
             if idx == 0:
-                dynamic_payload = {"instruction": "Generate the first DescriptionTaskProtocolDraft JSON."}
+                dynamic_payload = {"instruction": "生成第一版 DescriptionTaskProtocolDraft JSON。"}
             else:
                 dynamic_payload = {
                     "previous_protocol_defects": defects,
                     "repair_instruction": (
-                        "Regenerate the full DescriptionTaskProtocolDraft JSON. Fix every listed defect. "
-                        "Do not output data_access; deterministic file access will be merged by code. "
-                        "Do not add sample_submission requirements unless an authoritative contract exists."
+                        "重新生成完整 DescriptionTaskProtocolDraft JSON，并修复列出的每个缺陷。"
+                        "不要输出 data_access；程序会合并确定性文件访问合同。"
+                        "除非存在权威合同，不要新增 sample_submission 要求。"
                     ),
                 }
-            stable, dynamic = stable_dynamic_prompt(
+            stable, dynamic = self._stage_prompt(
+                stage=f"description_protocol_{paradigm}_{idx+1}",
                 stable=payload,
                 dynamic=dynamic_payload,
                 stable_title="Stable description protocol evidence",
@@ -715,6 +822,7 @@ class TaskDefinitionModule:
                 draft,
                 paradigm=paradigm,
                 deterministic_data_access=deterministic_data_access,
+                problem_review=problem_review,
             )
             bundle.problem_paradigm = paradigm
             cols = [
@@ -1248,6 +1356,13 @@ class TaskDefinitionModule:
             field_limit=max(2, min(5, int(getattr(self.config.prompt, "description_protocol_fields_per_file", 12)))),
         )
         relation_cards = build_relation_cards(relations, limit=relation_limit)
+        source_coverage_ledger = build_source_coverage_ledger(
+            file_summaries=file_summaries,
+        )
+        population_verification_queue = build_population_verification_queue(
+            detailed_table_cards,
+            limit=12,
+        )
         filename_group_cards = self._filename_group_cards_for_sections(
             downstream_context,
             file_summaries=file_summaries,
@@ -1263,6 +1378,9 @@ class TaskDefinitionModule:
             },
             "table_cards": table_cards,
             "relations": relation_cards,
+            "relation_verification_queue": build_relation_verification_queue(relation_cards, limit=12),
+            "population_verification_queue": population_verification_queue,
+            "source_coverage_ledger": source_coverage_ledger,
             "filename_sample_groups": filename_group_cards,
         }
         return payload
@@ -1475,7 +1593,10 @@ class TaskDefinitionModule:
             # Compatibility key: tiny file/table handles only, not a full metadata bundle.
             "evaluation_related_files": self._table_cards_as_file_index(table_cards),
             "table_index": table_cards,
+            "source_coverage_ledger": compiled["source_coverage_ledger"],
+            "population_verification_queue": compiled["population_verification_queue"],
             "relations": compiled["relations"][:20],
+            "relation_verification_queue": compiled["relation_verification_queue"],
             "filename_sample_groups": compiled["filename_sample_groups"][:12],
             "qdi_evaluation_output_constraint_conclusions": self._question_memory_pack(downstream_context),
             "protocol_evaluation_summary": (
@@ -1525,6 +1646,9 @@ class TaskDefinitionModule:
             "qdi_output_conclusions": self._question_memory_pack(downstream_context),
             "table_index": table_cards,
             "relations": relation_cards,
+            "source_coverage_ledger": compiled.get("source_coverage_ledger", {}) if file_summaries is not None else {},
+            "relation_verification_queue": compiled.get("relation_verification_queue", []) if file_summaries is not None else [],
+            "population_verification_queue": compiled.get("population_verification_queue", []) if file_summaries is not None else [],
             "filename_sample_groups": filename_group_cards,
             "known_output_like_files": [
                 str(p.relative_to(data_root)).replace("\\", "/")
@@ -1544,10 +1668,13 @@ class TaskDefinitionModule:
         return {
             # Compatibility key: tiny file/table handles only.
             "files": self._table_cards_as_file_index(compiled["table_cards"]),
+            "source_coverage_ledger": compiled["source_coverage_ledger"],
             "filename_sample_groups": compiled["filename_sample_groups"],
             "global_reading_policy": [
                 "description.md 只写必要读取方式；详细读取代码进入 automl_context。",
                 "普通默认 CSV 不冗余展开读取代码；非默认 CSV、多 sheet Excel、JSON 等需要提示读取方式。",
+                "source_coverage_ledger 中每个 required/supporting 来源必须在本章说明，或明确写出不使用原因。",
+                "verified_row_count 与 worksheet used range 冲突时，任务口径使用 verified_row_count；used range 只说明物理布局异常。",
             ],
         }
 
@@ -1570,13 +1697,15 @@ class TaskDefinitionModule:
         )
         return {
             "context_policy": {
-                "table_index_is_route_only": True,
+                "table_index_is_compact_navigation": True,
                 "table_field_details_are_bounded_prompt_visible_evidence": True,
                 "full_profiles_previews_and_source_metadata_are_local_only": True,
             },
-            "table_index": compiled["table_cards"],
+            "table_index": self._table_cards_as_file_index(compiled["table_cards"]),
             "table_field_details": table_field_details,
+            "source_coverage_ledger": compiled["source_coverage_ledger"],
             "relations": compiled["relations"][:40],
+            "relation_verification_queue": compiled["relation_verification_queue"],
             "filename_sample_groups": compiled["filename_sample_groups"],
             "field_selection_policy": (
                 "只写任务相关关键字段；不要求罗列所有列。字段含义优先来自 "
@@ -1652,9 +1781,10 @@ class TaskDefinitionModule:
                 "artifact_refs": artifact_refs or {},
             },
         )
-        stable, dynamic = stable_dynamic_prompt(
+        stable, dynamic = self._stage_prompt(
+            stage="description_sections_overview_task_definition",
             stable=stable_payload,
-            dynamic={"instruction": "Generate frozen overview and task-definition sections."},
+            dynamic={"instruction": "生成冻结的任务概述与任务定义章节。"},
             stable_title="Stable overview/task-definition evidence",
             dynamic_title="Dynamic section request",
         )
@@ -1762,9 +1892,10 @@ class TaskDefinitionModule:
                 "artifact_refs": artifact_refs or {},
             },
         )
-        stable, dynamic = stable_dynamic_prompt(
+        stable, dynamic = self._stage_prompt(
+            stage="description_section_output_spec",
             stable=stable_payload,
-            dynamic={"instruction": "Generate output/submission section and sample_submission_spec."},
+            dynamic={"instruction": "生成输出/提交格式章节与 sample_submission_spec。"},
             stable_title="Stable output section evidence",
             dynamic_title="Dynamic output section request",
         )
@@ -1820,7 +1951,8 @@ class TaskDefinitionModule:
                 "artifact_refs": artifact_refs or {},
             },
         )
-        stable, dynamic = stable_dynamic_prompt(
+        stable, dynamic = self._stage_prompt(
+            stage=f"description_section_{section_id}",
             stable=stable_payload,
             dynamic={"instruction": f"Generate only the `{section_title}` section."},
             stable_title=f"Stable {section_id} section evidence",
@@ -2309,6 +2441,176 @@ class TaskDefinitionModule:
                     + "do not access it as a raw dataframe column. Derive it from exact source fields, provide an evaluation/config rule, or define an explicit exclusion rule."
                 )
             sample_spec.validation_rules = list(dict.fromkeys(existing_rules))
+        return corrections
+
+    def _resolve_unresolved_source_field_aliases(
+        self,
+        sample_spec: SampleSubmissionSpec,
+        *,
+        schema_contract: dict,
+        downstream_context: dict,
+        original_text: str,
+    ) -> list[dict]:
+        """Resolve remaining aliases by bounded semantic choice, then revalidate."""
+
+        if not bool(getattr(self.config.prompt, "source_field_alias_llm_resolution_enabled", True)):
+            return []
+        physical_columns = sorted(self._exact_schema_columns(schema_contract))
+        physical_column_set = set(physical_columns)
+        non_column_names = self._exact_schema_non_column_names(schema_contract)
+        candidate_rows: list[dict] = []
+        groups: list[dict] = []
+        for output_column, raw in (sample_spec.source_fields or {}).items():
+            for alias in self._source_field_alias_tokens(str(raw or "")):
+                field = str(alias or "").strip()
+                if not field or field in physical_column_set or field in non_column_names:
+                    continue
+                deterministic, exact_candidates = self._resolve_exact_source_field_alias(
+                    field,
+                    schema_contract=schema_contract,
+                    physical_columns=physical_columns,
+                    non_column_names=non_column_names,
+                )
+                if deterministic or not exact_candidates:
+                    continue
+                group_candidates: list[dict] = []
+                for exact in exact_candidates[:10]:
+                    candidate_id = f"A{len(candidate_rows) + 1:04d}"
+                    row = {
+                        "candidate_id": candidate_id,
+                        "output_column": str(output_column),
+                        "alias": field,
+                        "exact_physical_column": str(exact),
+                    }
+                    candidate_rows.append(row)
+                    group_candidates.append(row)
+                groups.append(
+                    {
+                        "output_column": str(output_column),
+                        "alias": field,
+                        "candidates": group_candidates,
+                    }
+                )
+        if not groups:
+            return []
+
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._prompt_language_policy(),
+            "original_requirements_full": original_text,
+            "authoritative_memory": compact_authoritative_memory(
+                downstream_context.get("authoritative_memory", {})
+            ),
+            "constraint_memory": compact_constraint_memory(
+                downstream_context.get("constraint_memory", {})
+            ),
+            "exact_alias_candidate_groups": groups,
+            "rules": [
+                "只能选择同一 output_column 和 alias 组中的 candidate_id。",
+                "candidate 对应的 exact_physical_column 已由程序确认存在；不得输出其他字段。",
+                "短业务概念可能跨表复用，证据不足时必须保持 unresolved。",
+            ],
+        }
+        dynamic_payload = {
+            "instruction": "结合权威需求和输出语义，仅消解无法由字符串规则安全处理的源字段别名。",
+            "sample_submission_source_fields": sample_spec.source_fields,
+            "output_column_meanings": sample_spec.column_meanings,
+            "row_unit": sample_spec.row_unit,
+        }
+        stable, dynamic = self._stage_prompt(
+            stage="source_field_alias_resolver",
+            stable=stable_payload,
+            dynamic=dynamic_payload,
+            stable_title="Stable exact source-field candidates",
+            dynamic_title="Latest unresolved source-field aliases",
+            dynamic_limit=16000,
+        )
+        report: dict = {
+            "schema_version": "autorealize.source_field_alias_resolution.v1",
+            "candidate_groups": groups,
+            "accepted": [],
+            "rejected": [],
+        }
+        try:
+            decision = self.services.llm_client.ask_structured(
+                model_cls=SourceFieldAliasResolution,
+                system_prompt=self.services.prompt_mgr.load("system/source_field_alias_resolver.md"),
+                user_prompt=dynamic,
+                prompt_name="source_field_alias_resolver",
+                max_tokens=2200,
+                static_context_prompt=stable,
+                dynamic_user_prompt=dynamic,
+            )
+            report["decision"] = decision.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            report["error"] = str(exc)[:1000]
+            write_json_safe(self.report_dir / "source_field_alias_resolution_report.json", report, indent=2)
+            return []
+
+        by_id = {str(row["candidate_id"]): row for row in candidate_rows}
+        min_confidence = min(
+            1.0,
+            max(0.0, float(getattr(self.config.prompt, "source_field_alias_resolution_min_confidence", 0.82))),
+        )
+        corrections: list[dict] = []
+        for choice in decision.choices:
+            candidate = by_id.get(str(choice.candidate_id or ""))
+            rejection = ""
+            if candidate is None:
+                rejection = "candidate_not_in_deterministic_set"
+            elif str(choice.output_column or "") != str(candidate.get("output_column") or ""):
+                rejection = "output_column_mismatch"
+            elif str(choice.alias or "") != str(candidate.get("alias") or ""):
+                rejection = "alias_mismatch"
+            elif choice.remain_unresolved or float(choice.confidence or 0.0) < min_confidence:
+                rejection = "unresolved_or_below_confidence_threshold"
+            elif str(candidate.get("exact_physical_column") or "") not in physical_column_set:
+                rejection = "field_not_in_physical_schema"
+            if rejection:
+                report["rejected"].append(
+                    {"candidate_id": str(choice.candidate_id or ""), "reason": rejection}
+                )
+                continue
+            correction = {
+                "output_column": str(candidate["output_column"]),
+                "from": str(candidate["alias"]),
+                "to": str(candidate["exact_physical_column"]),
+                "reason": "LLM selected an exact deterministic schema candidate for an ambiguous source-field alias",
+                "confidence": float(choice.confidence or 0.0),
+            }
+            if correction not in corrections:
+                corrections.append(correction)
+                report["accepted"].append(correction)
+
+        if corrections:
+            updated = dict(sample_spec.source_fields or {})
+            for correction in corrections:
+                output_column = correction["output_column"]
+                updated[output_column] = self._replace_source_field_alias(
+                    str(updated.get(output_column, "") or ""),
+                    correction["from"],
+                    correction["to"],
+                )
+            sample_spec.source_fields = updated
+            resolved_aliases = {(item["output_column"], item["from"]) for item in corrections}
+            rules = []
+            for rule in sample_spec.validation_rules or []:
+                if any(
+                    str(rule).startswith("AutoRealize could not resolve source field alias")
+                    and f"`{alias}`" in str(rule)
+                    and f"`{output_column}`" in str(rule)
+                    for output_column, alias in resolved_aliases
+                ):
+                    continue
+                rules.append(str(rule))
+            for correction in corrections:
+                rules.append(
+                    "AutoRealize resolved source field alias "
+                    f"`{correction['from']}` -> `{correction['to']}` for output column "
+                    f"`{correction['output_column']}` using a schema-bounded semantic decision."
+                )
+            sample_spec.validation_rules = list(dict.fromkeys(rules))
+        write_json_safe(self.report_dir / "source_field_alias_resolution_report.json", report, indent=2)
         return corrections
 
     @staticmethod
@@ -2831,7 +3133,8 @@ class TaskDefinitionModule:
                 "artifact_refs": artifact_refs or {},
             },
         )
-        stable, dynamic = stable_dynamic_prompt(
+        stable, dynamic = self._stage_prompt(
+            stage="sample_submission_spec_validator",
             stable=stable_payload,
             dynamic={
                 "generated_columns": generated_columns,
@@ -2908,7 +3211,8 @@ class TaskDefinitionModule:
         )
 
         def _ask_plan(dynamic_payload: dict, round_idx: int) -> SubmissionScriptPlan:
-            stable, dynamic = stable_dynamic_prompt(
+            stable, dynamic = self._stage_prompt(
+                stage=f"sample_submission_spec_builder_{round_idx}",
                 stable=stable_payload,
                 dynamic=dynamic_payload,
                 stable_title="Stable sample builder evidence",
@@ -2928,7 +3232,7 @@ class TaskDefinitionModule:
                 plan.submission_columns = list(sample_spec.columns)
             return plan
 
-        current_plan = _ask_plan({"instruction": "Generate initial sample_submission builder script."}, 0)
+        current_plan = _ask_plan({"instruction": "生成第一版 sample_submission 构建脚本。"}, 0)
         max_repairs = max(3, int(getattr(self.config.prompt, "description_quality_max_retries", 3)))
         max_validator_rounds = 3
         validator_rounds = 0
@@ -2941,7 +3245,7 @@ class TaskDefinitionModule:
                     break
                 current_plan = _ask_plan(
                     {
-                        "instruction": "Repair previous script; it violated the read-only/static safety policy.",
+                        "instruction": "修复上一版脚本；它违反了只读或静态安全策略。",
                         "previous_plan": current_plan.model_dump(),
                         "static_issues": static_issues,
                         "repair_round": round_idx + 1,
@@ -2956,7 +3260,7 @@ class TaskDefinitionModule:
                     break
                 current_plan = _ask_plan(
                     {
-                        "instruction": "Repair previous script; it failed during execution.",
+                        "instruction": "修复上一版脚本；它在执行期间失败。",
                         "previous_plan": current_plan.model_dump(),
                         "execution_issues": plan_issues,
                         "repair_round": round_idx + 1,
@@ -3016,7 +3320,7 @@ class TaskDefinitionModule:
             else:
                 current_plan = _ask_plan(
                     {
-                        "instruction": "Repair script according to validator/rule issues.",
+                    "instruction": "根据校验器和确定性规则报告的问题修复脚本。",
                         "previous_plan": current_plan.model_dump(),
                         "generated_columns": generated_columns,
                         "generated_preview": generated_preview[:5],
@@ -3044,6 +3348,7 @@ class TaskDefinitionModule:
         sample_spec: SampleSubmissionSpec,
         evaluation_contract: EvaluationContractReview,
         legacy,
+        source_coverage_ledger: dict | None = None,
     ) -> list[str]:
         defects: list[str] = []
         if not str(desc or "").strip():
@@ -3057,7 +3362,297 @@ class TaskDefinitionModule:
                 defects.append(f"sample_columns_mismatch: got={cols}, expected={sample_spec.columns}")
         missing_refs = legacy._find_missing_file_references(desc, data_root)
         defects.extend([f"引用了不存在文件: {x}" for x in missing_refs])
+        defects.extend(self._source_coverage_defects(desc, source_coverage_ledger or {}))
         return list(dict.fromkeys([x for x in defects if str(x).strip()]))
+
+    def _replace_h2_section(self, desc: str, section_title: str, replacement: str) -> str:
+        allowed = {
+            "任务概述",
+            "任务定义",
+            "评估协议",
+            "输出或提交格式",
+            "数据说明",
+            "关键字段说明",
+            "约束与防泄漏",
+            "关键坑点与待确认事项",
+        }
+        title = str(section_title or "").strip()
+        text = self._strip_markdown_fence(replacement).strip()
+        if title not in allowed or not text.startswith(f"## {title}"):
+            return desc
+        lines = desc.splitlines()
+        start = next((idx for idx, line in enumerate(lines) if line.strip() == f"## {title}"), None)
+        if start is None:
+            return desc
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            if lines[idx].startswith("## "):
+                end = idx
+                break
+        return "\n".join(lines[:start] + text.splitlines() + lines[end:]).strip() + "\n"
+
+    def _sync_final_description_sections(self, desc: str, downstream_context: dict) -> None:
+        """Keep the machine protocol's frozen section snapshot aligned after audit patches."""
+
+        sections = downstream_context.get("description_sections")
+        if not isinstance(sections, dict):
+            return
+        overview = sections.get("overview_task_definition")
+        if isinstance(overview, dict):
+            overview["overview_markdown"] = self._h2_section_text(desc, "任务概述")
+            overview["task_definition_markdown"] = self._h2_section_text(desc, "任务定义")
+        mapping = {
+            "output": "输出或提交格式",
+            "data": "数据说明",
+            "fields": "关键字段说明",
+            "constraints_leakage": "约束与防泄漏",
+            "tips": "关键坑点与待确认事项",
+        }
+        for key, title in mapping.items():
+            item = sections.get(key)
+            if isinstance(item, dict):
+                item["markdown"] = self._h2_section_text(desc, title)
+        downstream_context["final_description_sha256_16"] = hashlib.sha256(
+            desc.encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+
+    def _review_final_artifact_consistency(
+        self,
+        *,
+        desc: str,
+        problem_review: ProblemParadigmReview,
+        protocol_bundle: DescriptionProtocolBundle,
+        evaluation_contract: EvaluationContractReview,
+        sample_spec: SampleSubmissionSpec,
+        submission_report: dict,
+        automl_context_pack: dict,
+        main_task_protocol: dict,
+        downstream_context: dict,
+        deterministic_defects: list[str],
+        round_idx: int,
+    ) -> ArtifactConsistencyReview:
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._prompt_language_policy(),
+            "audit_rules": [
+                "只审查跨产物语义一致性和证据归属，不做文风润色。",
+                "真实 schema、官方合同和程序验证事实不可被任务书文本覆盖。",
+                "QDI unresolved 不得被提升为确定事实。",
+                "只引用输入中可见的 artifact/section/evidence，不得猜测隐藏内容。",
+            ],
+        }
+        dynamic_payload = {
+            "instruction": "审查当前最终候选产物；列出最小、可定位、可修复的问题。",
+            "round": round_idx,
+            "description_markdown": desc,
+            "problem_paradigm_review": problem_review.model_dump(),
+            "description_protocol_bundle": protocol_bundle.model_dump(),
+            "evaluation_contract": evaluation_contract.model_dump(),
+            "sample_submission_spec": sample_spec.model_dump(),
+            "submission_report": submission_report,
+            "automl_context_pack": automl_context_pack,
+            "main_task_protocol": main_task_protocol,
+            "qdi_conclusions": self._question_memory_pack(downstream_context),
+            "source_alias_guard": downstream_context.get("source_alias_guard", []),
+            "deterministic_defects": deterministic_defects,
+        }
+        stable, dynamic = self._stage_prompt(
+            stage=f"artifact_consistency_reviewer_{round_idx}",
+            stable=stable_payload,
+            dynamic=dynamic_payload,
+            stable_title="Stable artifact audit rules",
+            dynamic_title="Latest final artifact candidates",
+            dynamic_limit=52000,
+        )
+        return self.services.llm_client.ask_structured(
+            model_cls=ArtifactConsistencyReview,
+            system_prompt=self.services.prompt_mgr.load("system/artifact_consistency_reviewer.md"),
+            user_prompt=dynamic,
+            prompt_name=f"artifact_consistency_reviewer_{round_idx}",
+            max_tokens=4500,
+            static_context_prompt=stable,
+            dynamic_user_prompt=dynamic,
+        )
+
+    def _build_artifact_consistency_patch(
+        self,
+        *,
+        desc: str,
+        review: ArtifactConsistencyReview,
+        round_idx: int,
+    ) -> ArtifactConsistencyPatch:
+        repairable = [
+            issue.model_dump()
+            for issue in review.issues
+            if str(issue.repair_target or "") == "description_section" and str(issue.section or "").strip()
+        ]
+        if not repairable:
+            return ArtifactConsistencyPatch()
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._prompt_language_policy(),
+            "rules": [
+                "只返回需要修改的完整二级章节；每个值必须从对应 ## 标题开始。",
+                "不要改写未列入 repairable_issues 的章节。",
+                "不得修改机器合同、真实字段、文件路径、官方规则或未解决状态。",
+                "修复冲突，不做一般性润色。",
+            ],
+        }
+        dynamic_payload = {
+            "instruction": "按审查意见生成最小章节补丁。",
+            "round": round_idx,
+            "repairable_issues": repairable,
+            "current_description": desc,
+        }
+        stable, dynamic = self._stage_prompt(
+            stage=f"artifact_consistency_patcher_{round_idx}",
+            stable=stable_payload,
+            dynamic=dynamic_payload,
+            stable_title="Stable artifact patch rules",
+            dynamic_title="Latest consistency issues",
+            dynamic_limit=32000,
+        )
+        return self.services.llm_client.ask_structured(
+            model_cls=ArtifactConsistencyPatch,
+            system_prompt=self.services.prompt_mgr.load("system/artifact_consistency_patcher.md"),
+            user_prompt=dynamic,
+            prompt_name=f"artifact_consistency_patcher_{round_idx}",
+            max_tokens=6000,
+            static_context_prompt=stable,
+            dynamic_user_prompt=dynamic,
+        )
+
+    def _audit_and_repair_final_artifacts(
+        self,
+        *,
+        desc: str,
+        data_root: Path,
+        legacy,
+        problem_review: ProblemParadigmReview,
+        protocol_bundle: DescriptionProtocolBundle,
+        evaluation_contract: EvaluationContractReview,
+        sample_spec: SampleSubmissionSpec,
+        submission_report: dict,
+        automl_context_pack: dict,
+        main_task_protocol: dict,
+        downstream_context: dict,
+        deterministic_defects: list[str],
+        source_coverage_ledger: dict,
+    ) -> tuple[str, ArtifactConsistencyReview, list[str]]:
+        if not bool(getattr(self.config.prompt, "artifact_consistency_enabled", True)):
+            return desc, ArtifactConsistencyReview(passed=True, summary="disabled_by_config"), deterministic_defects
+        current = desc
+        review = ArtifactConsistencyReview(passed=True)
+        rounds: list[dict] = []
+        max_rounds = max(1, int(getattr(self.config.prompt, "artifact_consistency_max_rounds", 2)))
+        for round_idx in range(1, max_rounds + 1):
+            try:
+                review = self._review_final_artifact_consistency(
+                    desc=current,
+                    problem_review=problem_review,
+                    protocol_bundle=protocol_bundle,
+                    evaluation_contract=evaluation_contract,
+                    sample_spec=sample_spec,
+                    submission_report=submission_report,
+                    automl_context_pack=automl_context_pack,
+                    main_task_protocol=main_task_protocol,
+                    downstream_context=downstream_context,
+                    deterministic_defects=deterministic_defects,
+                    round_idx=round_idx,
+                )
+            except Exception as exc:  # noqa: BLE001
+                review = ArtifactConsistencyReview(
+                    passed=False,
+                    summary=f"consistency reviewer failed: {exc}",
+                )
+                rounds.append({"round": round_idx, "reviewer_error": str(exc)[:1000]})
+                break
+            rounds.append({"round": round_idx, "review": review.model_dump()})
+            self._remember_stage(
+                f"artifact_consistency_review_{round_idx}",
+                review.model_dump(),
+                authority="semantic_audit",
+            )
+            blocking = [issue for issue in review.issues if str(issue.severity or "").lower() == "blocking"]
+            if review.passed and not blocking:
+                break
+            if round_idx >= max_rounds:
+                break
+            patch = self._build_artifact_consistency_patch(desc=current, review=review, round_idx=round_idx)
+            if not patch.revised_sections:
+                break
+            candidate = current
+            for section, markdown in patch.revised_sections.items():
+                candidate = self._replace_h2_section(candidate, section, markdown)
+            patch_missing_refs = legacy._find_missing_file_references(candidate, data_root)
+            rounds[-1]["patch"] = patch.model_dump()
+            rounds[-1]["patch_missing_file_references"] = patch_missing_refs
+            if patch_missing_refs:
+                rounds[-1]["patch_rejected"] = "introduced_or_retained_nonexistent_file_reference"
+                break
+            candidate = legacy._enforce_existing_file_references(candidate, data_root)
+            candidate_defects = self._artifact_sanity_check(
+                desc=candidate,
+                data_root=data_root,
+                legacy=legacy,
+                sample_spec=sample_spec,
+                evaluation_contract=evaluation_contract,
+                source_coverage_ledger=source_coverage_ledger,
+            )
+            new_defects = [item for item in candidate_defects if item not in deterministic_defects]
+            rounds[-1]["candidate_new_deterministic_defects"] = new_defects
+            if new_defects:
+                break
+            current = finalize_description_markdown(candidate)
+            deterministic_defects = candidate_defects
+            self._remember_stage(
+                f"artifact_consistency_patch_{round_idx}",
+                patch.model_dump(),
+                authority="bounded_description_patch",
+            )
+        write_json_safe(
+            self.report_dir / "artifact_consistency_report.json",
+            {"final": review.model_dump(), "rounds": rounds},
+            indent=2,
+        )
+        blocking_messages = [
+            f"artifact_consistency:{issue.issue_id or issue.category}:{issue.message}"
+            for issue in review.issues
+            if str(issue.severity or "").lower() == "blocking"
+        ]
+        if bool(getattr(self.config.prompt, "artifact_consistency_fail_on_blocking", False)):
+            deterministic_defects = list(dict.fromkeys(deterministic_defects + blocking_messages))
+        return current, review, deterministic_defects
+
+    def _source_coverage_defects(self, desc: str, ledger: dict) -> list[str]:
+        """Check that task-defining structured sources were not silently dropped."""
+
+        entries = ledger.get("entries") if isinstance(ledger, dict) else []
+        if not isinstance(entries, list):
+            return []
+        compact_desc = re.sub(r"\s+", "", str(desc or "")).lower()
+        defects: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("coverage_status") not in {"required", "supporting"}:
+                continue
+            table_id = str(entry.get("table_id", "") or "")
+            source = str(entry.get("source_file", "") or entry.get("source_collection", "") or "")
+            sheet = str(entry.get("sheet_name", "") or "")
+            source_candidates = [source, Path(source).name if source else ""]
+            source_visible = any(
+                normalized in compact_desc
+                for candidate in source_candidates
+                if len(normalized := re.sub(r"\s+", "", candidate).lower()) >= 2
+            )
+            normalized_sheet = re.sub(r"\s+", "", sheet).lower()
+            sheet_visible = not normalized_sheet or (
+                len(normalized_sheet) >= 2 and normalized_sheet in compact_desc
+            )
+            # Generic names such as Sheet1 occur in many workbooks. They count only
+            # when the owning file/collection is also named in the description.
+            if not source_visible or not sheet_visible:
+                defects.append(f"description_missing_source_coverage: {table_id}")
+        return defects[:40]
 
     def _collect_description_defects(
         self,
@@ -3398,6 +3993,250 @@ class TaskDefinitionModule:
         return current
 
 
+    def _resolve_downstream_context_semantics(
+        self,
+        *,
+        data_root: Path,
+        task_hint: str,
+        original_text: str,
+        downstream_context: dict,
+        file_summaries: list,
+    ) -> dict:
+        """Use an LLM only for ambiguous choices from a deterministic candidate set."""
+
+        candidates_by_dimension = downstream_context.get("inference_candidates")
+        resolutions = downstream_context.get("inference_resolution")
+        if not isinstance(candidates_by_dimension, dict) or not isinstance(resolutions, dict):
+            return downstream_context
+        if not bool(getattr(self.config.prompt, "downstream_context_llm_resolution_enabled", True)):
+            return downstream_context
+        ambiguous = [
+            str(dimension)
+            for dimension, resolution in resolutions.items()
+            if isinstance(resolution, dict) and bool(resolution.get("unresolved"))
+        ]
+        max_dimensions = max(
+            1,
+            int(getattr(self.config.prompt, "downstream_context_resolution_max_dimensions", 5)),
+        )
+        ambiguous = ambiguous[:max_dimensions]
+        if not ambiguous:
+            downstream_context["downstream_context_resolution_source"] = "deterministic_high_confidence"
+            return downstream_context
+
+        bounded_candidates = {
+            dimension: list(candidates_by_dimension.get(dimension) or [])[:20]
+            for dimension in ambiguous
+        }
+        file_semantics = [
+            {
+                "source_file": str(getattr(summary, "path", "") or ""),
+                "summary": str(getattr(summary, "summary", "") or "")[:800],
+                "column_semantics": dict(getattr(summary, "column_semantics", {}) or {}),
+            }
+            for summary in file_summaries[:40]
+        ]
+        stable_payload = {
+            "context_policy": self._headroom_context_policy(),
+            "output_language_policy": self._prompt_language_policy(),
+            "original_requirements_full": original_text,
+            "task_hint": task_hint,
+            "authoritative_memory": compact_authoritative_memory(
+                downstream_context.get("authoritative_memory", {})
+            ),
+            "constraint_memory": compact_constraint_memory(
+                downstream_context.get("constraint_memory", {})
+            ),
+            "file_cognition_semantics": file_semantics,
+            "candidate_contract": bounded_candidates,
+            "rules": [
+                "只能选择 candidate_contract 中当前 dimension 下的 candidate_id。",
+                "文件、Sheet、字段和 task type 均不得自由生成。",
+                "证据不足时 remain_unresolved=true，不要为了填满字段而猜测。",
+                "权威需求和程序验证事实高于文件名启发式与 LLM 推断。",
+            ],
+        }
+        dynamic_payload = {
+            "instruction": "仅消解列出的歧义维度；为每个选择给出短理由和证据引用。",
+            "ambiguous_dimensions": ambiguous,
+            "current_deterministic_resolution": {
+                dimension: resolutions.get(dimension) for dimension in ambiguous
+            },
+            "retrieved_knowledge": downstream_context.get("retrieved_knowledge", [])[:12],
+        }
+        stable, dynamic = stable_dynamic_prompt(
+            stable=stable_payload,
+            dynamic=dynamic_payload,
+            stable_title="Stable downstream semantic candidates",
+            dynamic_title="Latest ambiguous downstream dimensions",
+            dynamic_limit=18000,
+        )
+        report: dict = {
+            "schema_version": "autorealize.downstream_context_resolution.v1",
+            "ambiguous_dimensions": ambiguous,
+            "accepted": [],
+            "rejected": [],
+        }
+        try:
+            decision = self.services.llm_client.ask_structured(
+                model_cls=DownstreamContextResolution,
+                system_prompt=self.services.prompt_mgr.load("system/downstream_context_resolver.md"),
+                user_prompt=dynamic,
+                prompt_name="downstream_context_resolver",
+                max_tokens=2400,
+                static_context_prompt=stable,
+                dynamic_user_prompt=dynamic,
+            )
+            report["decision"] = decision.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            report["error"] = str(exc)[:1000]
+            downstream_context["downstream_context_resolution_source"] = "deterministic_fallback"
+            write_json_safe(self.report_dir / "downstream_context_resolution_report.json", report, indent=2)
+            return downstream_context
+
+        inventory = {
+            (str(item.get("source_file") or ""), str(item.get("sheet_name") or "")): {
+                str(column) for column in item.get("columns") or []
+            }
+            for item in downstream_context.get("detected_table_units", [])
+            if isinstance(item, dict)
+        }
+        min_confidence = min(
+            1.0,
+            max(0.0, float(getattr(self.config.prompt, "downstream_context_resolution_min_confidence", 0.72))),
+        )
+        chosen: dict[str, dict] = {}
+        for choice in decision.choices:
+            dimension = str(choice.dimension or "")
+            candidate_id = str(choice.candidate_id or "")
+            candidate = next(
+                (
+                    item
+                    for item in bounded_candidates.get(dimension, [])
+                    if str(item.get("candidate_id") or "") == candidate_id
+                ),
+                None,
+            )
+            rejection = ""
+            if dimension not in ambiguous:
+                rejection = "dimension_not_requested"
+            elif candidate is None:
+                rejection = "candidate_not_in_deterministic_set"
+            elif choice.remain_unresolved or float(choice.confidence or 0.0) < min_confidence:
+                rejection = "unresolved_or_below_confidence_threshold"
+            elif dimension in {"id_column", "target_column"}:
+                source_key = (
+                    str(candidate.get("source_file") or ""),
+                    str(candidate.get("sheet_name") or ""),
+                )
+                if str(candidate.get("value") or "") not in inventory.get(source_key, set()):
+                    rejection = "field_not_in_physical_schema"
+            if rejection:
+                report["rejected"].append(
+                    {"dimension": dimension, "candidate_id": candidate_id, "reason": rejection}
+                )
+                continue
+            chosen[dimension] = candidate
+            report["accepted"].append(
+                {
+                    "dimension": dimension,
+                    "candidate_id": candidate_id,
+                    "confidence": float(choice.confidence or 0.0),
+                    "reason": str(choice.reason or "")[:500],
+                }
+            )
+
+        def selected_table_candidate(dimension: str) -> dict | None:
+            if dimension in chosen:
+                return chosen[dimension]
+            resolution = resolutions.get(dimension)
+            selected_id = str(resolution.get("selected_candidate_id") or "") if isinstance(resolution, dict) else ""
+            return next(
+                (
+                    item
+                    for item in candidates_by_dimension.get(dimension, [])
+                    if str(item.get("candidate_id") or "") == selected_id
+                ),
+                None,
+            )
+
+        for field_dimension, table_dimension in [
+            ("target_column", "train_table"),
+            (
+                "id_column",
+                "predict_table"
+                if chosen.get("predict_table") or downstream_context.get("predict_table")
+                else "train_table",
+            ),
+        ]:
+            field_candidate = chosen.get(field_dimension)
+            table_candidate = selected_table_candidate(table_dimension)
+            if not field_candidate or not table_candidate:
+                continue
+            field_source = (
+                str(field_candidate.get("source_file") or ""),
+                str(field_candidate.get("sheet_name") or ""),
+            )
+            table_source = (
+                str(table_candidate.get("source_file") or ""),
+                str(table_candidate.get("sheet_name") or ""),
+            )
+            if field_source == table_source:
+                continue
+            chosen.pop(field_dimension, None)
+            report["accepted"] = [
+                item for item in report["accepted"] if item.get("dimension") != field_dimension
+            ]
+            report["rejected"].append(
+                {
+                    "dimension": field_dimension,
+                    "candidate_id": str(field_candidate.get("candidate_id") or ""),
+                    "reason": f"field_not_in_selected_{table_dimension}",
+                }
+            )
+
+        for dimension, candidate in chosen.items():
+            value = str(candidate.get("value") or "")
+            if dimension in {"train_table", "predict_table"}:
+                downstream_context[dimension] = value
+                downstream_context["train_sheet" if dimension == "train_table" else "predict_sheet"] = str(
+                    candidate.get("sheet_name") or ""
+                )
+            else:
+                downstream_context[dimension] = value
+                if dimension == "target_column":
+                    downstream_context["y_true_field"] = value
+            resolution = resolutions.get(dimension)
+            if isinstance(resolution, dict):
+                resolution.update(
+                    {
+                        "selected_candidate_id": str(candidate.get("candidate_id") or ""),
+                        "selected_value": value,
+                        "confidence": next(
+                            (
+                                float(item.get("confidence") or 0.0)
+                                for item in report["accepted"]
+                                if item.get("dimension") == dimension
+                            ),
+                            float(candidate.get("score") or 0.0),
+                        ),
+                        "evidence": list(candidate.get("evidence") or []),
+                        "unresolved": False,
+                        "resolution_source": "llm_bounded_choice",
+                    }
+                )
+        downstream_context["unresolved_inferences"] = [
+            dimension
+            for dimension, resolution in resolutions.items()
+            if isinstance(resolution, dict) and bool(resolution.get("unresolved"))
+        ]
+        downstream_context["downstream_context_resolution_source"] = (
+            "llm_bounded_choice" if report["accepted"] else "deterministic_fallback"
+        )
+        downstream_context["downstream_context_resolution_report"] = report
+        write_json_safe(self.report_dir / "downstream_context_resolution_report.json", report, indent=2)
+        return downstream_context
+
     def _retrieve_relevant_knowledge(self, task_hint: str, downstream_context: dict) -> list[dict]:
         store = getattr(self.services, "knowledge_store", None)
         if store is None:
@@ -3414,7 +4253,97 @@ class TaskDefinitionModule:
             " ".join([str(x) for x in downstream_context.get("predict_columns", [])[:40]]),
         ]
         query = "\n".join([x for x in query_parts if x.strip()])
-        results = store.search(query, top_k=self.config.knowledge.retrieval_top_k)
+        top_k = max(1, int(self.config.knowledge.retrieval_top_k))
+        multiplier = max(1, int(getattr(self.config.knowledge, "semantic_rerank_candidate_multiplier", 3)))
+        results = store.search(query, top_k=top_k * multiplier)
+        rerank_meta: dict = {"enabled": False, "missing_topics": []}
+        min_candidates = max(2, int(getattr(self.config.knowledge, "semantic_rerank_min_candidates", 4)))
+        if bool(getattr(self.config.knowledge, "semantic_rerank_enabled", True)) and len(results) >= min_candidates:
+            candidate_rows = []
+            candidate_map = {}
+            for idx, result in enumerate(results):
+                candidate_id = f"K{idx + 1:03d}"
+                candidate_map[candidate_id] = result
+                candidate_rows.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "lexical_score": result.score,
+                        "lexical_reasons": result.reasons,
+                        "kind": result.entry.kind,
+                        "source": result.entry.source,
+                        "text": result.entry.text[:1200],
+                        "fields": result.entry.fields[:20],
+                        "constraints": result.entry.constraints[:12],
+                        "tags": result.entry.tags[:12],
+                    }
+                )
+            stable_payload = {
+                "context_policy": self._headroom_context_policy(),
+                "output_language_policy": self._prompt_language_policy(),
+                "task_hint": task_hint,
+                "authoritative_memory": compact_authoritative_memory(
+                    downstream_context.get("authoritative_memory", {})
+                ),
+                "constraint_memory": compact_constraint_memory(
+                    downstream_context.get("constraint_memory", {})
+                ),
+            }
+            latest = {
+                "instruction": (
+                    "仅重排给定候选。判断每条知识对当前任务、数据读取、评估、输出或硬约束是否直接相关；"
+                    "不得创造候选 ID，不得把历史推断当作当前权威规则。"
+                ),
+                "query": query,
+                "candidate_rows": candidate_rows,
+                "return_limit": top_k,
+            }
+            stable, dynamic = self._stage_prompt(
+                stage="knowledge_semantic_reranker",
+                stable=stable_payload,
+                dynamic=latest,
+                stable_title="Stable knowledge rerank context",
+                dynamic_title="Latest lexical candidates",
+                dynamic_limit=24000,
+            )
+            try:
+                decision = self.services.llm_client.ask_structured(
+                    model_cls=KnowledgeRerankDecision,
+                    system_prompt=self.services.prompt_mgr.load("system/knowledge_semantic_reranker.md"),
+                    user_prompt=dynamic,
+                    prompt_name="knowledge_semantic_reranker",
+                    max_tokens=3000,
+                    static_context_prompt=stable,
+                    dynamic_user_prompt=dynamic,
+                )
+                ranked = []
+                seen = set()
+                for item in sorted(decision.items, key=lambda value: -float(value.score or 0.0)):
+                    candidate_id = str(item.candidate_id or "")
+                    if candidate_id not in candidate_map or candidate_id in seen:
+                        continue
+                    if str(item.relevance or "").lower() == "irrelevant":
+                        continue
+                    result = candidate_map[candidate_id]
+                    result.score = float(item.score or result.score)
+                    result.reasons = list(result.reasons) + [
+                        f"semantic_relevance={item.relevance}",
+                        f"semantic_reason={str(item.reason or '')[:240]}",
+                    ]
+                    ranked.append(result)
+                    seen.add(candidate_id)
+                results = ranked[:top_k] if ranked else results[:top_k]
+                rerank_meta = {
+                    "enabled": True,
+                    "candidate_count": len(candidate_rows),
+                    "selected_count": len(results),
+                    "missing_topics": [str(x) for x in decision.missing_topics[:12]],
+                }
+            except Exception as exc:  # noqa: BLE001
+                results = results[:top_k]
+                rerank_meta = {"enabled": True, "fallback": "lexical", "error": str(exc)[:500]}
+                log_event(logger, "knowledge.local_store", "RERANK_FAILED", error=str(exc)[:240])
+        else:
+            results = results[:top_k]
         packed: list[dict] = []
         for r in results:
             packed.append(
@@ -3430,7 +4359,14 @@ class TaskDefinitionModule:
                 }
             )
         write_json_safe(self.report_dir / "retrieved_knowledge.json", packed, indent=2)
-        log_event(logger, "knowledge.local_store", "RETRIEVED", entries=len(packed))
+        write_json_safe(self.report_dir / "knowledge_rerank_report.json", rerank_meta, indent=2)
+        log_event(
+            logger,
+            "knowledge.local_store",
+            "RETRIEVED",
+            entries=len(packed),
+            semantic_rerank=bool(rerank_meta.get("enabled")),
+        )
         return packed
 
     def _review_evaluation_contract(
@@ -3472,10 +4408,10 @@ class TaskDefinitionModule:
             "context_policy": self._headroom_context_policy(),
             "output_language_policy": self._output_language_policy(),
             "instruction": (
-                "Compile or repair a strict EvaluationContractReview from the compact evidence pack. "
-                "Do not inspect or rewrite the full description. Normal review rounds may set passed=false "
-                "with concise issues/fixes when evidence is insufficient. The finalizer round must instead "
-                "write a complete executable contract using explicit AutoRealize-defined assumptions when needed."
+                "根据紧凑证据包编译或修复严格的 EvaluationContractReview。"
+                "不要检查或改写完整 description。普通审查轮在证据不足时可以设置 passed=false，"
+                "并给出简短 issues/fixes；最终轮必须在必要时使用明确标注的 AutoRealize 假设，"
+                "写出完整且可执行的合同。"
             ),
             "original_requirements_full": original_text,
             "evaluation_evidence_pack": evaluation_evidence_pack,
@@ -3503,7 +4439,7 @@ class TaskDefinitionModule:
         for idx in range(max_rounds):
             is_finalizer_round = idx == max_rounds - 1
             if review is None:
-                dynamic_payload = reflection_payload or {"instruction": "Create the evaluation contract review."}
+                dynamic_payload = reflection_payload or {"instruction": "生成评估合同审查结果。"}
             else:
                 defects = evaluation_contract_defects(review)
                 dynamic_payload = {
@@ -3522,17 +4458,18 @@ class TaskDefinitionModule:
                 finalizer_payload = {
                     **dynamic_payload,
                     "finalizer_instruction": (
-                        "这是最后一轮，不再作为 reviewer 返回 passed=false。你现在是最终评估合同作者。"
-                        "必须输出完整 EvaluationContractReview JSON，并设置 passed=true。"
+                        "这是最后一轮，你现在是最终评估合同作者。"
+                        "必须输出完整 EvaluationContractReview JSON，但不得为了通过而隐藏证据缺口。"
                         "不得输出未明确、待补充、待确认、unknown、tbd、推荐、可选、通常、视情况、可以考虑。"
                         "如果官方材料缺少唯一评分公式、权重、惩罚系数或非法解处理规则，"
                         "请将缺口转化为清晰标注的 AutoRealize-defined evaluation assumption、"
                         "由输入数据上界推导的规则，或外部评估配置参数；仍要给出一个当前可执行的默认公式。"
+                        "此时设置 executable=true、authority_status=autorealize_assumption，并把假设写进 assumptions。"
+                        "只有在缺失信息使唯一标量仍不可执行时才设置 passed=false、executable=false、authority_status=unresolved。"
                         "不要编造不存在的输入字段、官方样例列、车牌号、车辆唯一 ID 或官方规则。"
                         "如果需要资源实例但输入没有唯一实体 ID，只能使用方案输出中的确定性派生 ID 或占位资源 ID，"
                         "并在 y_pred_source/submission_checks 中说明。"
-                        "issues 和 fixes 必须为空；所有先前问题都要被吸收到 metric_formula、validation_protocol、"
-                        "submission_checks、leakage_guards、invalid_solution_rules、tie_break_rules、audit_metrics、evidence 或 rationale 中。"
+                        "已经由明确假设解决的问题进入 assumptions/residual_issues；仍阻塞执行的问题保留在 issues/fixes。"
                     ),
                 }
                 if review is not None:
@@ -3541,7 +4478,12 @@ class TaskDefinitionModule:
                     finalizer_payload.setdefault("previous_issues", review.issues)
                     finalizer_payload.setdefault("previous_fixes", review.fixes)
                 dynamic_payload = finalizer_payload
-            stable, dynamic = stable_dynamic_prompt(
+            stable, dynamic = self._stage_prompt(
+                stage=(
+                    f"evaluation_contract_finalizer_{idx+1}"
+                    if is_finalizer_round
+                    else f"evaluation_contract_reviewer_{idx+1}"
+                ),
                 stable=stable_payload,
                 dynamic=dynamic_payload,
                 stable_title="Stable evaluation contract evidence",
@@ -3561,10 +4503,22 @@ class TaskDefinitionModule:
                 dynamic_user_prompt=dynamic,
             )
             if is_finalizer_round:
-                review.passed = True
-                review.issues = []
-                review.fixes = []
-                defects = []
+                if review.authority_status not in {"official", "autorealize_assumption", "unresolved"}:
+                    review.authority_status = "unresolved"
+                if review.assumptions and review.authority_status == "unresolved" and review.passed:
+                    review.authority_status = "autorealize_assumption"
+                elif review.passed and review.authority_status == "unresolved" and not review.assumptions:
+                    review.authority_status = "official"
+                review.executable = bool(review.executable or review.passed)
+                defects = evaluation_contract_defects(review)
+                if defects:
+                    review.passed = False
+                    review.executable = False
+                    review.authority_status = "unresolved"
+                    review.residual_issues = self._dedupe_strings(
+                        list(review.residual_issues or []) + defects,
+                        limit=20,
+                    )
             else:
                 defects = evaluation_contract_defects(review)
             revision_log.append(
@@ -3576,6 +4530,10 @@ class TaskDefinitionModule:
                         else "reflection_repair" if reflection_feedback else "contract_review"
                     ),
                     "passed": review.passed,
+                    "executable": review.executable,
+                    "authority_status": review.authority_status,
+                    "assumptions": review.assumptions,
+                    "residual_issues": review.residual_issues,
                     "defects": defects,
                     "issues": review.issues,
                     "fixes": review.fixes,
@@ -3631,6 +4589,7 @@ class TaskDefinitionModule:
             table_limit=24,
             relation_limit=40,
         )
+        downstream_context["data_root"] = str(getattr(self, "_current_data_root", "") or "")
         pack = build_automl_context_pack(
             protocol_bundle,
             file_summaries=file_summaries,
@@ -3865,6 +4824,7 @@ class TaskDefinitionModule:
 
         log_event(logger, "module.task_definition", "CREATED")
         log_event(logger, "module.task_definition", "ACTIVATED")
+        self._current_data_root = data_root
         data_description_path = cognition.data_description_path or (self.report_dir / "data_description.md")
         data_description_text = data_description_path.read_text(encoding="utf-8") if data_description_path.exists() else ""
         data_digest = data_description_text[:16000]
@@ -3917,8 +4877,24 @@ class TaskDefinitionModule:
             retrieved_knowledge = self._retrieve_relevant_knowledge(task_hint, downstream_context)
             downstream_context["retrieved_knowledge"] = retrieved_knowledge
 
+        downstream_context = self._resolve_downstream_context_semantics(
+            data_root=data_root,
+            task_hint=task_hint,
+            original_text=original_text,
+            downstream_context=downstream_context,
+            file_summaries=cognition.file_summaries,
+        )
+
         deterministic_data_access = build_data_access_protocol(cognition.file_summaries)
         downstream_context["data_access_protocol"] = deterministic_data_access.model_dump()
+        self._initialize_cross_stage_context(
+            task_hint=task_hint,
+            original_text=original_text,
+            downstream_context=downstream_context,
+            file_summaries=cognition.file_summaries,
+            relations=cognition.relation_hints,
+            deterministic_data_access=deterministic_data_access,
+        )
         log_event(logger, "module.task_definition.problem_paradigm", "ACTIVATED")
         problem_review = self._classify_problem_paradigm(
             task_hint=task_hint,
@@ -3931,6 +4907,12 @@ class TaskDefinitionModule:
         )
         downstream_context["problem_paradigm"] = problem_review.problem_paradigm
         downstream_context["problem_paradigm_review"] = problem_review.model_dump()
+        self._remember_stage(
+            "problem_paradigm",
+            problem_review.model_dump(),
+            authority="llm_interpretation",
+            evidence_refs=list(problem_review.evidence or []),
+        )
         self._write_protocol_artifacts(
             problem_review=problem_review,
             deterministic_data_access=deterministic_data_access,
@@ -3967,6 +4949,7 @@ class TaskDefinitionModule:
             primary_metric=task_cls.primary_metric,
         )
         downstream_context["task_type_hint"] = task_cls.task_type
+        self._remember_stage("task_classification", task_cls.model_dump(), authority="derived")
         if task_cls.primary_metric:
             plan.evaluation_metric = task_cls.primary_metric
         if task_cls.metric_formula:
@@ -4020,6 +5003,7 @@ class TaskDefinitionModule:
             original_text=original_text,
             artifact_refs=task_definition_artifact_refs,
         )
+        self._remember_stage("overview_task_definition", overview_task.model_dump())
         frozen_sections: dict[str, str] = {
             "任务概述": overview_task.overview_markdown,
             "任务定义": overview_task.task_definition_markdown,
@@ -4041,6 +5025,11 @@ class TaskDefinitionModule:
             data_digest=data_description_text,
         )
         downstream_context["evaluation_contract"] = evaluation_contract.model_dump()
+        self._remember_stage(
+            "evaluation_contract",
+            evaluation_contract.model_dump(),
+            authority=str(evaluation_contract.authority_status or "llm_interpretation"),
+        )
         evaluation_section = self._render_evaluation_section(evaluation_contract, downstream_context)
         frozen_sections["评估协议"] = evaluation_section
         log_event(
@@ -4082,6 +5071,7 @@ class TaskDefinitionModule:
             original_text=original_text,
             artifact_refs=task_definition_artifact_refs,
         )
+        self._remember_stage("output_contract_draft", output_draft.model_dump())
         sample_spec = output_draft.sample_submission_spec
         if official_sample_probe.get("columns"):
             sample_spec.source = "official_sample"
@@ -4101,6 +5091,16 @@ class TaskDefinitionModule:
             sample_spec,
             schema_contract=source_schema_contract,
         )
+        semantic_source_field_corrections = self._resolve_unresolved_source_field_aliases(
+            sample_spec,
+            schema_contract=source_schema_contract,
+            downstream_context=downstream_context,
+            original_text=original_text,
+        )
+        if semantic_source_field_corrections:
+            source_field_corrections = list(
+                source_field_corrections + semantic_source_field_corrections
+            )
         source_field_audit_rules = [
             str(rule)
             for rule in (sample_spec.validation_rules or [])
@@ -4192,6 +5192,8 @@ class TaskDefinitionModule:
             self._write_submission_report(submission_report)
             log_event(logger, "module.task_definition", "SKIPPED", file="sample_submission.csv", reason=reason)
 
+        self._remember_stage("sample_submission", submission_report, authority="validated_artifact_status")
+
         generated_submission_columns = self._read_sample_submission_columns(sample_path)
         if generated_submission_columns:
             downstream_context["generated_submission_columns"] = generated_submission_columns
@@ -4222,13 +5224,14 @@ class TaskDefinitionModule:
                 )
         frozen_sections["输出或提交格式"] = output_draft.markdown
 
+        data_evidence_pack = self._build_data_section_pack(
+            file_summaries=cognition.file_summaries,
+            downstream_context=downstream_context,
+        )
         data_section = self._generate_generic_section(
             section_id="data",
             section_title="数据说明",
-            evidence_pack=self._build_data_section_pack(
-                file_summaries=cognition.file_summaries,
-                downstream_context=downstream_context,
-            ),
+            evidence_pack=data_evidence_pack,
             frozen_sections=frozen_sections,
             original_text=original_text,
             artifact_refs=task_definition_artifact_refs,
@@ -4237,6 +5240,29 @@ class TaskDefinitionModule:
                 "不要展开完整 preview，不要把字段说明放到本章主体。",
             ],
         )
+        source_coverage_defects = self._source_coverage_defects(
+            data_section.markdown,
+            data_evidence_pack.get("source_coverage_ledger", {}),
+        )
+        if source_coverage_defects:
+            data_section = self._generate_generic_section(
+                section_id="data_coverage_repair",
+                section_title="数据说明",
+                evidence_pack={
+                    **data_evidence_pack,
+                    "deterministic_coverage_defects": source_coverage_defects,
+                    "previous_data_section": data_section.markdown,
+                },
+                frozen_sections=frozen_sections,
+                original_text=original_text,
+                artifact_refs=task_definition_artifact_refs,
+                extra_rules=[
+                    "重写数据说明并修复 deterministic_coverage_defects 中的每个漏项。",
+                    "每个 required/supporting 文件、Sheet 或目录集合必须说明用途；若不使用，明确说明证据与原因。",
+                    "只写输入作用、已验证 shape/行数、Sheet 边界和必要读取提示，不展开 raw preview。",
+                ],
+            )
+        self._remember_stage("description_data_section", data_section.model_dump())
         frozen_sections["数据说明"] = data_section.markdown
         field_section = self._generate_generic_section(
             section_id="fields",
@@ -4254,6 +5280,7 @@ class TaskDefinitionModule:
                 "字段含义优先使用前置文件认知结果，不要重新发明。",
             ],
         )
+        self._remember_stage("description_field_section", field_section.model_dump())
         frozen_sections["关键字段说明"] = field_section.markdown
         constraint_section = self._generate_generic_section(
             section_id="constraints_leakage",
@@ -4270,6 +5297,7 @@ class TaskDefinitionModule:
                 "不要发明权威材料中没有的约束。",
             ],
         )
+        self._remember_stage("description_constraint_section", constraint_section.model_dump())
         frozen_sections["约束与防泄漏"] = constraint_section.markdown
         tips_section = self._generate_generic_section(
             section_id="tips",
@@ -4283,6 +5311,7 @@ class TaskDefinitionModule:
                 "提醒下游避免依赖未验证疑惑，无法避免时写成可配置假设或保守兜底。",
             ],
         )
+        self._remember_stage("description_tips_section", tips_section.model_dump())
         frozen_sections["关键坑点与待确认事项"] = tips_section.markdown
 
         desc = self._compose_description_sections(
@@ -4299,15 +5328,24 @@ class TaskDefinitionModule:
         )
         desc = self._apply_source_alias_guard_to_description(desc, source_alias_guard)
         desc = legacy._enforce_existing_file_references(desc, data_root)
+        final_source_ledger = build_source_coverage_ledger(file_summaries=cognition.file_summaries)
         defects = self._artifact_sanity_check(
             desc=desc,
             data_root=data_root,
             legacy=legacy,
             sample_spec=sample_spec,
             evaluation_contract=evaluation_contract,
+            source_coverage_ledger=final_source_ledger,
         )
+        if defects:
+            downstream_context["description_source_coverage_defects"] = defects
         desc = finalize_description_markdown(desc)
         downstream_context["description_protocol_bundle"] = protocol_bundle.model_dump()
+        self._remember_stage(
+            "description_protocol",
+            protocol_bundle.model_dump(),
+            authority="llm_draft_with_deterministic_data_access",
+        )
         downstream_context["description_sections"] = {
             "overview_task_definition": overview_task.model_dump(),
             "output": output_draft.model_dump(),
@@ -4329,6 +5367,34 @@ class TaskDefinitionModule:
             evaluation_contract=evaluation_contract,
             relations=rel_hints_refined,
         )
+        main_task_protocol = self._write_main_task_protocol(
+            task_hint=task_hint,
+            problem_review=problem_review,
+            protocol_bundle=protocol_bundle,
+            deterministic_data_access=deterministic_data_access,
+            evaluation_contract=evaluation_contract,
+            automl_context_pack=automl_context_pack,
+            downstream_context=downstream_context,
+        )
+        desc, consistency_review, defects = self._audit_and_repair_final_artifacts(
+            desc=desc,
+            data_root=data_root,
+            legacy=legacy,
+            problem_review=problem_review,
+            protocol_bundle=protocol_bundle,
+            evaluation_contract=evaluation_contract,
+            sample_spec=sample_spec,
+            submission_report=submission_report,
+            automl_context_pack=automl_context_pack,
+            main_task_protocol=main_task_protocol,
+            downstream_context=downstream_context,
+            deterministic_defects=defects,
+            source_coverage_ledger=final_source_ledger,
+        )
+        downstream_context["artifact_consistency_review"] = consistency_review.model_dump()
+        self._sync_final_description_sections(desc, downstream_context)
+        # The consistency patcher can only change reader-facing sections. Rebuild
+        # the protocol snapshot so it cannot retain pre-patch frozen markdown.
         main_task_protocol = self._write_main_task_protocol(
             task_hint=task_hint,
             problem_review=problem_review,
@@ -4366,6 +5432,26 @@ class TaskDefinitionModule:
                 "automl_context_pack": "automl_context_pack.json",
                 "automl_context": "automl_context.md",
                 "main_task_protocol": "main_task_protocol.json",
+                "artifact_consistency": (
+                    "artifact_consistency_report.json"
+                    if (self.report_dir / "artifact_consistency_report.json").is_file()
+                    else None
+                ),
+                "cross_stage_context": (
+                    "cross_stage_context.json"
+                    if (self.report_dir / "cross_stage_context.json").is_file()
+                    else None
+                ),
+                "downstream_context_resolution": (
+                    "downstream_context_resolution_report.json"
+                    if (self.report_dir / "downstream_context_resolution_report.json").is_file()
+                    else None
+                ),
+                "source_field_alias_resolution": (
+                    "source_field_alias_resolution_report.json"
+                    if (self.report_dir / "source_field_alias_resolution_report.json").is_file()
+                    else None
+                ),
             },
         }
         write_json_safe(self.report_dir / "task_definition_report.json", report_payload, indent=2)

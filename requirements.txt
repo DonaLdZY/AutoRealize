@@ -24,6 +24,9 @@ h5py>=3.10.0,<4
 tables>=3.9.0,<4
 zarr>=2.17.0,<4
 
+# QDI may execute optimization probes when the task requires them.
+ortools>=9.9.0,<10
+
 # Spreadsheet, document, image, archive, and configuration readers
 openpyxl>=3.1.2,<4
 xlrd>=2.0.1,<3

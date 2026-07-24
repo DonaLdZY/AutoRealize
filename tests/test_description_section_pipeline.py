@@ -4,7 +4,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from autorealize.config import AutoRealizeConfig
-from autorealize.models import AutoMLContextPack, EvaluationContractReview, FileRole, FileSummary, ProblemParadigmReview, SampleSubmissionSpec
+from autorealize.models import (
+    AutoMLContextPack,
+    DescriptionProtocolBundle,
+    DescriptionTaskProtocolDraft,
+    EvaluationContractReview,
+    FileRole,
+    FileSummary,
+    ProblemParadigmReview,
+    SampleSubmissionSpec,
+)
 from autorealize.modules.task_definition import TaskDefinitionModule
 from autorealize.report_writer import render_automl_context_markdown
 
@@ -108,10 +117,13 @@ def test_compose_description_sections_uses_required_order(tmp_path: Path) -> Non
     ]
 
 
-def test_method_only_rl_dispatch_is_normalized_to_static_optimization(tmp_path: Path) -> None:
+def test_static_optimization_can_require_rl_without_changing_problem_structure(tmp_path: Path) -> None:
     mod = _module(tmp_path)
     review = ProblemParadigmReview(
-        problem_paradigm="reinforcement_learning",
+        problem_paradigm="static_optimization",
+        problem_structure="decision_optimization",
+        explicit_rl_requested=True,
+        rl_required=True,
         reasoning="用户要求 PPO/DQN，状态、动作、奖励；任务输出 assignment 明细表，评分 total_penalized_cost。",
         evidence=["必须使用强化学习建模", "输出订单车辆分配方案", "最小化未分配订单和运输成本"],
         key_signals=["强化学习", "车辆调度", "assignment 明细"],
@@ -124,10 +136,46 @@ def test_method_only_rl_dispatch_is_normalized_to_static_optimization(tmp_path: 
     )
 
     assert review.problem_paradigm == "static_optimization"
+    assert review.problem_structure == "decision_optimization"
     assert review.explicit_rl_requested is True
+    assert review.rl_required is True
     assert review.rl_as_required_paradigm is False
-    assert "rl_candidate" in review.recommended_solver_families
-    assert any("deterministic evaluator" in note for note in review.method_routing_notes)
+    assert "reinforcement_learning" in review.required_method_families
+    assert review.environment_source == "constructed_from_static_data"
+    assert not any("baseline" in note.lower() for note in review.method_routing_notes)
+
+
+def test_description_protocol_models_accept_null_inactive_branches() -> None:
+    payload = {
+        "problem_paradigm": "static_optimization",
+        "ml_dl": None,
+        "optimization": {"objective": "minimize total cost"},
+        "rl": None,
+        "hybrid": None,
+    }
+
+    draft = DescriptionTaskProtocolDraft.model_validate(payload)
+    bundle = DescriptionProtocolBundle.model_validate(payload)
+
+    for protocol in (draft, bundle):
+        assert protocol.ml_dl is not None
+        assert protocol.optimization.objective == "minimize total cost"
+        assert protocol.rl is not None
+        assert protocol.hybrid is not None
+
+
+def test_description_protocol_prompts_forbid_null_protocol_branches() -> None:
+    prompt_dir = Path(__file__).parents[1] / "autorealize" / "prompts" / "system"
+    prompt_names = [
+        "ml_dl_description_protocol.md",
+        "optimization_description_protocol.md",
+        "rl_description_protocol.md",
+        "hybrid_description_protocol.md",
+    ]
+
+    for prompt_name in prompt_names:
+        text = (prompt_dir / prompt_name).read_text(encoding="utf-8")
+        assert "绝不能输出 `null`" in text
 
 def test_artifact_sanity_checks_sample_columns(tmp_path: Path) -> None:
     mod = _module(tmp_path)
@@ -504,7 +552,7 @@ def test_field_section_pack_includes_bounded_field_meanings(tmp_path: Path) -> N
         relations=[],
     )
 
-    assert pack["table_index"][0]["detail_policy"].startswith("Route-only")
+    assert pack["table_index"][0]["table_id"] == "orders.xlsx"
     detail = pack["table_field_details"][0]
     fields = {field["name"]: field for field in detail["fields"]}
     assert fields["order_id"]["meaning"] == "Unique order identifier."

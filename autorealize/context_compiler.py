@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +9,7 @@ import re
 from typing import Any
 
 from .utils.safe_json import json_safe, write_json_safe
-from .entity_alias import build_entity_alias_candidates
+from .entity_alias import build_entity_alias_candidates, enrich_entity_alias_candidates_with_coverage
 
 
 @dataclass(frozen=True)
@@ -227,22 +228,32 @@ def build_qdi_context_bundle_from_table_cards(
 
     table_cards = compact_table_cards_for_prompt(
         detailed_table_cards,
-        field_limit=_context_int(cfg, "stable_table_card_field_limit", 3),
-        max_cards=_context_int(cfg, "stable_table_card_limit", 48),
-        per_source_limit=_context_int(cfg, "stable_table_cards_per_source", 6),
+        field_limit=_context_int(cfg, "stable_table_card_field_limit", 80),
+        max_cards=_context_int(cfg, "stable_table_card_limit", 120),
+        per_source_limit=_context_int(cfg, "stable_table_cards_per_source", 80),
+        max_chars=_context_int(cfg, "stable_table_cards_max_chars", 220000),
     )
     relation_cards = build_relation_cards(
         relation_hints,
         limit=_context_int(cfg, "relation_card_limit", 100),
+    )
+    source_coverage_ledger = build_source_coverage_ledger(
+        detailed_table_cards=detailed_table_cards,
     )
     filename_group_cards = build_filename_group_cards(
         (knowledge_base or {}).get("filename_sample_groups", []),
         file_summaries=file_summaries,
         limit=_context_int(cfg, "filename_group_card_limit", 80),
     )
-    entity_alias_candidates = build_entity_alias_candidates(
-        file_summaries,
-        filename_sample_groups=(knowledge_base or {}).get("filename_sample_groups", []),
+    entity_alias_candidates = enrich_entity_alias_candidates_with_coverage(
+        build_entity_alias_candidates(
+            file_summaries,
+            llm_candidates=(constraint_memory or {}).get("entity_alias_candidates", [])
+            if isinstance(constraint_memory, dict)
+            else [],
+            filename_sample_groups=(knowledge_base or {}).get("filename_sample_groups", []),
+        ),
+        data_root=data_root,
     )
     return {
         "schema_version": "autorealize.qdi_context.headroom.v1",
@@ -256,9 +267,9 @@ def build_qdi_context_bundle_from_table_cards(
             "constraint_facts_source": "constraint_memory",
             "historical_script_outputs_are_artifact_backed": True,
             "append_only_action_and_digest_timeline_is_visible": True,
-            "stable_table_cards_are_light_index": True,
-            "detailed_field_statistics_are_dynamic_only": True,
-            "stable_table_cards_are_route_only": True,
+            "stable_table_cards_are_bounded_evidence": True,
+            "stable_table_cards_include_exact_schema": True,
+            "large_source_objects_are_local_only": True,
             "retrieve_details_action": "request_context",
             "retrieve_document_actions": ["search_document", "read_document_chunks"],
             "retrieve_qdi_artifact_action": "read_qdi_artifact_excerpt",
@@ -268,6 +279,15 @@ def build_qdi_context_bundle_from_table_cards(
         },
         "table_cards": table_cards,
         "relations": relation_cards,
+        "source_coverage_ledger": source_coverage_ledger,
+        "relation_verification_queue": build_relation_verification_queue(
+            relation_cards,
+            limit=12,
+        ),
+        "population_verification_queue": build_population_verification_queue(
+            detailed_table_cards,
+            limit=12,
+        ),
         "constraint_memory": compact_constraint_memory(constraint_memory),
         "authoritative_memory": compact_authoritative_memory(authoritative_memory),
         "sampled_filename_patterns": compact_sampled_patterns(
@@ -275,6 +295,11 @@ def build_qdi_context_bundle_from_table_cards(
         ),
         "filename_sample_groups": filename_group_cards,
         "entity_alias_candidates": entity_alias_candidates,
+        "entity_alias_schema_telemetry": (
+            (constraint_memory or {}).get("entity_alias_schema_telemetry", {})
+            if isinstance(constraint_memory, dict)
+            else {}
+        ),
         "field_glossary": compact_field_glossary((knowledge_base or {}).get("field_glossary") or {}),
         "script_investigation_policy": {
             "input_dir": "read-only",
@@ -386,16 +411,16 @@ def _table_card_detail_map(detailed: list[dict[str, Any]]) -> dict[str, dict[str
 def compact_table_cards_for_prompt(
     cards: list[dict[str, Any]],
     *,
-    field_limit: int = 3,
-    max_cards: int = 48,
-    per_source_limit: int = 6,
+    field_limit: int = 80,
+    max_cards: int = 120,
+    per_source_limit: int = 80,
+    max_chars: int = 220000,
 ) -> list[dict[str, Any]]:
-    """Return a Headroom-style route-only table manifest for stable prompts.
+    """Return stable evidence cards while keeping raw large objects artifact-only.
 
-    This is deliberately closer to Headroom's marker/index idea than to a data
-    pack: stable prompts get just enough identifiers to request details, while
-    field semantics, statistics, reading notes, warnings, previews, and artifact
-    refs stay in local detail cards until `request_context` asks for them.
+    Provider-cache economics favor a useful repeated prefix over tiny stage
+    manifests. Exact schema, bounded semantics/statistics, reading instructions,
+    and warnings stay visible; raw previews and full profiles remain local.
     """
 
     out: list[dict[str, Any]] = []
@@ -403,6 +428,8 @@ def compact_table_cards_for_prompt(
     seen_by_source: dict[str, int] = {}
     max_cards = max(1, int(max_cards))
     per_source_limit = max(1, int(per_source_limit))
+    max_chars = max(1, int(max_chars))
+    used_chars = 0
     for card in list(cards or []):
         if not isinstance(card, dict):
             continue
@@ -410,7 +437,13 @@ def compact_table_cards_for_prompt(
         if len(out) >= max_cards or seen_by_source.get(source, 0) >= per_source_limit:
             omitted_by_source[source] = omitted_by_source.get(source, 0) + 1
             continue
-        out.append(_route_only_table_card(card, field_limit=field_limit))
+        evidence_card = compact_detail_table_card_for_prompt(card, field_limit=field_limit)
+        evidence_chars = len(json.dumps(evidence_card, ensure_ascii=False, sort_keys=True, default=str))
+        if out and used_chars + evidence_chars > max_chars:
+            omitted_by_source[source] = omitted_by_source.get(source, 0) + 1
+            continue
+        out.append(evidence_card)
+        used_chars += evidence_chars
         seen_by_source[source] = seen_by_source.get(source, 0) + 1
     if omitted_by_source:
         out.append(
@@ -424,9 +457,8 @@ def compact_table_cards_for_prompt(
                         for source, count in sorted(omitted_by_source.items())[:20]
                     ],
                     "detail_policy": (
-                        "Additional table manifests and all table details are stored locally. "
-                        "Use request_context with input_files, focus_sheets, focus_columns, "
-                        "or query to retrieve focused details."
+                        "The stable evidence budget omitted additional table cards. Use request_context "
+                        "only for omitted cards, raw previews, or full profiles."
                     ),
                 }
             )
@@ -445,6 +477,10 @@ def _route_only_table_card(card: dict[str, Any], *, field_limit: int = 3) -> dic
                         "table_kind": card.get("table_kind"),
                         "role": card.get("role"),
                         "shape": card.get("shape"),
+                        "verified_row_count": card.get("verified_row_count"),
+                        "row_count_basis": card.get("row_count_basis"),
+                        "worksheet_used_range_shape": card.get("worksheet_used_range_shape") if card.get("row_count_conflict") else None,
+                        "row_count_conflict": card.get("row_count_conflict"),
                         "layout_kind": _abnormal_layout_value(card.get("layout_kind")),
                         "read_strategy_kind": _abnormal_layout_value(card.get("read_strategy_kind")),
                         "sheet_group_id": card.get("sheet_group_id"),
@@ -452,6 +488,7 @@ def _route_only_table_card(card: dict[str, Any], *, field_limit: int = 3) -> dic
                         "is_deep_profiled": card.get("is_deep_profiled"),
                         "field_hints": field_hints,
                         "field_count": len(fields),
+                        "primary_key_candidates": card.get("primary_key_candidates"),
             "detail_policy": "Route-only table manifest. Use request_context for field meanings, statistics, reading notes, warnings, or sheet details.",
         }
     )
@@ -490,7 +527,7 @@ def _route_field_hints(fields: list[Any], *, limit: int) -> list[str]:
 
 
 def compact_detail_table_card_for_prompt(card: dict[str, Any], *, field_limit: int = 12) -> dict[str, Any]:
-    """Return a bounded table detail excerpt for one retrieval turn.
+    """Return a bounded table evidence card suitable for a stable prompt or retrieval.
 
     Full field profiles and previews remain in ArtifactStore; this prompt-side
     object mirrors Headroom's marker-plus-local-store design.
@@ -529,6 +566,12 @@ def compact_detail_table_card_for_prompt(card: dict[str, Any], *, field_limit: i
             "role": card.get("role"),
             "file_cognition": str(card.get("file_cognition", "") or "")[:260],
             "shape": card.get("shape"),
+            "verified_row_count": card.get("verified_row_count"),
+            "row_count_basis": card.get("row_count_basis"),
+            "worksheet_used_range_shape": card.get("worksheet_used_range_shape") if card.get("row_count_conflict") else None,
+            "row_count_conflict": card.get("row_count_conflict"),
+            "row_count_note": str(card.get("row_count_note", "") or "")[:300],
+            "primary_key_candidates": card.get("primary_key_candidates"),
             "layout_kind": card.get("layout_kind"),
             "header_confidence": card.get("header_confidence"),
             "detected_header_row": card.get("detected_header_row"),
@@ -537,7 +580,7 @@ def compact_detail_table_card_for_prompt(card: dict[str, Any], *, field_limit: i
             "fields": compact_fields,
             "reading_notes": [str(x)[:180] for x in (card.get("reading_notes") or [])[:4]],
             "warnings": [str(x)[:180] for x in (card.get("warnings") or [])[:4]],
-            "detail_policy": "This is a bounded retrieved excerpt; full profile remains local and is not part of the prompt.",
+            "detail_policy": "Bounded prompt-visible evidence; raw preview and full profile remain local artifacts.",
         }
     )
 
@@ -596,6 +639,317 @@ def build_table_cards(
     return cards
 
 
+def reconcile_table_shape(
+    table: dict[str, Any],
+    column_profiles: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Separate worksheet used range from verified parsed data rows.
+
+    Excel ``max_row``/used-range metadata often includes formatted or formerly
+    populated blank rows.  A full profile is a stronger source for the number
+    of parsed, non-empty data rows.  Sampled profiles remain explicitly marked
+    as samples and never replace the physical shape.
+    """
+
+    profiles = [p for p in (column_profiles or table.get("column_profiles") or []) if isinstance(p, dict)]
+    physical_shape = _shape_pair(table.get("shape") or table.get("shape_estimated"))
+    profiled_shape = _shape_pair(table.get("shape_profiled"))
+    sampled_shape = _shape_pair(table.get("shape_sampled"))
+    profile_policy = str(table.get("profile_policy", "") or "").lower()
+    sampling = table.get("profile_sampling") if isinstance(table.get("profile_sampling"), dict) else {}
+    is_sampled = bool(sampling.get("sampled")) or "sample" in profile_policy
+
+    counts: list[int] = []
+    for profile in profiles:
+        try:
+            value = int(profile.get("row_count"))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            counts.append(value)
+    profile_rows = Counter(counts).most_common(1)[0][0] if counts else None
+
+    parsed_rows: int | None = None
+    basis = "worksheet_used_range"
+    confidence = "medium"
+    if not is_sampled:
+        if profile_rows is not None:
+            parsed_rows = profile_rows
+            basis = "full_column_profile_row_count"
+            confidence = "high"
+        elif profiled_shape:
+            parsed_rows = profiled_shape[0]
+            basis = "full_profiled_shape"
+            confidence = "high"
+
+    if parsed_rows is None and physical_shape:
+        parsed_rows = physical_shape[0]
+    column_count = (
+        (profiled_shape or sampled_shape or physical_shape or [0, 0])[1]
+        or len(table.get("columns") or [])
+    )
+    verified_shape = [parsed_rows, column_count] if parsed_rows is not None else (physical_shape or [])
+    conflict = bool(
+        physical_shape
+        and parsed_rows is not None
+        and physical_shape[0] != parsed_rows
+        and not is_sampled
+    )
+    result = {
+        "verified_shape": verified_shape,
+        "verified_row_count": parsed_rows,
+        "row_count_basis": basis,
+        "row_count_confidence": confidence,
+        "worksheet_used_range_shape": physical_shape,
+        "profiled_shape": profiled_shape,
+        "sampled_shape": sampled_shape,
+        "profile_is_sampled": is_sampled,
+        "row_count_conflict": conflict,
+    }
+    if conflict:
+        result["row_count_note"] = (
+            f"Worksheet used range reports {physical_shape[0]} rows, while full parsing/profile facts report "
+            f"{parsed_rows} data rows. Use verified_row_count for task population and keep used range only as a "
+            "physical-layout diagnostic."
+        )
+    elif is_sampled:
+        result["row_count_note"] = (
+            "Field profiles are sampled; their row_count is not the full table population. "
+            "Use worksheet/reader shape until a full count is computed."
+        )
+    return _drop_empty(result)
+
+
+def primary_key_candidates(fields: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
+    """Rank evidence-backed key candidates without asserting a business key."""
+
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    for field in fields or []:
+        if not isinstance(field, dict):
+            continue
+        name = str(field.get("name", "") or "").strip()
+        if not name:
+            continue
+        try:
+            rows = float(field.get("row_count") or 0)
+            non_null = float(field.get("non_null_count") or 0)
+            unique = float(field.get("unique_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if rows <= 0 or non_null <= 0:
+            continue
+        completeness = non_null / rows
+        uniqueness = unique / non_null
+        if completeness < 0.8 or uniqueness < 0.8:
+            continue
+        role_bonus = 0.15 if str(field.get("role", "")) == "id_or_key" else 0.0
+        name_lower = name.lower()
+        name_bonus = 0.12 if any(token in name_lower for token in ["id", "编号", "代码", "单号", "key"]) else 0.0
+        score = 0.48 * completeness + 0.40 * uniqueness + role_bonus + name_bonus
+        ranked.append(
+            (
+                score,
+                name,
+                {
+                    "field": name,
+                    "non_null_ratio": round(completeness, 6),
+                    "unique_ratio_among_non_null": round(uniqueness, 6),
+                    "status": "candidate_not_confirmed",
+                },
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [item for _, _, item in ranked[: max(1, int(limit))]]
+
+
+def build_source_coverage_ledger(
+    file_summaries: list[Any] | None = None,
+    *,
+    detailed_table_cards: list[dict[str, Any]] | None = None,
+    limit: int = 240,
+) -> dict[str, Any]:
+    """Build a complete, compact inventory used to prevent silent source loss."""
+
+    cards = list(detailed_table_cards or [])
+    if not cards and file_summaries is not None:
+        cards = build_table_cards(file_summaries, file_limit=max(1, len(file_summaries)), sheet_limit=120, field_limit=120)
+
+    entries: list[dict[str, Any]] = []
+    for card in cards[: max(1, int(limit))]:
+        if not isinstance(card, dict):
+            continue
+        fields = [field for field in (card.get("fields") or []) if isinstance(field, dict)]
+        table_kind = str(card.get("table_kind", "") or "")
+        role = str(card.get("role", "") or "")
+        if table_kind == "document" or role in {"task_requirement", "data_description"}:
+            coverage_status = "documentation"
+        elif table_kind in {"excel_sheet", "csv_table", "json_table_or_document", "excel_workbook"}:
+            coverage_status = "required"
+        else:
+            coverage_status = "supporting"
+        entries.append(
+            _drop_empty(
+                {
+                    "table_id": card.get("table_id"),
+                    "source_file": card.get("source_file"),
+                    "sheet_name": card.get("sheet_name"),
+                    "table_kind": table_kind,
+                    "source_role": role,
+                    "coverage_status": coverage_status,
+                    "verified_shape": card.get("shape"),
+                    "verified_row_count": card.get("verified_row_count"),
+                    "row_count_basis": card.get("row_count_basis"),
+                    "worksheet_used_range_shape": card.get("worksheet_used_range_shape"),
+                    "row_count_conflict": card.get("row_count_conflict"),
+                    "layout_kind": card.get("layout_kind"),
+                    "recommended_read": card.get("recommended_read"),
+                    "schema_signature_fields": [str(field.get("name")) for field in fields[:16] if field.get("name")],
+                    "field_count": len(fields),
+                    "primary_key_candidates": card.get("primary_key_candidates") or primary_key_candidates(fields),
+                    "coverage_rule": (
+                        "The final description must explain this source/sheet or explicitly state why it is not used."
+                        if coverage_status in {"required", "supporting"}
+                        else "Route current rules, answers, future plans, and examples separately."
+                    ),
+                }
+            )
+        )
+
+    collapsed = _collapse_directory_collections(entries)
+    counts = Counter(str(item.get("coverage_status", "unresolved")) for item in collapsed)
+    return {
+        "schema_version": "autorealize.source_coverage_ledger.v1",
+        "policy": [
+            "Every required/supporting source must be covered by description.md or have an explicit exclusion reason.",
+            "verified_row_count is the task-population count when row_count_basis is a full parse; worksheet_used_range_shape is only a layout diagnostic.",
+            "primary_key_candidates are statistical candidates, not confirmed business keys; prefer high completeness and uniqueness and verify semantics.",
+            "Directory collection entries are inventory compression only. They do not assert identical schemas; inspect shared and variant fields before merging.",
+        ],
+        "entries": collapsed,
+        "counts": dict(sorted(counts.items())),
+        "original_table_count": len(entries),
+        "visible_entry_count": len(collapsed),
+        "omitted_table_count": max(0, len(cards) - len(entries)),
+    }
+
+
+def build_relation_verification_queue(relations: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    """Select diverse cross-source joins whose full directional coverage matters."""
+
+    queue: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for relation in relations or []:
+        if not isinstance(relation, dict):
+            continue
+        left = str(relation.get("left_file", "") or "")
+        right = str(relation.get("right_file", "") or "")
+        if not left or not right or left == right:
+            continue
+        pair = tuple(sorted((left, right)))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        queue.append(
+            {
+                "left_file": left,
+                "left_field": relation.get("left_field"),
+                "right_file": right,
+                "right_field": relation.get("right_field"),
+                "candidate_relation_type": relation.get("relation_type"),
+                "status": "needs_full_value_directional_coverage",
+                "required_statistics": [
+                    "left_non_null_unique_count",
+                    "right_non_null_unique_count",
+                    "intersection_count",
+                    "left_covered_by_right_ratio",
+                    "right_covered_by_left_ratio",
+                    "matched_row_ratio",
+                ],
+            }
+        )
+        if len(queue) >= max(1, int(limit)):
+            break
+    return queue
+
+
+def build_population_verification_queue(
+    detailed_table_cards: list[dict[str, Any]],
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    """Surface ambiguous entity/evaluation populations before task writing."""
+
+    queue: list[dict[str, Any]] = []
+    for card in detailed_table_cards or []:
+        if not isinstance(card, dict):
+            continue
+        row_count = card.get("verified_row_count")
+        try:
+            rows = int(row_count)
+        except (TypeError, ValueError):
+            continue
+        fields = [field for field in (card.get("fields") or []) if isinstance(field, dict)]
+        key_candidates = card.get("primary_key_candidates") if isinstance(card.get("primary_key_candidates"), list) else []
+        best_key = key_candidates[0] if key_candidates else {}
+        relevant_fields = []
+        for field in fields:
+            name = str(field.get("name", "") or "")
+            role = str(field.get("role", "") or "")
+            logical_type = str(field.get("logical_type", "") or "").lower()
+            is_datetime = any(token in logical_type for token in ["date", "time"])
+            if role not in {"time", "target", "constraint", "output"} and not is_datetime:
+                continue
+            try:
+                non_null = int(field.get("non_null_count"))
+            except (TypeError, ValueError):
+                continue
+            if 0 < non_null < rows:
+                relevant_fields.append(
+                    {
+                        "field": name,
+                        "non_null_count": non_null,
+                        "missing_count": rows - non_null,
+                        "non_null_ratio": round(non_null / max(1, rows), 6),
+                    }
+                )
+            datetime_stats = field.get("datetime_stats") if isinstance(field.get("datetime_stats"), dict) else {}
+            date_min = str(datetime_stats.get("min", "") or "")
+            date_max = str(datetime_stats.get("max", "") or "")
+            if date_min and date_max and (_year_from_datetime(date_min) < 1970 or _year_from_datetime(date_max) > 2100):
+                relevant_fields.append(
+                    {
+                        "field": name,
+                        "datetime_min": date_min,
+                        "datetime_max": date_max,
+                        "status": "possible_sentinel_or_invalid_datetime",
+                    }
+                )
+        if not relevant_fields:
+            continue
+        queue.append(
+            {
+                "table_id": card.get("table_id"),
+                "verified_row_count": rows,
+                "best_statistical_key_candidate": best_key,
+                "population_sensitive_fields": relevant_fields[:12],
+                "status": "needs_evaluation_population_rule",
+                "question": (
+                    "Define whether evaluation covers every verified row/key or only entities with required fields. "
+                    "State the exact eligibility rule, eligible count, excluded count/reasons, and fallback treatment. "
+                    "Do not silently substitute worksheet used-range rows, unique IDs, and required-field non-null rows."
+                ),
+            }
+        )
+        if len(queue) >= max(1, int(limit)):
+            break
+    return queue
+
+
+def _year_from_datetime(value: str) -> int:
+    match = re.match(r"\s*(\d{4})", str(value or ""))
+    return int(match.group(1)) if match else 1970
+
+
 def file_to_table_cards(
     fs: Any,
     *,
@@ -631,6 +985,13 @@ def file_to_table_cards(
             sheet_name = str(sheet.get("sheet_name", "") or "")
             sheet_semantics = sheet_semantics_all.get(sheet_name, {}) if isinstance(sheet_semantics_all, dict) else {}
             sheet_profiles_compact = sheet.get("column_profiles", []) if isinstance(sheet.get("column_profiles"), list) else []
+            shape_facts = reconcile_table_shape(sheet, sheet_profiles_compact)
+            field_cards = _field_cards(
+                [str(x) for x in (sheet.get("columns") or [])],
+                sheet_profiles_compact,
+                sheet_semantics,
+                limit=field_limit,
+            )
             refs = list(artifact_refs)
             if artifact_store is not None:
                 refs.append(
@@ -651,7 +1012,13 @@ def file_to_table_cards(
                         "table_kind": "excel_sheet",
                         "role": role,
                         "file_cognition": summary[:350],
-                        "shape": sheet.get("shape") or sheet.get("shape_profiled") or sheet.get("shape_sampled"),
+                        "shape": shape_facts.get("verified_shape"),
+                        "verified_row_count": shape_facts.get("verified_row_count"),
+                        "row_count_basis": shape_facts.get("row_count_basis"),
+                        "row_count_confidence": shape_facts.get("row_count_confidence"),
+                        "worksheet_used_range_shape": shape_facts.get("worksheet_used_range_shape"),
+                        "row_count_conflict": shape_facts.get("row_count_conflict"),
+                        "row_count_note": shape_facts.get("row_count_note"),
                         "profile_policy": sheet.get("profile_policy"),
                         "sheet_group_id": sheet.get("sheet_group_id"),
                         "sheet_group_size": sheet.get("sheet_group_size"),
@@ -661,12 +1028,8 @@ def file_to_table_cards(
                         "detected_header_row": sheet.get("detected_header_row"),
                         "read_strategy_kind": sheet.get("read_strategy_kind"),
                         "recommended_read": sheet.get("recommended_read"),
-                        "fields": _field_cards(
-                            [str(x) for x in (sheet.get("columns") or [])],
-                            sheet_profiles_compact,
-                            sheet_semantics,
-                            limit=field_limit,
-                        ),
+                        "fields": field_cards,
+                        "primary_key_candidates": primary_key_candidates(field_cards),
                         "reading_notes": _reading_notes(path, meta, sheet_name=sheet_name, sheet=sheet),
                         "warnings": _warnings(fs, sheet),
                         "artifact_refs": refs,
@@ -676,6 +1039,8 @@ def file_to_table_cards(
         return cards
 
     columns = [str(x) for x in (getattr(fs, "columns", []) or [])]
+    non_excel_fields = _field_cards(columns, profiles, semantics, limit=field_limit)
+    non_excel_shape = reconcile_table_shape(meta, profiles)
     return [
         _drop_empty(
             {
@@ -684,8 +1049,14 @@ def file_to_table_cards(
                 "table_kind": _table_kind(path, meta),
                 "role": role,
                 "file_cognition": summary[:350],
-                "shape": meta.get("shape") or meta.get("shape_estimated"),
-                "fields": _field_cards(columns, profiles, semantics, limit=field_limit),
+                "shape": non_excel_shape.get("verified_shape"),
+                "verified_row_count": non_excel_shape.get("verified_row_count"),
+                "row_count_basis": non_excel_shape.get("row_count_basis"),
+                "worksheet_used_range_shape": non_excel_shape.get("worksheet_used_range_shape"),
+                "row_count_conflict": non_excel_shape.get("row_count_conflict"),
+                "row_count_note": non_excel_shape.get("row_count_note"),
+                "fields": non_excel_fields,
+                "primary_key_candidates": primary_key_candidates(non_excel_fields),
                 "reading_notes": _reading_notes(path, meta),
                 "warnings": _warnings(fs, {}),
                 "artifact_refs": artifact_refs,
@@ -695,8 +1066,8 @@ def file_to_table_cards(
 
 
 def build_relation_cards(relations: Any, *, limit: int = 100) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for rel in list(relations or [])[: max(1, int(limit))]:
+    candidates: list[dict[str, Any]] = []
+    for rel in list(relations or []):
         if hasattr(rel, "model_dump"):
             data = rel.model_dump()
         elif hasattr(rel, "__dict__"):
@@ -708,7 +1079,7 @@ def build_relation_cards(relations: Any, *, limit: int = 100) -> list[dict[str, 
         shared = data.get("shared_columns") or []
         left_field = str(data.get("left_field", "") or (shared[0] if shared else ""))
         right_field = str(data.get("right_field", "") or (shared[0] if shared else ""))
-        out.append(
+        candidates.append(
             _drop_empty(
                 {
                     "left_file": str(data.get("left_file", "")),
@@ -721,6 +1092,24 @@ def build_relation_cards(relations: Any, *, limit: int = 100) -> list[dict[str, 
                 }
             )
         )
+    candidates.sort(key=_relation_card_sort_key)
+    out: list[dict[str, Any]] = []
+    signature_counts: Counter[tuple[str, str, str]] = Counter()
+    source_pair_counts: Counter[tuple[str, str]] = Counter()
+    for card in candidates:
+        signature = (
+            _norm_card_field(card.get("left_field")),
+            _norm_card_field(card.get("right_field")),
+            str(card.get("relation_type", "")),
+        )
+        source_pair = tuple(sorted((str(card.get("left_file", "")), str(card.get("right_file", "")))))
+        if signature_counts[signature] >= 3 or source_pair_counts[source_pair] >= 4:
+            continue
+        signature_counts[signature] += 1
+        source_pair_counts[source_pair] += 1
+        out.append(card)
+        if len(out) >= max(1, int(limit)):
+            break
     return out
 
 
@@ -770,9 +1159,16 @@ def build_filename_group_cards(groups: Any, *, file_summaries: list[Any], limit:
 def compact_constraint_memory(memory: Any) -> dict[str, Any]:
     if not isinstance(memory, dict):
         return {}
+    items = [
+        item
+        for item in (memory.get("items", []) or [])
+        if not isinstance(item, dict)
+        or str(item.get("status", "current_candidate") or "current_candidate")
+        not in {"superseded", "not_current", "resolved"}
+    ]
     return {
         "summary": str(memory.get("summary", ""))[:1200],
-        "items": memory.get("items", [])[:40] if isinstance(memory.get("items", []), list) else [],
+        "items": items[:40],
         "unresolved_questions": [str(x)[:500] for x in (memory.get("unresolved_questions", []) or [])[:20]],
     }
 
@@ -791,6 +1187,12 @@ def compact_authoritative_memory(memory: Any) -> dict[str, Any]:
         "leakage_guards": [str(x)[:500] for x in (memory.get("leakage_guards", []) or [])[:20]],
         "unresolved_questions": [str(x)[:500] for x in (memory.get("unresolved_questions", []) or [])[:20]],
         "authority_conflicts": (memory.get("authority_conflicts", []) or [])[:20],
+        "requirement_fact_matrix": [
+            item
+            for item in (memory.get("requirement_fact_matrix", []) or [])
+            if isinstance(item, dict)
+            and str(item.get("status", "") or "") in {"current", "unresolved"}
+        ][:40],
         "submission_contract": memory.get("submission_contract", {}) if isinstance(memory.get("submission_contract", {}), dict) else {},
     }
 
@@ -1140,6 +1542,122 @@ def _excel_layouts_for_summary(fs: Any) -> list[dict[str, Any]]:
             )
         )
     return out
+
+
+def _shape_pair(value: Any) -> list[int]:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return []
+    try:
+        return [max(0, int(value[0])), max(0, int(value[1]))]
+    except (TypeError, ValueError):
+        return []
+
+
+def _collapse_directory_collections(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compress dense subdirectories while retaining schema diversity facts."""
+
+    by_parent: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        source = str(entry.get("source_file", "") or "").replace("\\", "/")
+        parent = str(Path(source).parent).replace("\\", "/")
+        if parent not in {"", "."} and entry.get("coverage_status") != "documentation":
+            by_parent[parent].append(entry)
+
+    collapsible = {
+        parent
+        for parent, items in by_parent.items()
+        if len({str(item.get("source_file", "")) for item in items}) >= 3
+    }
+    if not collapsible:
+        return entries
+
+    out = [
+        entry
+        for entry in entries
+        if str(Path(str(entry.get("source_file", "")).replace("\\", "/")).parent).replace("\\", "/")
+        not in collapsible
+    ]
+    for parent in sorted(collapsible):
+        sheet_buckets: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for entry in by_parent[parent]:
+            sheet_buckets[str(entry.get("sheet_name", "") or "")].append(entry)
+        for sheet_name, items in sorted(sheet_buckets.items()):
+            file_names = sorted({str(item.get("source_file", "")) for item in items})
+            signatures = [tuple(str(x) for x in (item.get("schema_signature_fields") or [])) for item in items]
+            nonempty_sets = [set(signature) for signature in signatures if signature]
+            shared = sorted(set.intersection(*nonempty_sets)) if nonempty_sets else []
+            union = sorted(set().union(*nonempty_sets)) if nonempty_sets else []
+            schema_buckets: defaultdict[tuple[str, ...], list[str]] = defaultdict(list)
+            for item, signature in zip(items, signatures):
+                schema_buckets[signature].append(str(item.get("source_file", "")))
+            variants = []
+            for signature, member_files in sorted(schema_buckets.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+                variants.append(
+                    {
+                        "file_count": len(member_files),
+                        "example_file_count": min(3, len(member_files)),
+                        "fields": list(signature),
+                        "fields_not_shared": [field for field in signature if field not in shared],
+                    }
+                )
+            row_counts = sorted(
+                {
+                    int(item.get("verified_row_count"))
+                    for item in items
+                    if item.get("verified_row_count") is not None
+                }
+            )
+            out.append(
+                _drop_empty(
+                    {
+                        "table_id": f"{parent}/**::{sheet_name}" if sheet_name else f"{parent}/**",
+                        "source_collection": parent,
+                        "sheet_name": sheet_name,
+                        "table_kind": "directory_collection",
+                        "coverage_status": (
+                            "required" if any(item.get("coverage_status") == "required" for item in items) else "supporting"
+                        ),
+                        "member_file_count": len(file_names),
+                        "representative_file_count": min(1, len(file_names)),
+                        "schema_consistent": len(schema_buckets) == 1,
+                        "shared_schema_signature_fields": shared,
+                        "union_schema_signature_fields": union,
+                        "schema_variants": variants[:12],
+                        "verified_row_count_values": row_counts[:20],
+                        "layout_kinds": sorted({str(item.get("layout_kind", "")) for item in items if item.get("layout_kind")}),
+                        "coverage_rule": (
+                            "Cover this collection and its schema variants. Do not claim all files share the union schema; "
+                            "keep per-file identity and check exact columns before concatenation."
+                        ),
+                    }
+                )
+            )
+    out.sort(key=lambda item: (str(item.get("coverage_status", "")), str(item.get("table_id", ""))))
+    return out
+
+
+def _norm_card_field(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _relation_card_sort_key(card: dict[str, Any]) -> tuple[Any, ...]:
+    relation_type = str(card.get("relation_type", "") or "")
+    field_text = f"{card.get('left_field', '')} {card.get('right_field', '')}".lower()
+    key_signal = any(token in field_text for token in ["id", "编号", "代码", "单号", "key", "地址", "名称"])
+    cardinality_signal = relation_type in {"one_to_one", "one_to_many", "many_to_one"}
+    try:
+        confidence = float(card.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return (
+        0 if cardinality_signal else 1,
+        0 if key_signal else 1,
+        -confidence,
+        str(card.get("left_file", "")),
+        str(card.get("right_file", "")),
+        str(card.get("left_field", "")),
+        str(card.get("right_field", "")),
+    )
 
 
 def _drop_empty(data: dict[str, Any]) -> dict[str, Any]:

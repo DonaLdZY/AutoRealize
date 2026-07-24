@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from autorealize.config import AutoRealizeConfig
 from autorealize.investigation import (
@@ -14,7 +15,8 @@ from autorealize.investigation import (
 )
 from autorealize.models import InvestigationToolRequest
 from autorealize.models import ReadonlyPythonRequest
-from autorealize.profiling.csv_utils import infer_csv_dialect
+from autorealize.parsers.table_parser import TableParser
+from autorealize.profiling.csv_utils import infer_csv_dialect, read_csv_auto
 
 
 def _tools(input_dir: Path) -> CrossFileInvestigationTools:
@@ -67,6 +69,44 @@ def test_csv_dialect_probe_detects_whitespace_table_with_comma_lists(tmp_path: P
     assert hint.engine == "python"
     assert hint.inferred is True
     assert hint.reason == "whitespace_columns_with_comma_lists"
+
+
+def test_csv_dialect_probe_rereads_semicolon_decimal_comma_and_observes_numeric_flags(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "input_trucks.csv"
+    path.write_text(
+        "Id truck;Weight;Stack with multiple docks\n"
+        "T1;386,750;0\n"
+        "T2;401,250;1\n",
+        encoding="utf-8",
+    )
+
+    hint = infer_csv_dialect(path)
+    frame = read_csv_auto(path)
+    parsed = TableParser(preview_rows=20).parse(path)
+    contract = parsed.metadata["csv_read_contract"]
+
+    assert hint.sep == ";"
+    assert hint.decimal == ","
+    assert "stable_semicolon_delimiter_with_decimal_comma" in hint.reason
+    assert frame.shape == (2, 3)
+    assert frame["Weight"].tolist() == pytest.approx([386.75, 401.25])
+    assert parsed.metadata["shape"] == [2, 3]
+    assert contract["pandas_kwargs"] == {
+        "sep": ";",
+        "encoding": "utf-8-sig",
+        "decimal": ",",
+    }
+    assert contract["validated_columns_exact"] == [
+        "Id truck",
+        "Weight",
+        "Stack with multiple docks",
+    ]
+    assert contract["boolean_like_columns"]["Stack with multiple docks"] == {
+        "representation": "numeric_0_1",
+        "observed_values": ["0", "1"],
+    }
 
 
 def test_custom_readonly_python_can_write_scratch_but_not_input(tmp_path: Path) -> None:

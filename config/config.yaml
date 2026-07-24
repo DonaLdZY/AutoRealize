@@ -13,10 +13,12 @@ llm:
   max_retries: 3
   # Sampling temperature / 生成温度
   temperature: 0.0
-  # Normal output token cap; null/0 lets provider decide / 普通输出上限；null/0 由服务商决定
-  max_tokens: null
+  # Minimum cap for every normal business LLM request / 所有正常业务 LLM 请求的输出 token 下限
+  minimum_output_tokens: 32768
+  # Normal output token cap / 普通文本输出上限
+  max_tokens: 32768
   # Structured JSON output token cap / 结构化 JSON 输出上限
-  structured_max_tokens: null
+  structured_max_tokens: 32768
   # Per-request timeout in seconds / 单次请求超时秒数
   request_timeout_seconds: 180.0
   # Maximum concurrent LLM requests / LLM 最大并发请求数
@@ -25,6 +27,8 @@ llm:
   enforce_json_retry: true
   # Cache identical calls locally / 是否缓存完全相同的调用
   enable_cache: true
+  # Provider prompt cache routing: auto only enables api.openai.com / Provider 缓存路由：auto 仅启用 OpenAI 官方 API
+  prompt_cache_key_mode: "auto"
   # Record cache hits in trace logs / 缓存命中是否仍记录轨迹
   trace_cache_hits: true
   # null=provider default, true=enabled, false=disabled / 思考模式：null=服务商默认
@@ -33,6 +37,22 @@ llm:
   reasoning_effort: null
   # Disable thinking for schema-constrained calls / 结构化调用是否关闭思考
   structured_disable_thinking: true
+  # Compact JSON schema before sending; local validation still uses the full schema / 发送前压缩 JSON schema，本地仍完整校验
+  compact_structured_schema: true
+  # Include a generated empty JSON example in structured prompts / 是否发送自动生成的空 JSON 示例
+  structured_include_json_example: false
+  # Follow DeepSeek JSON-mode guidance without affecting other providers / 仅对官方 DeepSeek 按文档附带紧凑 JSON 示例
+  deepseek_json_mode_include_example: true
+  # Disable thinking on retry when reasoning exhausts the structured output budget / reasoning 耗尽输出预算时自动关闭 thinking 重试
+  structured_reasoning_fallback_on_length: true
+  # Reasoning/completion ratio that triggers the fallback / 触发降级的 reasoning 占比
+  structured_reasoning_fallback_ratio: 0.75
+  # Retry every length-truncated structured response directly at this cap / 任意结构化输出截断后直接使用此上限重试
+  structured_length_retry_max_tokens: 32768
+  # Output cap for constraint and entity-alias extraction / 约束与实体别名抽取输出上限
+  constraint_memory_max_tokens: 32768
+  # Deduplicated physical fields visible to entity-alias extraction / 实体别名抽取可见的去重物理字段数
+  entity_alias_schema_max_fields: 600
 
 # Pipeline feature switches / 流程功能开关
 switches:
@@ -96,7 +116,7 @@ data:
   # Total rolling-memory character budget / 滚动重点记忆总字符预算
   document_cognition_memory_max_chars: 18000
   # Output budget for each rolling-memory update / 每次重点记忆更新输出 token 上限
-  document_cognition_chunk_max_tokens: 4096
+  document_cognition_chunk_max_tokens: 32768
   # File size treated as a large table / 大表判定字节数
   large_table_threshold_bytes: 268435456
   # Top categorical values retained / 类别字段保留的高频值数量
@@ -163,13 +183,13 @@ investigation:
   # always|on_demand|disabled / 调查触发方式
   trigger_mode: "always"
   # Maximum questions in one run / 单次最大问题数
-  max_questions: 5
+  max_questions: 20
   # Maximum actions per question / 每个问题最大动作轮数
-  max_rounds_per_run: 6
+  max_rounds_per_run: 10
   # Follow-up question depth / 子问题最大深度
-  question_bfs_max_depth: 3
+  question_bfs_max_depth: 5
   # Child questions generated per question / 每个问题最大子问题数
-  max_followup_questions_per_question: 3
+  max_followup_questions_per_question: 5
   # Permit sandboxed read-only Python / 是否允许沙箱只读 Python
   allow_custom_readonly_python: true
   # Script actions per question; document retrieval is separate / 每题脚本次数，文档检索另计
@@ -210,6 +230,10 @@ investigation:
   tool_sample_rows: 50000
   # Rows returned by sample actions / 样本动作最大返回行数
   max_sample_rows: 20
+  # Let QDI shrink question/action budgets when current evidence is sufficient / 证据充分时允许 QDI 缩小问题和动作预算
+  adaptive_budgeting: true
+  # Deterministic relation/layout verification questions added beside planner output / 自动追加的关系与读取验证题上限
+  automatic_verification_question_limit: 4
 
 # Vision-model cognition / 视觉模型认知
 vllm:
@@ -243,7 +267,7 @@ prompt:
   # Evaluation-section reflection rounds / 评估章节反思轮数
   evaluation_reflection_max_rounds: 3
   # Structured description-protocol output cap / description 协议输出上限
-  description_protocol_max_tokens: null
+  description_protocol_max_tokens: 32768
   # Original-requirement characters in protocol calls / 协议调用携带的原始需求字符数
   description_protocol_original_chars: 10000
   # Data-digest characters in protocol calls / 协议调用携带的数据摘要字符数
@@ -254,6 +278,21 @@ prompt:
   description_protocol_fields_per_file: 12
   # zh|en|auto / 最终自然语言
   output_language: "zh"
+  # Canonical language for control instructions; evidence and identifiers keep their source form / 控制指令统一语言
+  control_language: "zh"
+  # Audit final description and machine artifacts for semantic contradictions / 最终跨产物一致性审查
+  artifact_consistency_enabled: true
+  # Reviewer rounds; a repair round is followed by a verification round / 一致性审查最大轮数
+  artifact_consistency_max_rounds: 2
+  # Convert remaining blocking semantic issues into task defects / 是否将阻断级语义问题写入最终 defects
+  artifact_consistency_fail_on_blocking: false
+  # Resolve ambiguous downstream candidates with a bounded LLM choice / 对歧义下游候选进行受约束 LLM 消歧
+  downstream_context_llm_resolution_enabled: true
+  downstream_context_resolution_max_dimensions: 5
+  downstream_context_resolution_min_confidence: 0.72
+  # Resolve fuzzy source-field aliases only from exact schema candidates / 从精确 schema 候选中消解源字段别名
+  source_field_alias_llm_resolution_enabled: true
+  source_field_alias_resolution_min_confidence: 0.82
   # Fail or repair references to nonexistent files / 是否严格拒绝不存在的文件引用
   enforce_description_real_file_refs: true
 
@@ -266,17 +305,50 @@ context:
   # Fields retained in detailed cards / 详细卡片每表最大字段数
   table_card_field_limit: 80
   # Fields retained in stable route-only cards / 稳定路由卡片每表字段数
-  stable_table_card_field_limit: 3
+  stable_table_card_field_limit: 80
   # Stable table-card count / 稳定提示词表卡片数量
-  stable_table_card_limit: 48
+  stable_table_card_limit: 120
   # Stable cards allowed per source file / 单源文件稳定卡片数量
-  stable_table_cards_per_source: 6
+  stable_table_cards_per_source: 80
+  # Total stable TableCard evidence budget; raw previews/full profiles stay local / 稳定 TableCard 证据总字符预算，raw preview/完整 profile 仍留本地
+  stable_table_cards_max_chars: 220000
   # Stable relation-card count / 稳定关系卡片数量
   relation_card_limit: 100
   # Stable filename-group-card count / 稳定文件名组卡片数量
   filename_group_card_limit: 80
   # ArtifactRef visible excerpt length / ArtifactRef 可见摘要字符数
   artifact_visible_excerpt_chars: 1200
+  # Shared provider-cache prefix and artifact-backed dynamic memory / 跨阶段 provider 友好上下文
+  cross_stage_memory_enabled: true
+  # Immutable prefix budget; the full object remains retrievable / 固定前缀字符预算，完整内容保留为 artifact
+  cross_stage_stable_context_chars: 32000
+  # Optional immutable-prefix token budget; null derives it from prompt_token_budget / 固定前缀估算 token 上限
+  cross_stage_stable_context_tokens: null
+  # Dynamic-memory compaction threshold / 动态记忆压缩阈值
+  cross_stage_memory_trigger_chars: 48000
+  # Optional automatic-compaction token threshold / 自动压缩估算 token 阈值
+  cross_stage_memory_trigger_tokens: null
+  # total|body_after_prefix, matching Codex terminology / 压缩阈值计数范围
+  cross_stage_memory_limit_scope: "body_after_prefix"
+  # Input budget share; remaining space is output/reasoning headroom / 输入上下文占比，其余预留给输出和推理
+  cross_stage_headroom_ratio: 0.72
+  # Compressed-memory target and per-stage live excerpt / 压缩目标与每阶段常驻片段
+  cross_stage_memory_target_chars: 16000
+  cross_stage_memory_target_tokens: null
+  cross_stage_memory_entry_chars: 12000
+  cross_stage_memory_recent_entries: 4
+  cross_stage_memory_max_compactions: 6
+  # Plan exact artifact retrieval only at critical stages / 仅在关键阶段规划精确 artifact 取回
+  cross_stage_retrieval_enabled: true
+  cross_stage_retrieval_max_artifacts: 3
+  cross_stage_retrieval_excerpt_chars: 6000
+  cross_stage_retrieval_stage_prefixes:
+    - "description_protocol_"
+    - "evaluation_contract_"
+    - "description_section_output_spec"
+    - "sample_submission_spec_"
+    - "source_field_alias_"
+    - "artifact_consistency_"
 
 # Deterministic and LLM work concurrency / 确定性任务与 LLM 并发
 parallel:
@@ -307,6 +379,10 @@ knowledge:
   write_rag_manifest: true
   # Boost constraints, metrics and field glossary / 是否提升约束、指标和字段知识权重
   boost_structured_knowledge: true
+  # Rerank/filter only the deterministic lexical candidate set / 仅重排和过滤确定性词法候选
+  semantic_rerank_enabled: true
+  semantic_rerank_candidate_multiplier: 3
+  semantic_rerank_min_candidates: 4
 
 # Event stream, state, and resolved config / 事件流、状态与最终配置
 telemetry:

@@ -108,6 +108,50 @@ def test_optimization_description_avoids_hardcoded_output_contract_templates() -
     assert "不得把任务硬套成固定 `id,target` 两列表" not in text
 
 
+def test_automl_context_keeps_problem_structure_and_required_rl_separate() -> None:
+    bundle = DescriptionProtocolBundle(
+        problem_paradigm="static_optimization",
+        problem_structure="decision_optimization",
+        decision_temporality="static_instance",
+        environment_source="constructed_from_static_data",
+        required_method_families=["reinforcement_learning"],
+        allowed_method_families=["reinforcement_learning", "hybrid_policy"],
+        rl_formulation_candidates=[
+            {
+                "formulation_type": "constructive_policy",
+                "state_candidates": ["current partial solution", "remaining resources"],
+                "action_candidates": ["select one legal next decision"],
+                "transition_description": "Apply one action to the partial solution.",
+                "action_mask_basis": ["task-defined feasibility constraints"],
+                "reward_alignment": "Terminal return matches score_solution.",
+                "terminal_condition": "No decision units remain.",
+                "episode_generation": "Create episodes from static problem instances.",
+            }
+        ],
+        task_goal="Produce a task-valid decision artifact.",
+        evaluation_summary="Use one scalar score.",
+    )
+    pack = build_automl_context_pack(
+        bundle,
+        [],
+        downstream_context={
+            "problem_paradigm_review": {
+                "rl_required": True,
+                "explicit_rl_requested": True,
+            }
+        },
+    )
+    text = render_automl_context_markdown(pack)
+
+    assert pack.problem_structure == "decision_optimization"
+    assert pack.environment_source == "constructed_from_static_data"
+    assert pack.method_strategy["rl_required"] is True
+    assert pack.method_strategy["first_draft_method"] == "reinforcement_learning"
+    assert "rl_formulation_candidates" in text
+    assert "Build a deterministic" not in text
+    assert "RL is a later" not in text
+
+
 def test_data_access_protocol_renders_whitespace_csv_read_example() -> None:
     fs = FileSummary(
         path="trainset.csv",
@@ -133,6 +177,44 @@ def test_data_access_protocol_renders_whitespace_csv_read_example() -> None:
     )
     text = render_description_protocol_markdown(bundle, [fs])
     assert "pd.read_csv('./input/trainset.csv', sep=r'\\s+', engine='python', encoding='utf-8-sig')" in text
+
+
+def test_data_access_protocol_preserves_executable_csv_read_contract() -> None:
+    read_contract = {
+        "schema_version": "autorealize.csv_read_contract.v1",
+        "verified": True,
+        "path": "input_items.csv",
+        "reader": "pandas.read_csv",
+        "pandas_kwargs": {"sep": ";", "decimal": ",", "encoding": "utf-8-sig"},
+        "validated_shape": [203, 19],
+        "validated_columns_exact": ["Item ident", "Weight"],
+    }
+    fs = FileSummary(
+        path="input_items.csv",
+        role=FileRole.raw_data_table,
+        summary="Semicolon-delimited item data.",
+        columns=["Item ident", "Weight"],
+        source_metadata={
+            "csv_dialect": {
+                "sep": ";",
+                "decimal": ",",
+                "inferred": True,
+                "reason": "stable_semicolon_delimiter_with_decimal_comma",
+            },
+            "csv_encoding": "utf-8-sig",
+            "csv_read_contract": read_contract,
+        },
+    )
+
+    protocol = build_data_access_protocol([fs])
+
+    assert protocol.files[0].read_example == (
+        "pd.read_csv('./input/input_items.csv', sep=';', decimal=',', encoding='utf-8-sig')"
+    )
+    assert protocol.files[0].read_contract["path"] == "input_items.csv"
+    assert protocol.files[0].read_contract["read_example"] == protocol.files[0].read_example
+    schema = build_data_schema_contract([fs])
+    assert schema["tables"][0]["read_contract"]["pandas_kwargs"]["decimal"] == ","
 
 
 def test_repeated_structured_files_are_grouped_in_description() -> None:
@@ -798,7 +880,37 @@ def test_automl_context_renders_entity_alias_candidates_as_unconfirmed() -> None
         data_access=build_data_access_protocol(files),
     )
 
-    pack = build_automl_context_pack(bundle, files)
+    pack = build_automl_context_pack(
+        bundle,
+        files,
+        downstream_context={
+            "constraint_memory": {
+                "entity_alias_candidates": [
+                    {
+                        "concept_id": "carrier_settlement_entity",
+                        "label": "承运商/结算方实体候选字段",
+                        "reason": "字段语义可能引用同一参与方，但需要值域核验。",
+                        "confidence": "medium",
+                        "candidate_fields": [
+                            {
+                                "source_file": "contracts.xlsx",
+                                "sheet_name": "承运商成本合同表",
+                                "field": "结算方代码",
+                                "semantic_role": "party_identifier",
+                                "value_kind": "code",
+                            },
+                            {
+                                "source_file": "vehicles.xlsx",
+                                "field": "承运商代码",
+                                "semantic_role": "party_identifier",
+                                "value_kind": "code",
+                            },
+                        ],
+                    }
+                ]
+            }
+        },
+    )
     text = render_automl_context_markdown(pack)
 
     assert "## Entity Alias Candidates" in text

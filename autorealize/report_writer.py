@@ -15,7 +15,8 @@ from .models import (
     FileRole,
     PipelinePlan,
 )
-from .entity_alias import build_entity_alias_candidates
+from .entity_alias import build_entity_alias_candidates, enrich_entity_alias_candidates_with_coverage
+from .context_compiler import build_relation_verification_queue, build_source_coverage_ledger, reconcile_table_shape
 from .profiling.relations import RelationHint
 
 
@@ -516,6 +517,7 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
         inferred = bool(dialect.get("inferred"))
         reason = str(dialect.get("reason", "") or "")
         encoding = str((fs.source_metadata or {}).get("csv_encoding", "") or "utf-8-sig")
+        decimal = dialect.get("decimal")
         kwargs = [f"{input_path!r}"]
         if sep == r"\s+":
             kwargs.append(r"sep=r'\s+'")
@@ -523,10 +525,14 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
             kwargs.append(f"sep={sep!r}")
         if engine:
             kwargs.append(f"engine={engine!r}")
+        if decimal and str(decimal) != ".":
+            kwargs.append(f"decimal={str(decimal)!r}")
         kwargs.append(f"encoding={encoding!r}")
         example = f"pd.read_csv({', '.join(kwargs)})"
         if inferred:
             notes.append(f"检测到 CSV 需要显式读取参数：sep={sep!r}；原因：{reason or '自动探测'}。")
+        if decimal and str(decimal) != ".":
+            notes.append(f"检测到 CSV 数值小数点为 {str(decimal)!r}，读取时必须保留 decimal 参数。")
         if encoding != "utf-8-sig":
             notes.append(f"检测到编码候选为 {encoding!r}。")
         notes.append("如果出现编码错误，可使用 gb18030 作为备选编码重试。")
@@ -576,6 +582,15 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
         return "Path.read_text", f"Path({input_path!r}).read_text(encoding='utf-8', errors='ignore')", notes
     return "按文件类型读取", f"# inspect {input_path!r} according to its file type", notes
 
+
+def _read_contract_for_file(fs: FileSummary, read_example: str) -> dict[str, Any]:
+    contract = dict((fs.source_metadata or {}).get("csv_read_contract") or {})
+    if not contract:
+        return {}
+    contract["path"] = str(fs.path)
+    contract["read_example"] = str(read_example or "")
+    return contract
+
 def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessProtocol:
     """Build deterministic file reading hints from parser metadata."""
     files: list[DataAccessFileProtocol] = []
@@ -616,6 +631,7 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
                 file_role=_role_label(fs.role),
                 read_method=read_method,
                 read_example=read_example,
+                read_contract=_read_contract_for_file(fs, read_example),
                 row_grain=str(fs.summary or "").strip()[:240],
                 key_fields=key_fields[:12],
                 target_fields=target_fields[:8],
@@ -1135,6 +1151,7 @@ def _compact_file_metadata_for_automl(fs: FileSummary) -> dict[str, Any]:
         "dtypes",
         "csv_dialect",
         "csv_encoding",
+        "csv_read_contract",
         "json_strategy",
         "json_root_type",
         "json_first_level_schema",
@@ -1345,9 +1362,10 @@ def _source_schema_entries_from_file(
             columns = [str(x) for x in (sheet.get("columns") or []) if str(x).strip()]
             profiles = sheet.get("column_profiles") if isinstance(sheet.get("column_profiles"), list) else []
             meanings = _sheet_field_descriptions(fs, sheet_name)
-            shape = sheet.get("shape") or sheet.get("shape_profiled") or sheet.get("shape_sampled")
+            shape_facts = reconcile_table_shape(sheet, profiles)
+            shape = shape_facts.get("verified_shape")
             row_counts = _profile_row_counts(profiles)
-            warnings = [x for x in [_shape_warning(shape, row_counts)] if x]
+            warnings = [str(shape_facts.get("row_count_note"))] if shape_facts.get("row_count_note") else []
             entries.append(
                 {
                     "table_id": f"{path}::{sheet_name}" if sheet_name else path,
@@ -1356,6 +1374,10 @@ def _source_schema_entries_from_file(
                     "table_kind": "excel_sheet",
                     "file_role": role,
                     "shape": shape,
+                    "verified_row_count": shape_facts.get("verified_row_count"),
+                    "row_count_basis": shape_facts.get("row_count_basis"),
+                    "worksheet_used_range_shape": shape_facts.get("worksheet_used_range_shape"),
+                    "row_count_conflict": shape_facts.get("row_count_conflict"),
                     "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
                     "column_count": len(columns),
                     "physical_columns_exact": columns[:max_columns],
@@ -1375,9 +1397,10 @@ def _source_schema_entries_from_file(
     columns = [str(x) for x in (fs.columns or []) if str(x).strip()]
     profiles = fs.column_profiles or []
     meanings = {str(k): str(v) for k, v in (fs.column_semantics or {}).items() if str(k).strip()}
-    shape = meta.get("shape") or meta.get("shape_estimated")
+    shape_facts = reconcile_table_shape(meta, profiles)
+    shape = shape_facts.get("verified_shape")
     row_counts = _profile_row_counts(profiles)
-    warnings = [x for x in [_shape_warning(shape, row_counts)] if x]
+    warnings = [str(shape_facts.get("row_count_note"))] if shape_facts.get("row_count_note") else []
     entries.append(
         {
             "table_id": path,
@@ -1386,6 +1409,10 @@ def _source_schema_entries_from_file(
             "table_kind": _schema_table_kind(path),
             "file_role": role,
             "shape": shape,
+            "verified_row_count": shape_facts.get("verified_row_count"),
+            "row_count_basis": shape_facts.get("row_count_basis"),
+            "worksheet_used_range_shape": shape_facts.get("worksheet_used_range_shape"),
+            "row_count_conflict": shape_facts.get("row_count_conflict"),
             "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
             "column_count": len(columns),
             "physical_columns_exact": columns[:max_columns],
@@ -1396,7 +1423,8 @@ def _source_schema_entries_from_file(
                 meanings=meanings,
                 max_fields=max_field_summaries,
             ),
-            "read_example": _default_schema_read_example(path),
+            "read_example": _read_example_for_file(fs)[1],
+            "read_contract": dict(meta.get("csv_read_contract") or {}),
             "warnings": warnings,
         }
     )
@@ -1774,8 +1802,52 @@ def build_automl_context_pack(
     contract = _as_evaluation_contract(evaluation_contract) if evaluation_contract is not None else None
     paradigm = str(bundle.problem_paradigm or ctx.get("problem_paradigm", "unknown_but_executable")).strip()
     problem_review = ctx.get("problem_paradigm_review") if isinstance(ctx.get("problem_paradigm_review"), dict) else {}
+    bundle_structure = str(bundle.problem_structure or "").strip()
+    problem_structure = str(
+        bundle_structure
+        if bundle_structure not in {"", "unknown"}
+        else problem_review.get("problem_structure") or "unknown"
+    ).strip()
+    bundle_temporality = str(bundle.decision_temporality or "").strip()
+    decision_temporality = str(
+        bundle_temporality
+        if bundle_temporality not in {"", "not_applicable"}
+        else problem_review.get("decision_temporality") or "not_applicable"
+    ).strip()
+    bundle_environment = str(bundle.environment_source or "").strip()
+    environment_source = str(
+        bundle_environment
+        if bundle_environment not in {"", "not_applicable"}
+        else problem_review.get("environment_source") or "not_applicable"
+    ).strip()
     explicit_rl_requested = bool(problem_review.get("explicit_rl_requested"))
     rl_as_required_paradigm = bool(problem_review.get("rl_as_required_paradigm")) or paradigm == "reinforcement_learning"
+    required_method_families = _dedupe_any(
+        list(bundle.required_method_families or [])
+        + list(problem_review.get("required_method_families") or []),
+        limit=12,
+    )
+    allowed_method_families = _dedupe_any(
+        list(bundle.allowed_method_families or [])
+        + list(problem_review.get("allowed_method_families") or []),
+        limit=16,
+    )
+    rl_required = bool(
+        problem_review.get("rl_required")
+        or rl_as_required_paradigm
+        or any(
+            "reinforcement" in str(item).lower() or str(item).lower() == "rl"
+            for item in required_method_families
+        )
+    )
+    raw_rl_candidates = list(bundle.rl_formulation_candidates or []) or list(
+        problem_review.get("rl_formulation_candidates") or []
+    )
+    rl_formulation_candidates = [
+        item.model_dump() if hasattr(item, "model_dump") else dict(item)
+        for item in raw_rl_candidates[:8]
+        if hasattr(item, "model_dump") or isinstance(item, dict)
+    ]
     recommended_solver_families = _dedupe_any(problem_review.get("recommended_solver_families", []), limit=10)
     method_routing_notes = _dedupe_any(problem_review.get("method_routing_notes", []), limit=10)
     summaries_by_path = {str(fs.path): fs for fs in file_summaries}
@@ -1788,6 +1860,22 @@ def build_automl_context_pack(
         else []
     )
     data_schema_contract = build_data_schema_contract(file_summaries)
+    source_coverage_ledger = (
+        compact_ctx.get("source_coverage_ledger")
+        if isinstance(compact_ctx.get("source_coverage_ledger"), dict)
+        else build_source_coverage_ledger(file_summaries=file_summaries)
+    )
+    relation_verification_queue = (
+        compact_ctx.get("relation_verification_queue")
+        if isinstance(compact_ctx.get("relation_verification_queue"), list)
+        else build_relation_verification_queue(compact_relations, limit=12)
+    )
+    authoritative_memory = ctx.get("authoritative_memory") if isinstance(ctx.get("authoritative_memory"), dict) else {}
+    requirement_fact_matrix = [
+        item
+        for item in (authoritative_memory.get("requirement_fact_matrix", []) or [])
+        if isinstance(item, dict) and str(item.get("status", "") or "") in {"current", "unresolved"}
+    ][:40]
 
     data_entries: list[dict[str, Any]] = []
     entity_alias_source_aliases: dict[str, str] = {}
@@ -1825,6 +1913,7 @@ def build_automl_context_pack(
                 "shape": card.get("shape"),
                 "read_method": protocol.read_method if protocol is not None else "",
                 "read_example": protocol.read_example if protocol is not None else "",
+                "read_contract": protocol.read_contract if protocol is not None else {},
                 "columns": columns[:80],
                 "fields": fields[:24],
                 "key_fields": protocol.key_fields if protocol is not None else [],
@@ -1876,6 +1965,7 @@ def build_automl_context_pack(
                     "path": representative.path,
                     "read_method": representative.read_method,
                     "read_example": representative.read_example,
+                    "read_contract": representative.read_contract,
                     "columns": [],
                     "row_grain": representative.row_grain,
                     "key_fields": _dedupe_any(representative.key_fields, limit=16),
@@ -1899,10 +1989,16 @@ def build_automl_context_pack(
                         entry["excel_sheet_profiles"] = sheet_profiles
             data_entries.append(entry)
 
-    entity_alias_candidates = build_entity_alias_candidates(
-        file_summaries,
-        filename_sample_groups=compact_filename_groups,
-        source_aliases=entity_alias_source_aliases,
+    entity_alias_candidates = enrich_entity_alias_candidates_with_coverage(
+        build_entity_alias_candidates(
+            file_summaries,
+            llm_candidates=(ctx.get("constraint_memory") or {}).get("entity_alias_candidates", [])
+            if isinstance(ctx.get("constraint_memory"), dict)
+            else [],
+            filename_sample_groups=compact_filename_groups,
+            source_aliases=entity_alias_source_aliases,
+        ),
+        data_root=Path(str(ctx.get("data_root", "") or ".")),
     )
 
     output = bundle.output
@@ -1948,26 +2044,43 @@ def build_automl_context_pack(
 
     method_strategy: dict[str, Any] = {
         "problem_paradigm": paradigm or "unknown_but_executable",
+        "problem_structure": problem_structure,
+        "decision_temporality": decision_temporality,
+        "environment_source": environment_source,
         "explicit_rl_requested": explicit_rl_requested,
         "rl_as_required_paradigm": rl_as_required_paradigm,
+        "rl_required": rl_required,
+        "required_method_families": required_method_families,
+        "allowed_method_families": allowed_method_families,
+        "rl_formulation_candidates": rl_formulation_candidates,
         "recommended_solver_families": recommended_solver_families,
         "method_routing_notes": method_routing_notes,
     }
-    if paradigm in {"static_optimization", "hybrid_ml_optimization"}:
+    if rl_required:
+        method_strategy["first_draft_method"] = "reinforcement_learning"
         method_strategy["first_draft_policy"] = (
-            "Build a deterministic evaluator plus a greedy/repair/local-search or OR baseline first. "
-            "The first runnable node should produce a real, possibly partial, solution and a penalized scalar score."
+            "Implement one complete RL solution path that derives or uses an environment, trains or configures a policy, "
+            "evaluates its rollout with the shared evaluator, and saves a reusable policy artifact."
         )
-        method_strategy["rl_branch_policy"] = (
-            "If RL is requested, treat it as a later comparable branch. It must reuse the same load_problem_data, "
-            "validate_solution, score_solution, output schema, hard constraints, and final scalar score."
-        )
-    elif paradigm == "reinforcement_learning":
+    elif problem_structure in {"decision_optimization", "native_sequential_control"} or paradigm in {
+        "static_optimization",
+        "hybrid_ml_optimization",
+        "reinforcement_learning",
+    }:
+        method_strategy["first_draft_method"] = "optimization"
         method_strategy["first_draft_policy"] = (
-            "Build the environment/evaluator contract first, then compare a simple policy or heuristic rollout before expensive RL training."
+            "Implement one coherent optimization method and evaluate its generated decision artifact with the shared evaluator."
+        )
+    elif problem_structure == "prediction" or paradigm == "ml_dl_prediction":
+        method_strategy["first_draft_method"] = "prediction"
+        method_strategy["first_draft_policy"] = (
+            "Implement one coherent prediction pipeline with task-aligned validation and a reusable inference artifact."
         )
     else:
-        method_strategy["first_draft_policy"] = "Follow the task paradigm, but keep the first runnable solution simple and fully evaluable."
+        method_strategy["first_draft_method"] = "task_appropriate"
+        method_strategy["first_draft_policy"] = (
+            "Follow the required method contract and produce one runnable, evaluable, reusable solution path."
+        )
 
     modeling_boundary: list[str] = []
     if paradigm == "ml_dl_prediction":
@@ -2103,15 +2216,21 @@ def build_automl_context_pack(
             "If AutoRealize records source-field corrections, downstream code must use the corrected exact physical column names for pandas access.",
             "AutoRealize evaluation/output/data-access contracts override generic Kaggle templates and MLEvolve preview heuristics.",
             "Runtime path facts: input files under `./input`; configured outputs under `./submission` only when required.",
-            "For static optimization/dispatch tasks, first produce a deterministic scorable baseline; RL is a later comparable branch unless the problem paradigm is explicitly reinforcement_learning.",
+            "Problem structure and solution method are separate axes: a static optimization problem may require an RL method built from static data, and required methods must not be silently downgraded to optional branches.",
         ],
         problem_paradigm=paradigm or "unknown_but_executable",
+        problem_structure=problem_structure,
+        decision_temporality=decision_temporality,
+        environment_source=environment_source,
         task_goal=bundle.task_goal or bundle.overview or str(ctx.get("task_hint", "")),
         data_orchestration=data_orchestration,
         data_access=data_entries,
         data_schema_contract=data_schema_contract,
         source_alias_guard=list(ctx.get("source_alias_guard", []) or []),
         entity_alias_candidates=entity_alias_candidates,
+        source_coverage_ledger=source_coverage_ledger,
+        relation_verification_queue=relation_verification_queue,
+        requirement_fact_matrix=requirement_fact_matrix,
         output_contract=output_contract,
         evaluation_contract=evaluation,
         method_strategy=method_strategy,
@@ -2147,6 +2266,48 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     ]
     for item in _dedupe_any(pack.priority_rules, limit=12):
         lines.append(f"- {item}")
+
+    ledger = pack.source_coverage_ledger or {}
+    if ledger:
+        lines.extend(["", "## Source Coverage Ledger"])
+        lines.append(
+            f"- original_table_count={ledger.get('original_table_count')}; "
+            f"visible_entry_count={ledger.get('visible_entry_count')}; counts={ledger.get('counts')}"
+        )
+        for rule in _dedupe_any(ledger.get("policy", []), limit=8):
+            lines.append(f"- rule: {rule}")
+        for entry in (ledger.get("entries") or [])[:80]:
+            if not isinstance(entry, dict):
+                continue
+            parts = [
+                f"table_id={entry.get('table_id')}",
+                f"status={entry.get('coverage_status')}",
+                f"verified_shape={entry.get('verified_shape')}" if entry.get("verified_shape") else "",
+                f"row_count_basis={entry.get('row_count_basis')}" if entry.get("row_count_basis") else "",
+                f"member_file_count={entry.get('member_file_count')}" if entry.get("member_file_count") else "",
+                f"schema_consistent={entry.get('schema_consistent')}" if entry.get("schema_consistent") is not None else "",
+                f"layout={entry.get('layout_kind') or entry.get('layout_kinds')}" if entry.get("layout_kind") or entry.get("layout_kinds") else "",
+            ]
+            lines.append("- " + "; ".join(str(x) for x in parts if str(x).strip()))
+            if entry.get("row_count_conflict"):
+                lines.append(f"  - worksheet_used_range_shape={entry.get('worksheet_used_range_shape')} (layout diagnostic only)")
+            key_candidates = entry.get("primary_key_candidates") if isinstance(entry.get("primary_key_candidates"), list) else []
+            if key_candidates:
+                lines.append(f"  - primary_key_candidates={key_candidates[:5]}")
+            variants = entry.get("schema_variants") if isinstance(entry.get("schema_variants"), list) else []
+            if variants:
+                lines.append(f"  - schema_variants={variants[:8]}")
+
+    if pack.requirement_fact_matrix:
+        lines.extend(["", "## Current Requirement Fact Matrix"])
+        lines.append("- Only status=current facts are executable facts. status=unresolved remains a question; future/examples/superseded items are excluded upstream.")
+        for item in pack.requirement_fact_matrix[:40]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- type={item.get('fact_type')}; status={item.get('status')}; "
+                f"statement={item.get('statement')}; source={item.get('source')}"
+            )
 
     schema_contract = pack.data_schema_contract or {}
     if schema_contract:
@@ -2282,17 +2443,24 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                 f"- concept_id={group.get('concept_id')}; "
                 f"label={group.get('label')}; "
                 f"status={group.get('status')}; "
+                f"evidence_status={group.get('evidence_status')}; "
+                f"task_relevance={group.get('task_relevance')}; "
                 f"alias_families={group.get('alias_families')}; "
                 f"value_kinds={group.get('value_kinds')}"
             )
+            if group.get("qdi_routing"):
+                lines.append(f"  qdi_routing: {group.get('qdi_routing')}")
             fields = group.get("candidate_fields") if isinstance(group.get("candidate_fields"), list) else []
             if fields:
                 lines.append("  candidate_fields:")
                 for item in fields[:24]:
                     if not isinstance(item, dict):
                         continue
+                    source_collection = str(item.get("source_collection", "") or "")
+                    source_file = str(item.get("source_file", "") or "")
                     parts = [
-                        f"source_file={item.get('source_file')}",
+                        f"source_file={source_file}" if not source_collection or source_collection == source_file else "",
+                        f"source_collection={source_collection}" if source_collection else "",
                         f"sheet_name={item.get('sheet_name')}" if item.get("sheet_name") else "",
                         f"field={item.get('field')}",
                         f"alias_family={item.get('alias_family')}",
@@ -2304,6 +2472,12 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
             if checks:
                 lines.append("  recommended_qdi_checks:")
                 lines.extend(f"    - {x}" for x in checks[:8])
+            deterministic = group.get("deterministic_group_coverage") if isinstance(group.get("deterministic_group_coverage"), dict) else {}
+            if deterministic:
+                lines.append(f"  collection_profiles: {deterministic.get('collection_profiles', [])}")
+                lines.append(f"  directional_coverage: {deterministic.get('directional_coverage', [])}")
+                if deterministic.get("read_errors"):
+                    lines.append(f"  read_errors: {deterministic.get('read_errors', [])}")
 
     lines.extend(["", "## Minimal Task Reference", f"- Problem paradigm: `{pack.problem_paradigm}`"])
     if pack.task_goal:
@@ -2312,16 +2486,50 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     method = pack.method_strategy or {}
     if method:
         lines.extend(["", "## Method Strategy"])
-        for key in ["problem_paradigm", "explicit_rl_requested", "rl_as_required_paradigm"]:
+        for key in [
+            "problem_paradigm",
+            "problem_structure",
+            "decision_temporality",
+            "environment_source",
+            "explicit_rl_requested",
+            "rl_as_required_paradigm",
+            "rl_required",
+            "first_draft_method",
+        ]:
             if key in method:
                 lines.append(f"- {key}: `{method.get(key)}`")
-        families = _dedupe_any(method.get("recommended_solver_families", []), limit=10)
-        if families:
-            lines.append("- recommended_solver_families: " + ", ".join(f"`{x}`" for x in families))
-        for key in ["first_draft_policy", "rl_branch_policy"]:
+        for key in ["required_method_families", "allowed_method_families", "recommended_solver_families"]:
+            families = _dedupe_any(method.get(key, []), limit=16)
+            if families:
+                lines.append(f"- {key}: " + ", ".join(f"`{x}`" for x in families))
+        for key in ["first_draft_policy"]:
             value = str(method.get(key, "") or "").strip()
             if value:
                 lines.append(f"- {key}: {value}")
+        candidates = method.get("rl_formulation_candidates")
+        if isinstance(candidates, list) and candidates:
+            lines.append("- rl_formulation_candidates:")
+            for index, candidate in enumerate(candidates[:8], 1):
+                if not isinstance(candidate, dict):
+                    continue
+                lines.append(
+                    f"  - candidate_{index}: formulation_type={candidate.get('formulation_type')}; "
+                    f"generalization_target={candidate.get('generalization_target')}"
+                )
+                for field_name in [
+                    "state_candidates",
+                    "action_candidates",
+                    "transition_description",
+                    "action_mask_basis",
+                    "reward_alignment",
+                    "terminal_condition",
+                    "episode_generation",
+                    "evidence_refs",
+                    "unresolved_points",
+                ]:
+                    candidate_value = candidate.get(field_name)
+                    if candidate_value not in (None, "", [], {}):
+                        lines.append(f"    - {field_name}: {candidate_value}")
         notes = _dedupe_any(method.get("method_routing_notes", []), limit=8)
         if notes:
             lines.append("- method_routing_notes:")
@@ -2331,6 +2539,9 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     evaluation = pack.evaluation_contract or {}
     final_formula = str(evaluation.get("final_score_formula") or evaluation.get("metric_formula") or "").strip()
     for key in [
+        "passed",
+        "executable",
+        "authority_status",
         "primary_metric",
         "metric_direction",
         "prediction_unit",
@@ -2341,6 +2552,11 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         value = str(evaluation.get(key, "") or "").strip()
         if value:
             lines.append(f"- {key}: {value}")
+    for key in ["assumptions", "residual_issues"]:
+        values = _dedupe_any(evaluation.get(key, []), limit=12)
+        if values:
+            lines.append(f"- {key}:")
+            lines.extend(f"  - {x}" for x in values)
     if final_formula:
         lines.append(f"- final_score_formula: {final_formula}")
     lines.append("- final_validation_score_rule: validation should be comparable by exactly one numeric `Final Validation Score` derived from `final_score_formula`.")
@@ -2598,6 +2814,16 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                     ]
                     if str(x).strip() and not str(x).endswith("=None")
                 )
+            )
+
+    if pack.relation_verification_queue:
+        lines.extend(["", "## Relation Verification Queue"])
+        lines.append("- These joins are candidates only. Verify full-value directional coverage before relying on them in loading, constraints, or scoring.")
+        for item in pack.relation_verification_queue[:12]:
+            lines.append(
+                f"- {item.get('left_file')}.{item.get('left_field')} -> "
+                f"{item.get('right_file')}.{item.get('right_field')}; "
+                f"status={item.get('status')}; required_statistics={item.get('required_statistics')}"
             )
 
     if pack.modeling_boundary:
