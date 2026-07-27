@@ -1,301 +1,389 @@
 # AutoRealize
 
-AutoRealize 是 AutoDecision 的数据认知与任务定义引擎。它把原始数据目录和自然语言需求转换为下游算法系统可以直接使用的任务包，包括精确数据说明、任务书、评估合同、输出合同和 AutoML 专用上下文。
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 
-AutoRealize 不只概括文件内容，还要尽量确认：数据实际包含什么、字段准确叫什么、文件和表如何关联、任务如何评价、方案必须输出什么，以及哪些事实和约束不能被下游模型误解。
+AutoRealize 将**原始数据目录 + 自然语言需求**转换成一份可以直接交给算法工程师、AutoML Agent 或搜索系统使用的 **Kaggle 风格赛题包**。
 
-## 输入与输出
+它不只是总结文件。AutoRealize 会核对数据怎么读取、表和字段如何关联、任务究竟属于预测/优化/决策/RL 中的哪一类、指标如何计算、结果必须输出成什么格式，并把这些结论同时写成人类可读文档和机器可执行合同。
 
-输入：
+最终产物的核心是：
 
-- 原始数据目录。
-- 可选的自然语言任务需求。
-- 一份带注释的 YAML 配置。
+- `description.md`：完整的 Kaggle 风格任务书；
+- `sample_submission.csv`：复用官方样例，或按输出合同生成并校验的样例；
+- `realize_report/automl_context.md`：供下游 AutoML/Agent 直接阅读的精确上下文；
+- `realize_report/automl_context_pack.json`：对应的机器可读合同；
+- `realize_report/main_task_protocol.json`：任务事实、数据访问、评估和输出合同的统一入口；
+- `realize_report/`：数据认知、调查、审查、运行轨迹及 LLM 用量等可追溯材料。
 
-核心输出：
-
-- `description.md`：面向用户和算法开发者的完整任务书。
-- `sample_submission.csv`：官方样例复用或根据输出合同生成的格式样例。
-- `realize_report/data_description.md`：全局数据认知报告。
-- `realize_report/automl_context.md`：明确供 MLEvolve 使用的结构化上下文。
-- `realize_report/` 下的调查报告、合同、事件、LLM 用量和本地 artifact。
+> AutoRealize 负责把数据和需求“实现”为完备赛题，不负责训练最终模型。模型训练、搜索和交付可以由任意下游系统消费上述任务包。
 
 ## 工作流程
 
-```text
-目录扫描
-  -> 文件名模式与读取计划
-  -> 文件解析、布局证据和表格画像
-  -> 文件认知、Table Card、Relation Card
-  -> QDI 问题驱动调查
-  -> 权威需求与约束归并
-  -> 任务范式、评估合同和输出合同
-  -> description.md + automl_context.md + sample_submission.csv
+```mermaid
+flowchart TD
+    A["原始数据目录 + 自然语言需求"] --> B["复制工作区并安全展开压缩包"]
+    B --> C["文件清点、模式分组与代表样本选择"]
+    C --> D["解析、表格画像与逐文件认知"]
+    D --> E["Table Card、字段语义与跨表关系"]
+    E --> F["权威需求、约束与冲突归并"]
+    F --> G["QDI 问题驱动只读调查"]
+    G --> H["下游数据上下文与读取协议"]
+    H --> I["任务范式、评估合同与输出合同"]
+    I --> J["样例提交生成或复用并校验"]
+    J --> K["分章节生成 description.md"]
+    K --> L["跨产物一致性审查与修复"]
+    L --> M["Kaggle 风格任务包"]
 ```
 
-## 主要能力
+各步骤不是清一色调用 LLM，而是按证据类型选择规则、LLM 或混合流程：
 
-### 数据与文档认知
+| 步骤            | 做什么                                                            | 怎么做                                                                                                                                                    |
+| --------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. 工作区准备   | 保留原始输入，建立独立运行目录                                    | **规则**：复制输入；按配置展开压缩包；输入已有 `description.md` 时备份为 `description_origin.md`                                                |
+| 2. 文件选择     | 避免大量同构文件把上下文撑爆                                      | **规则 + LLM**：按文件名、目录、表头和 schema 签名分组；规则先抽代表文件，可选 LLM 仅提出分组正则，候选仍需程序验证                                 |
+| 3. 解析与画像   | 获得精确物理 schema 和数据质量事实                                | **规则**：解析文件、识别 CSV 方言和 Excel 布局；统计 shape、列名、类型、空值、唯一值、类别、数值与日期特征；大表按配置采样                          |
+| 4. 文件认知     | 判断每个文件的角色、字段含义和风险                                | **混合**：程序事实作为不可覆盖的底座，LLM 总结业务语义、关键实体和读取注意事项；结果按文件写入 artifact                                             |
+| 5. 关系发现     | 找出训练/预测/说明/提交文件及跨表关系                             | **规则为主**：字段名、值域交集、覆盖率和基数验证一对一/一对多/多对多关系；不会仅凭名称相似断言字段等价                                              |
+| 6. 权威信息归并 | 解决用户要求、原始任务文档和数据推断之间的优先级                  | **混合**：提取权威需求和约束，保留冲突与未决问题；物理文件和字段回到真实 schema 校验                                                                |
+| 7. QDI 调查     | 针对“表头在哪、主外键是否成立、指标/输出是否明确”等缺口继续取证 | **LLM 规划 + 受限规则执行**：LLM 选择只读工具或编写受限 Python 探查脚本；程序限制动作、超时和输出，再由 LLM 根据结果决定追问、修复脚本或结束        |
+| 8. 下游上下文   | 明确训练表、预测表、ID、目标列、sheet 和读取参数                  | **规则 + 受约束 LLM 消歧**：先生成真实候选；只有低置信度维度交给 LLM 选择，返回结果必须属于候选并通过 schema 回验                                   |
+| 9. 任务协议     | 建模预测、时序、推荐、静态优化、决策、RL 或混合任务               | **LLM + 结构化校验**：生成范式协议、评价公式、方向、边界条件及输出合同；Pydantic/规则检查结构和引用                                                 |
+| 10. 样例输出    | 给下游提供确定的提交/决策结果格式                                 | **混合**：优先复制官方 `sample_submission`；否则 LLM 生成构造脚本，程序在运行副本中执行并验证列名、顺序、行数和来源字段                           |
+| 11. 任务书生成  | 形成可读、可执行的 Kaggle 风格说明                                | **LLM 分章节生成**：任务概述、任务定义、评估协议、输出格式、数据说明、关键字段、约束/防泄漏和待确认事项分别生成，已确认章节被冻结，避免全文反复改写 |
+| 12. 一致性审查  | 防止说明文档、评估合同、样例输出和 AutoML 上下文互相矛盾          | **LLM 审查 + 定向修复 + 规则复验**：修复器只能改被点名的章节；不存在的文件/字段引用、合同结构和样例格式由程序再次检查                               |
 
-- 解析 CSV、Excel、JSON、TXT、Markdown、DOCX、PDF、图片、YAML、TOML 和常见压缩包。
-- 为表格生成 shape、精确列名、类型、空值、唯一值、类别、数值和日期统计。
-- 识别 Excel 的非首行表头、说明区、空白区、重复区和文档式布局，并给出读取建议。
-- 对文件名相似的数据先比较表头和结构签名，再决定合并认知、扩展抽样或拆分文件卡片。
-- 生成字段级关系证据，区分一对一、一对多、多对多和共享属性。
-- 将语义相近的字段视为候选关系，通过值域交集和覆盖率验证，不因名称相似直接断言等价。
+## 支持的输入
 
-### QDI 调查
+| 类型       | 后缀                                                                                                | 说明                                                      |
+| ---------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 表格       | `.csv`, `.xlsx`, `.xls`                                                                       | CSV 编码/分隔符推断；Excel 多 sheet、非首行表头和布局证据 |
+| 结构化数据 | `.json`, `.toml`                                                                                | JSON 可展开嵌套结构；TOML 提取结构化摘要                  |
+| 文本       | `.txt`, `.md`, `.rst`, `.log`                                                               | 按`utf-8`、`utf-8-sig`、`gb18030` 等候选编码读取    |
+| 文档       | `.docx`, `.pdf`                                                                                 | DOCX 提取段落和表格；PDF 提取文本层。扫描 PDF 不内置 OCR  |
+| 图片       | `.png`, `.jpg`, `.jpeg`, `.bmp`, `.gif`, `.webp`, `.tif`, `.tiff`                   | 始终可读取图片元数据；配置视觉模型后可做语义认知          |
+| 压缩包     | `.zip`, `.rar`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz` | 在运行副本中展开，原始输入目录不被修改                    |
 
-QDI（Question-Driven Investigation）针对尚未解决的问题生成受限的只读探查动作。模型会看到问题账本、近期动作摘要和当前相关证据；完整长输出保存在 artifact 中，需要时再按片段检索，避免反复发送全部历史。
-
-QDI 适合确认：
-
-- 主键、外键和跨表覆盖率。
-- 候选实体字段是否指向同一业务对象。
-- Excel 的实际表头、sheet 结构和读取参数。
-- 训练集、预测集、样例提交和说明文档的角色。
-- 约束、评估和输出要求对应的真实字段。
-
-### 任务定义
-
-- 保存完整 `original_requirements.txt` 作为权威需求来源。
-- 判断预测、时序、推荐、优化、决策或强化学习等任务范式。
-- 生成统一、可执行且可追溯的评估合同和输出合同。
-- 先生成训练表、预测表、ID、目标列和任务类型候选，再仅对低置信度维度调用 LLM 消歧；LLM 只能选择真实候选，结果还会经过物理 schema 回验。
-- 要求 `description.md` 中的数据字段与实际 schema 精确一致。
-- 区分用户表达中的业务概念和数据中的物理字段；必要时说明派生规则，不伪造不存在的列。
-- 最终对 `description.md`、评估/输出合同、sample submission、AutoML context 和主任务协议做结构化一致性审查；修复器只能替换被点名的二级章节。
-- 生成给 MLEvolve 直接消费的 `automl_context.md`，补充精确 schema、读取方式、约束和数据事实。
-
-### 上下文与成本控制
-
-- 原始需求全文在任务定义核心调用中保持可见。
-- 大型 metadata、预览、脚本输出和文档全文落到本地 artifact。
-- prompt 使用稳定的结构化 evidence pack、artifact ref 和动态尾部。
-- 任务定义阶段共享不可变的 provider-cache 前缀；近期阶段结果累积在尾部，接近预算时压缩为有损工作记忆。
-- `prompt_cache_key_mode: auto` 只对 OpenAI 官方 API 发送基于稳定前缀摘要的路由 key；DeepSeek 等兼容 provider 默认不接收 OpenAI 专属字段，显式启用后若被拒绝也会自动降级重试。
-- DeepSeek 使用自动磁盘上下文缓存，复用完全一致的消息前缀并读取 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；官方地址统一归一化到 `/beta`，与下游 MLEvolve 的 Chat Prefix Completion 保持一致，同时仍兼容普通 Chat Completions。
-- DeepSeek thinking 开启时不发送官方声明无效的采样参数；`reasoning_effort` 使用顶层字段，`thinking` 开关通过 SDK `extra_body` 发送。结构化 JSON 默认关闭 thinking，并按官方 JSON mode 建议附带紧凑合法示例。
-- 压缩预算同时按字符和中英混合文本的估算 token 约束，并支持 `total` / `body_after_prefix` 两种计数范围。
-- 被压缩的完整结果始终保存在本地 artifact；评估、输出和最终审查等关键阶段可按 `artifact_id + json_path` 规划最小范围回读。
-- 摘要只用于导航，不能覆盖权威需求和程序验证事实；被省略且未回读的内容不得推断。
-- QDI 历史保留问题、动作摘要、短结论和可检索引用，不重复携带全部 stdout。
-- `llm_usage.jsonl` 和汇总文件记录 token、reasoning token、provider 缓存读写、后端 fingerprint、上下文形状和 artifact 信息；DeepSeek V4 成本按官方美元单价估算。
+未注册格式会保留在最终任务目录中，但只标记为未知二进制文件，不做深度解析。
 
 ## 环境要求
 
-- Conda、Miniconda 或 Miniforge
-- Python 3.11 或 3.12，推荐 Python 3.12
-- 可访问 OpenAI-compatible LLM API
-- 对输入目录和输出目录的读写权限
+- Conda、Miniconda 或 Miniforge；
+- **Python 3.12**；
+- 可访问的 OpenAI-compatible 文本模型 API；
+- 输入目录读取权限和输出目录写入权限；
+- 可选：OpenAI-compatible 视觉模型 API，用于图片语义认知。
 
-PDF、Office 文档、Excel 和 QDI 会使用较完整的数据处理依赖。建议安装项目提供的全部 `requirements.txt`，不要只安装 Web 服务依赖。
+项目目前从仓库根目录直接运行，不需要 `pip install -e .`。请始终在含有 `autorealize/` 和 `config/` 的 AutoRealize 根目录执行命令。
 
-## Conda 环境安装
+## 使用 Conda 安装
 
-### 在 AutoDecision 主仓库中使用
-
-推荐直接复用主仓库的 `automl` 环境：
-
-```bash
-cd AutoDecision
-conda env create -f environment.yml
-conda activate automl
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-环境已经存在时，只需激活并同步依赖：
-
-```bash
-conda activate automl
-python -m pip install -r requirements.txt
-```
-
-### 独立安装 AutoRealize
+### 1. 克隆仓库
 
 ```bash
 git clone https://github.com/DonaLdZY/AutoRealize.git
 cd AutoRealize
+```
+
+### 2. 创建 Python 3.12 环境
+
+```bash
 conda create -n autorealize python=3.12 pip -y
 conda activate autorealize
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-确认解释器：
+验证环境：
 
 ```bash
-python -c "import sys; print(sys.executable); print(sys.version)"
+python --version
+python -c "import autorealize; print(autorealize.__file__)"
 ```
 
-## 配置
+第一条命令应输出 `Python 3.12.x`，第二条应指向当前仓库中的 `autorealize/__init__.py`。
 
-默认配置文件是 [`config/config.yaml`](config/config.yaml)。CLI 未指定 `--config` 时自动读取该文件，也可以使用其他位置的 YAML。
-
-主要配置区：
-
-| 配置区 | 作用 |
-| --- | --- |
-| `llm` | 模型、API、重试、并发、thinking、输出 token 和缓存 |
-| `switches` | 数据认知、任务定义、低成本路由和样例提交等流程开关 |
-| `data` | 文件解析、预览、画像、长文档切片和文件名模式抽样 |
-| `investigation` | QDI 问题、动作、脚本、检索和上下文预算 |
-| `prompt` | 控制/输出语言、下游语义消歧、源字段别名消歧和最终一致性审查 |
-| `context` | 稳定前缀、动态记忆压缩、Headroom 比例和 artifact 回读阶段 |
-| `knowledge` | 本地知识检索和候选集内语义重排 |
-| `parallel` | 文件认知 worker 与并发策略 |
-| `telemetry` / `logging` | 事件、详细日志、简略日志和 LLM usage |
-
-API Key 建议通过环境变量提供。Linux / macOS：
+开发和测试还需要：
 
 ```bash
+python -m pip install -r requirements-dev.txt
+```
+
+## 配置模型
+
+默认配置位于 [`config/config.yaml`](config/config.yaml)。建议生成一份仓库外的私有配置，而不是把 API Key 写进受 Git 管理的默认文件。
+
+Linux / macOS：
+
+```bash
+mkdir -p "$HOME/.config/autorealize"
+python -m autorealize.cli --write-default-config "$HOME/.config/autorealize/config.yaml"
 export DEEPSEEK_API_KEY="your_api_key"
 ```
 
 Windows PowerShell：
 
 ```powershell
+New-Item -ItemType Directory -Force "$HOME\.autorealize" | Out-Null
+python -m autorealize.cli --write-default-config "$HOME\.autorealize\config.yaml"
 $env:DEEPSEEK_API_KEY = "your_api_key"
 ```
 
-如果 `llm.api_key` 在 YAML 中非空，则配置值优先；否则读取 `DEEPSEEK_API_KEY`。不要提交包含真实密钥的配置。
+`llm.api_key` 非空时配置文件中的值优先；为 `null` 时读取 `DEEPSEEK_API_KEY`。这个环境变量名也用于其他 OpenAI-compatible 文本模型服务。
 
-查看或导出默认配置：
+### DeepSeek
 
-```bash
-python -m autorealize.cli --print-default-config
-python -m autorealize.cli --write-default-config ./my-config.yaml
+默认配置已经使用 DeepSeek 兼容接口：
+
+```yaml
+llm:
+  base_url: "https://api.deepseek.com"
+  model_name: "deepseek-v4-pro"  # 请改成你的账号实际可用模型
+  api_key: null
+  enable_thinking: null
+  reasoning_effort: null
+  max_concurrent_requests: 4
 ```
 
-## CLI 运行
+对于名称以 `deepseek` 开头且使用官方地址的模型，客户端会把官方根地址归一化到 `/beta`，以兼容 Chat Prefix Completion；普通 Chat Completions 仍通过同一客户端调用。thinking、`reasoning_effort`、JSON mode、缓存 token 和结构化输出长度失败也有 DeepSeek 专用适配及降级重试。
 
-最小运行示例：
+### 其他 OpenAI-compatible Provider
+
+只需在私有 YAML 中替换地址和模型名：
+
+```yaml
+llm:
+  base_url: "https://your-provider.example/v1"
+  model_name: "your-model"
+  api_key: null
+  max_concurrent_requests: 4
+  prompt_cache_key_mode: "auto"
+```
+
+`prompt_cache_key_mode: auto` 只会向 OpenAI 官方端点发送 OpenAI 专属的 `prompt_cache_key`；其他 provider 不会收到该字段。若兼容服务拒绝可选 thinking/cache 参数，客户端会移除对应参数后重试。
+
+### 可选视觉模型
+
+默认配置开启图片语义认知，并从 `AUTOREALIZE_VISION_API_KEY` 或 `VLLM_API_KEY` 读取 Key：
+
+```powershell
+$env:AUTOREALIZE_VISION_API_KEY = "your_vision_api_key"
+```
+
+对应配置：
+
+```yaml
+vllm:
+  enabled: true
+  base_url: "https://your-vision-provider.example/v1"
+  model_name: "your-vision-model"
+  api_key: null
+  fail_silently: true
+```
+
+不需要图片语义或没有视觉模型时，显式关闭它：
+
+```yaml
+vllm:
+  enabled: false
+```
+
+### 最重要的运行参数
+
+完整配置带有中英双语注释，可运行 `python -m autorealize.cli --print-default-config` 查看。以下参数最影响时间、费用或结果：
+
+| 配置                                                     | 影响                                                                         |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `llm.max_concurrent_requests`                          | 文本模型并发上限。先用`4`；provider 限流宽松时再提高                       |
+| `parallel.cognition_max_workers`                       | 文件解析/认知 worker 数；同时受 LLM 并发上限约束                             |
+| `parallel.relations_max_workers`                       | 跨表关系分析并发                                                             |
+| `parallel.probe_max_workers`                           | QDI 探查动作并发                                                             |
+| `data.llm_file_cognition_mode`                         | `all` 最充分；`documents_only` 更省；`none` 仅做规则认知               |
+| `data.table_profile_sample_rows`                       | 单表画像最大行数；设为`null` 才会允许全量读取                              |
+| `investigation.trigger_mode`                           | `always` 全面调查；`on_demand` 只在存在阻断缺口时启动；`disabled` 关闭 |
+| `investigation.max_questions` / `max_rounds_per_run` | QDI 问题数和每题动作预算，直接影响耗时与 token                               |
+| `switches.generate_sample_submission`                  | 是否生成/复用并验证`sample_submission.csv`                                 |
+| `prompt.output_language`                               | 最终自然语言：`zh`、`en` 或 `auto`                                     |
+| `prompt.control_language`                              | LLM 控制指令语言：`zh` 或 `en`；原始证据和标识符保持原样                 |
+| `context.cross_stage_headroom_ratio`                   | 输入上下文占比；其余空间留给模型输出和推理                                   |
+| `context.cross_stage_memory_trigger_chars`             | 动态记忆达到该规模后触发压缩                                                 |
+
+仓库默认并发值面向高吞吐环境。个人 API 账号建议先将 `llm.max_concurrent_requests` 和三个 `parallel.*_workers` 调到 `4` 至 `8`，确认没有 429/超时后再增加。
+
+## CLI 使用
+
+### 最小示例
+
+Linux / macOS：
 
 ```bash
 python -m autorealize.cli \
-  --input-root /path/to/input \
-  --output-root /path/to/output \
-  --run-name demo \
-  --task "预测下个月销量"
-```
-
-指定其他配置：
-
-```bash
-python -m autorealize.cli \
-  --config /path/to/config.yaml \
-  --input-root /path/to/input \
-  --output-root /path/to/output \
-  --run-name demo \
-  --task "预测下个月销量"
+  --config "$HOME/.config/autorealize/config.yaml" \
+  --input-root "/path/to/raw-task" \
+  --output-root "/path/to/runs" \
+  --run-name "sales-forecast" \
+  --task "根据历史订单预测未来 30 天每个商品的销量；以 MAE 评价，输出商品 ID 和预测销量。"
 ```
 
 Windows PowerShell：
 
 ```powershell
 python -m autorealize.cli `
-  --config ".\config\config.yaml" `
-  --input-root "D:\data\demo" `
-  --output-root "D:\runs" `
-  --run-name "demo" `
-  --task "预测下个月销量"
+  --config "$HOME\.autorealize\config.yaml" `
+  --input-root "D:\data\raw-task" `
+  --output-root "D:\data\runs" `
+  --run-name "sales-forecast" `
+  --task "根据历史订单预测未来 30 天每个商品的销量；以 MAE 评价，输出商品 ID 和预测销量。"
 ```
 
-查看全部参数：
+结果写入 `<output-root>/<run-name>/`。`--task` 可以为空，但任务目标、硬约束、指标和输出要求写得越明确，系统越少依赖推断。
+
+### 常用覆盖参数
+
+```text
+--no-cognition                 跳过数据认知
+--no-task-definition           跳过任务定义
+--no-knowledge                 关闭本地知识库
+--no-telemetry                 关闭事件和状态文件
+--no-llm-cache                 关闭本地 LLM 响应缓存
+--llm-timeout SECONDS          覆盖请求超时
+--llm-concurrency N            覆盖 LLM 并发
+--cognition-workers N          覆盖文件认知 worker 数
+--auto-generate-predict-split  在运行副本中生成预测演练切分
+```
+
+完整参数以实际 CLI 为准：
 
 ```bash
 python -m autorealize.cli --help
 ```
 
-## 服务模式
+`--auto-generate-predict-split` 只适合缺少独立预测集、又需要演练预测流程的任务。它会修改本次运行的输入副本，不会修改原始输入目录。
+
+## Python API
+
+```python
+from pathlib import Path
+
+from autorealize import AutoRealizeConfig, AutoRealizePipeline
+
+config = AutoRealizeConfig.from_file(Path.home() / ".config/autorealize/config.yaml")
+pipeline = AutoRealizePipeline(config)
+
+run_dir = pipeline.run(
+    input_root=Path("/path/to/raw-task"),
+    output_root=Path("/path/to/runs"),
+    task_hint="预测未来 30 天销量，并按 MAE 评价。",
+    run_name="sales-forecast",
+)
+print(run_dir)
+```
+
+Windows 可将配置路径改成 `Path.home() / ".autorealize/config.yaml"`。
+
+## FastAPI 服务
+
+在 AutoRealize 仓库根目录启动：
 
 ```bash
+conda activate autorealize
 python -m uvicorn autorealize.service_api:app --host 127.0.0.1 --port 18101
 ```
 
-常用接口：
+交互式 OpenAPI 页面：`http://127.0.0.1:18101/docs`。
 
-- `GET /health`
-- `POST /jobs/start`
-- `GET /jobs/{job_id}`
-- `POST /jobs/stop`
-- `POST /snapshot`
+### 启动任务
 
-访问 `http://127.0.0.1:18101/docs` 查看 OpenAPI 文档。AutoDecision Gateway 通过服务接口传入任务临时 YAML 和运行目录。
+```bash
+curl -X POST "http://127.0.0.1:18101/jobs/start" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_id": "sales-forecast",
+    "input_root": "/absolute/path/to/raw-task",
+    "output_root": "/absolute/path/to/runs",
+    "run_name": "sales-forecast",
+    "task_hint": "预测未来 30 天销量，并按 MAE 评价。",
+    "config_path": "/absolute/path/to/private-config.yaml",
+    "python_executable": "python",
+    "working_dir": "/absolute/path/to/AutoRealize",
+    "auto_generate_predict_split": false
+  }'
+```
+
+`working_dir` 应明确设为 AutoRealize 仓库根目录；`config_path` 建议使用绝对路径。服务会在后台子进程中执行与 CLI 相同的 pipeline，并返回 `job_id`。
+
+### 查询、停止和读取快照
+
+```bash
+# 查询任务状态
+curl "http://127.0.0.1:18101/jobs/<job_id>"
+
+# 停止任务
+curl -X POST "http://127.0.0.1:18101/jobs/stop" \
+  -H "Content-Type: application/json" \
+  -d '{"job_id":"<job_id>"}'
+
+# 汇总前端所需的状态、事件和产物
+curl -X POST "http://127.0.0.1:18101/snapshot" \
+  -H "Content-Type: application/json" \
+  -d '{"run_dir":"/absolute/path/to/runs/sales-forecast"}'
+```
+
+接口清单：
+
+| 方法     | 路径               | 用途                                         |
+| -------- | ------------------ | -------------------------------------------- |
+| `GET`  | `/health`        | 健康检查                                     |
+| `POST` | `/jobs/start`    | 启动一个 AutoRealize 子进程                  |
+| `GET`  | `/jobs/{job_id}` | 查询状态以及 stdout/stderr 尾部              |
+| `POST` | `/jobs/stop`     | 请求停止任务，超时后强制终止                 |
+| `POST` | `/snapshot`      | 读取一次运行的状态、事件、报告和文件认知索引 |
+
+任务状态保存在服务进程内存中；服务重启后旧 `job_id` 不再可查，但已经落盘的运行目录仍可通过 `/snapshot` 读取。
 
 ## 输出目录
 
-一次运行通常生成：
+AutoRealize 先在 `<run-dir>/data/` 处理输入副本，完成后把数据文件平铺回运行根目录。因此最终目录通常是：
 
 ```text
 <output-root>/<run-name>/
+|-- <输入数据文件和目录的副本>
 |-- description.md
-|-- original_requirements.txt
-|-- sample_submission.csv
+|-- description_origin.md                 # 输入原本含 description.md 时生成
+|-- sample_submission.csv                 # 任务需要且成功生成/复用时存在
 `-- realize_report/
+    |-- original_requirements.txt
     |-- data_description.md
-    |-- automl_context.md
     |-- data_cognition_report.json
+    |-- file_cognition/
+    |-- authoritative_task_memory.json
+    |-- constraint_memory.json
     |-- question_investigation_report.json
+    |-- data_access_protocol.json
+    |-- problem_paradigm_report.json
+    |-- description_protocol_bundle.json
     |-- evaluation_contract_report.json
+    |-- submission_report.json
+    |-- automl_context.md
+    |-- automl_context_pack.json
+    |-- main_task_protocol.json
+    |-- artifact_consistency_report.json   # 启用并执行一致性审查时存在
+    |-- frontend_manifest.json
+    |-- current_state.json
     |-- event_stream.jsonl
+    |-- llm_traces.jsonl
     |-- llm_usage.jsonl
     |-- llm_usage_summary.json
     `-- artifacts/
 ```
 
-具体文件名和是否生成某类产物由配置控制。
+下游系统推荐按以下优先级消费：
 
-## 日志与 token 统计
+1. `main_task_protocol.json`：统一机器入口；
+2. `automl_context_pack.json`：数据访问、字段、约束、评估和输出的结构化上下文；
+3. `automl_context.md`：适合与desciption拼接直接放入 Agent 上下文；
+4. `description.md`：供人阅读，也可作为 Kaggle 风格任务说明。
 
-- 简略日志用于快速查看阶段、耗时、调用次数和结果。
-- 详细日志保留解析、QDI、LLM 和异常诊断。
-- `llm_usage.jsonl` 记录逐次调用的输入、缓存读取、缓存写入和输出 token。
-- `llm_usage_summary.json` 按阶段、模型和 prompt 部分汇总。
-- artifact 保留未进入 prompt 的完整证据，便于人工追溯。
+## License
 
-## 测试
-
-```bash
-conda activate autorealize
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-在 AutoDecision 根环境中测试时改为：
-
-```bash
-conda activate automl
-python -m pytest core/AutoRealize/tests -q
-```
-
-默认单元测试应使用 mock，不调用真实 LLM。使用真实模型验证长文档、QDI 或完整任务时会产生 API 费用。
-
-## 常见问题
-
-### 输出中的字段名与数据不一致
-
-检查 `realize_report/automl_context.md` 和字段校验报告。物理字段必须来自实际 schema；业务概念如果需要由多个字段推导，应在任务书中写明推导逻辑，而不是生成一个不存在的列名。
-
-### Excel 没有识别出正确表头
-
-检查文件认知中的 layout evidence 和 reading note。非首行表头、合并单元格或文档式 Excel 可能需要 QDI 进一步探查；不要仅凭默认 `header=0` 读取。
-
-### 相似文件被错误合并认知
-
-提高文件名模式抽样数或启用结构签名检查。代表文件不一致时，系统应继续抽样、拆分分组，或将文件标记为异构而不是强行共享一张卡片。
-
-### QDI 输出过长
-
-完整输出会写入 artifact，prompt 只保留截断片段、动作摘要和引用。需要复查时应使用 artifact 检索或更精确的只读脚本，不应把全部历史输出重新拼回上下文。
-
-### 服务提示缺少 API Key
-
-确认 `config/config.yaml` 的 `llm.api_key` 非空，或在启动服务的同一 Conda 环境中设置 `DEEPSEEK_API_KEY`。
-
-## 安全与许可证
-
-- QDI 只应运行受限的只读探查代码；仍应避免对不可信输入目录授予不必要的系统权限。
-- 不要提交真实 API Key、用户数据、运行 artifact、日志或生成的任务目录。
-- 仓库加入明确许可证前，不应视为已经授权自由使用、修改或再分发。
+本项目采用 [Apache License 2.0](LICENSE)。你可以在许可证条款下使用、修改和分发本项目；再分发时需保留许可证及相关版权/NOTICE 声明，并遵守 Apache-2.0 的专利和商标条款。
