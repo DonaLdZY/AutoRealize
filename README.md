@@ -386,4 +386,6 @@ AutoRealize 先在 `<run-dir>/data/` 处理输入副本，完成后把数据文�
 
 ## License
 
+Copyright 2026 Bydecision.
+
 本项目采用 [Apache License 2.0](LICENSE)。你可以在许可证条款下使用、修改和分发本项目；再分发时需保留许可证及相关版权/NOTICE 声明，并遵守 Apache-2.0 的专利和商标条款。
