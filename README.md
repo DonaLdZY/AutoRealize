@@ -88,8 +88,8 @@ cd AutoRealize
 ### 2. 创建 Python 3.12 环境
 
 ```bash
-conda create -n autorealize python=3.12 pip -y
-conda activate autorealize
+conda create -n autodecision python=3.12 pip -y
+conda activate autodecision
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
@@ -286,7 +286,7 @@ Windows 可将配置路径改成 `Path.home() / ".autorealize/config.yaml"`。
 在 AutoRealize 仓库根目录启动：
 
 ```bash
-conda activate autorealize
+conda activate autodecision
 python -m uvicorn autorealize.service_api:app --host 127.0.0.1 --port 18101
 ```
 
