@@ -49,6 +49,22 @@ def _module_with_capture_llm(tmp_path: Path) -> tuple[TaskDefinitionModule, _Cap
     return TaskDefinitionModule(cfg, services, tmp_path, report_dir), llm
 
 
+def test_low_cost_classifier_does_not_treat_split_rule_as_metric(tmp_path: Path) -> None:
+    mod, llm = _module_with_capture_llm(tmp_path)
+    result = mod._task_classification_from_problem_review(
+        ProblemParadigmReview(problem_paradigm="ml_dl_prediction", confidence=0.99),
+        {"authoritative_memory": {"evaluation_requirements": [
+            "Use chronological 60/20/20 splits.",
+            "Primary metric is MAE in kWh.",
+        ]}},
+    )
+
+    assert result.task_type == "prediction"
+    assert result.primary_metric == ""
+    assert result.metric_formula == ""
+    assert llm.calls == []
+
+
 def test_description_file_pack_excludes_raw_preview_and_keeps_sheet_inventory(tmp_path: Path) -> None:
     mod = _module(tmp_path)
     fs = FileSummary(

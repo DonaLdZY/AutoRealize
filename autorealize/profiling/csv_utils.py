@@ -20,11 +20,19 @@ class CsvDialectHint:
 
 
 def _decode_sample(raw: bytes) -> tuple[str, str]:
-    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+    for enc in ("utf-8-sig", "utf-8"):
         try:
             return raw.decode(enc), enc
         except UnicodeDecodeError:
             continue
+    # Western engineering exports can contain only degree/micro/superscript
+    # symbols. GB18030 can misdecode a degree sign plus ASCII C as one CJK glyph.
+    if all(byte < 128 or byte in {176, 178, 179, 181} for byte in raw):
+        return raw.decode("cp1252"), "cp1252"
+    try:
+        return raw.decode("gb18030"), "gb18030"
+    except UnicodeDecodeError:
+        pass
     return raw.decode("utf-8", errors="replace"), "utf-8"
 
 
@@ -176,4 +184,4 @@ def read_csv_auto(path: Path, *args: Any, **kwargs: Any) -> pd.DataFrame:
     try:
         return pd.read_csv(path, *args, encoding=kwargs.pop("encoding", "utf-8-sig"), **kwargs)
     except UnicodeDecodeError:
-        return pd.read_csv(path, *args, encoding="gb18030", **kwargs)
+        return pd.read_csv(path, *args, encoding=detect_csv_encoding(path), **kwargs)

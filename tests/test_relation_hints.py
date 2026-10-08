@@ -66,3 +66,45 @@ def test_detect_relations_keeps_legacy_shared_columns_fields() -> None:
     assert hint.shared_columns == ["user_id"]
     assert hint.reason == hint.short_evidence
     assert hint.relation_type in {"many_to_many", "shared_attribute"}
+
+
+def test_workbook_default_profile_is_not_a_second_relation_source() -> None:
+    workbook = FileSummary(
+        path="orders.xlsx", role=FileRole.raw_data_table, summary="",
+        columns=["order_id"],
+        source_metadata={"excel_sheet_profiles": [
+            {"sheet_name": "orders", "columns": ["order_id"]},
+            {"sheet_name": "items", "columns": ["order_id"]},
+        ]},
+    )
+    external = FileSummary(
+        path="tracking.csv", role=FileRole.raw_data_table, summary="", columns=["order_id"],
+    )
+    hints = detect_relations(
+        {workbook.path: workbook.columns, external.path: external.columns},
+        file_summaries=[workbook, external],
+    )
+    pairs = {frozenset((hint.left_file, hint.right_file)) for hint in hints}
+    assert all(workbook.path not in pair for pair in pairs)
+    assert frozenset(("orders.xlsx::orders", "orders.xlsx::items")) in pairs
+    assert frozenset(("orders.xlsx::orders", "tracking.csv")) in pairs
+    assert frozenset(("orders.xlsx::items", "tracking.csv")) in pairs
+
+
+def test_document_field_descriptions_are_not_joinable_observations() -> None:
+    data = FileSummary(path="orders.csv", role=FileRole.raw_data_table, summary="", columns=["id"])
+    prose = FileSummary(
+        path="requirements.pdf", role=FileRole.task_requirement, summary="The data has an id column",
+        columns=["id"], source_metadata={"kind": "document"},
+    )
+    assert detect_relations(
+        {data.path: data.columns, prose.path: prose.columns}, file_summaries=[data, prose],
+    ) == []
+    extracted = FileSummary(
+        path="requirements.pdf::table1", role=FileRole.raw_data_table, summary="Extracted table",
+        columns=["id"], source_metadata={"kind": "table"},
+        column_profiles=[_profile("id", unique_count=2, row_count=2)],
+    )
+    assert detect_relations(
+        {data.path: data.columns, extracted.path: extracted.columns}, file_summaries=[data, extracted],
+    )

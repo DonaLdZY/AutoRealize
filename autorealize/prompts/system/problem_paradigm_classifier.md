@@ -34,6 +34,6 @@
 候选只是有证据的建模入口，不得把某一种状态、动作、奖励或算法写成唯一事实。不要使用任何特定行业模板，不要发明输入中不存在的实体、字段、环境或轨迹。
 
 其它要求：
-- `requires_sample_submission` 只有在权威输出合同明确要求表格提交时才为 true。
+- `requires_sample_submission` 只有在来源明确要求样例文件或已提供官方样例时才为 true。要求表格形式的预测/决策输出，不等于必须提供 sample_submission；系统可以另用 should_generate 生成可选格式样例，不把它称为官方要求。
 - `evidence`、`key_signals` 和 method routing notes 必须引用具体输入事实。
 - `recommended_solver_families` 保留为兼容字段，其内容应与 allowed method families 一致，不再强制 baseline 优先级。

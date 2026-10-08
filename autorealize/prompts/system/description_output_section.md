@@ -34,6 +34,8 @@ sample_submission_spec 要求：
 - `row_unit` 和 `row_count_rule` 必须可执行；不确定就写入 `no_sample_submission_reason`，不要硬猜。
 - `format_rules` 和 `validation_rules` 只写输出相关规则。
 - `source_fields` 必须覆盖所有非占位列；若某列来自模型决策而不是输入字段，应在 `format_rules` 中标明它是“决策输出/派生占位”，并说明可接受的构造规则。
+- 源字段引用使用精确的 `文件::Sheet::字段`（CSV 使用 `文件::字段`），解释放在引用外；不要把 `source_file=...`、`sheet_name=...`、DataFrame 等说明文字伪装成列名。输出列不是源列，真实标签引用与模型预测值分别说明。
+- 配置要求生成格式样例不代表来源要求提交样例。没有官方样例或明确来源要求时，将其说明为可选生成样例；保持样例格式检查与最终预测验证分离。
 
 上下文使用原则：
 - 只使用 output evidence、冻结任务定义和评估合同。

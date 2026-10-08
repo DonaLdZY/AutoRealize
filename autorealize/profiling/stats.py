@@ -182,6 +182,12 @@ def profile_excel_sheets(
                 shape = [int(preview_df.shape[0]), int(preview_df.shape[1])]
                 shape_estimated = True
             columns = [str(c) for c in preview_df.columns.tolist()]
+            profiled_reader = {"schema_version": "autorealize.excel_read_contract.v1",
+                "pandas_kwargs": {"sheet_name": sheet, "header": 0, "skiprows": 0},
+                "columns_exact": columns, "read_parameters_verified": True,
+                "verification_scope": "actual_profile_reader_not_inferred_header_suggestion"}
+            if path.suffix.lower() == ".xlsx":
+                profiled_reader["pandas_kwargs"]["engine"] = "openpyxl"
             layout = infer_excel_sheet_layout(
                 raw_preview=raw_preview,
                 default_columns=columns,
@@ -195,6 +201,7 @@ def profile_excel_sheets(
                     "shape_estimated": shape_estimated,
                     "preview_rows_used": int(len(preview_df)),
                     "columns": columns,
+                    "profiled_read_contract": profiled_reader,
                     "dtypes": {str(k): str(v) for k, v in preview_df.dtypes.to_dict().items()},
                     "preview": _records(preview_df.head(max(1, int(preview_rows)))),
                     "raw_preview": raw_preview,

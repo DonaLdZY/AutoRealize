@@ -10,6 +10,7 @@ from autorealize.investigation import (
     CrossFileInvestigationTools,
     _available_qdi_actions,
     _terminal_qdi_actions,
+    _reading_strategy_verification_questions,
     run_custom_readonly_python,
     validate_custom_readonly_python,
 )
@@ -17,6 +18,50 @@ from autorealize.models import InvestigationToolRequest
 from autorealize.models import ReadonlyPythonRequest
 from autorealize.parsers.table_parser import TableParser
 from autorealize.profiling.csv_utils import infer_csv_dialect, read_csv_auto
+
+
+def test_reading_checks_skip_documents_and_verified_standard_sheet() -> None:
+    from autorealize.context_compiler import file_to_table_cards
+    from autorealize.models import FileRole, FileSummary
+
+    sheet = FileSummary(
+        path="links.xlsx", role=FileRole.raw_data_table, summary="",
+        source_metadata={"excel_sheet_profiles": [{
+            "sheet_name": "links", "columns": ["id"], "layout_kind": "standard_table",
+            "header_confidence": 0.804, "read_strategy_kind": "default_header",
+            "recommended_read": "pd.read_excel(path, sheet_name='links')",
+            "raw_preview": [["id"], [1]], "reading_risks": [],
+        }]},
+    )
+    cards = file_to_table_cards(sheet)
+    cards.extend([
+        {"table_id": "requirements.pdf", "warnings": ["CSV encoding and header need verification"]},
+        {"table_id": "requirements.docx", "table_kind": "document", "warnings": ["Inspect sheet mapping"]},
+    ])
+    assert _reading_strategy_verification_questions({"table_cards": cards}) == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"layout_kind": "headerless_table", "read_strategy_kind": "header_none_table"},
+    {"layout_kind": "non_default_header", "read_strategy_kind": "explicit_header_row"},
+    {"layout_kind": "sparse_or_irregular_sheet", "read_strategy_kind": "header_none_inspect"},
+    {"layout_kind": "document_like_sheet", "read_strategy_kind": "header_none_document"},
+    {"header_confidence": 0.4},
+    {"header_confidence": "unknown"},
+    {"warnings": ["Header mismatch after full read"]},
+    {"reading_risks": ["Merged cells may conceal labels"]},
+    {"table_id": "cooling.csv", "table_kind": "csv_table", "layout_kind": "", "reading_notes": ["CSV non-default separator hint: sep=';' and encoding='cp1252'"]},
+])
+def test_reading_checks_preserve_uncertain_or_abnormal_reader_contracts(changes) -> None:
+    card = {
+        "table_id": "links.xlsx::links", "table_kind": "excel_sheet",
+        "layout_kind": "standard_table", "read_strategy_kind": "default_header",
+        "header_confidence": 0.9, "reading_notes": ["Recommended read for this sheet: pd.read_excel(path)"],
+    }
+    card.update(changes)
+    questions = _reading_strategy_verification_questions({"table_cards": [card]})
+    assert len(questions) == 1
+    assert questions[0].category == "data_access"
 
 
 def _tools(input_dir: Path) -> CrossFileInvestigationTools:
@@ -107,6 +152,26 @@ def test_csv_dialect_probe_rereads_semicolon_decimal_comma_and_observes_numeric_
         "representation": "numeric_0_1",
         "observed_values": ["0", "1"],
     }
+
+
+def test_preview_integers_do_not_become_full_table_dtype_constraints(tmp_path: Path) -> None:
+    path = tmp_path / "values.csv"
+    path.write_text("value\n0\n0\n0.125\n", encoding="utf-8")
+    parsed = TableParser(preview_rows=2).parse(path)
+    contract = parsed.metadata["csv_read_contract"]
+    assert contract["observed_preview_dtypes"]["value"] == "int64"
+    assert contract["dtype_validation_scope"] == "preview_only"
+    assert "validated_dtypes" not in contract
+    frame = pd.read_csv(path, **contract["pandas_kwargs"])
+    assert frame["value"].iloc[-1] == pytest.approx(0.125)
+
+
+def test_reactive_power_is_not_a_boolean_flag(tmp_path: Path) -> None:
+    path = tmp_path / "values.csv"
+    path.write_text("Leading_Current_Reactive_Power_kVarh,is_active\n0,0\n0,0\n0.125,1\n", encoding="utf-8")
+    contract = TableParser(preview_rows=2).parse(path).metadata["csv_read_contract"]
+    assert "Leading_Current_Reactive_Power_kVarh" not in contract["boolean_like_columns"]
+    assert "is_active" in contract["boolean_like_columns"]
 
 
 def test_custom_readonly_python_can_write_scratch_but_not_input(tmp_path: Path) -> None:
@@ -205,6 +270,33 @@ def analyze(input_dir: str, scratch_dir: str) -> dict:
     )
 
     assert issues == []
+
+
+def test_slash_missing_marker_does_not_request_script_repair(tmp_path: Path) -> None:
+    code = '''
+def analyze(input_dir: str, scratch_dir: str) -> dict:
+    values = ["A", "/", "B", "/"]
+    return {"missing": sum(value == "/" for value in values)}
+'''
+    assert validate_custom_readonly_python(code) == []
+    assert run_custom_readonly_python(code, input_dir=tmp_path, cfg=AutoRealizeConfig())["missing"] == 2
+
+
+def test_slash_literal_does_not_allow_root_directory_access(tmp_path: Path) -> None:
+    code = '''
+from pathlib import Path
+def analyze(input_dir: str, scratch_dir: str) -> dict:
+    return {"entries": [str(path) for path in Path("/").iterdir()]}
+'''
+    result = run_custom_readonly_python(code, input_dir=tmp_path, cfg=AutoRealizeConfig())
+    assert result["error"] == "custom_python_exit_code:1"
+    assert "refused read outside input_dir/scratch_dir" in result["stderr_tail"]
+
+
+@pytest.mark.parametrize("literal", ["/etc/passwd", "C:/Windows/system.ini", "../secrets.txt"])
+def test_full_absolute_and_traversal_literals_remain_rejected(literal) -> None:
+    code = f"def analyze(input_dir: str, scratch_dir: str) -> dict:\n    return {{'path': {literal!r}}}"
+    assert any("path_" in issue for issue in validate_custom_readonly_python(code))
 
 
 def test_document_retrieval_actions_do_not_depend_on_script_budget() -> None:

@@ -173,7 +173,7 @@ def _summarize_document_full_text(
             cfg,
             llm,
             prompt_mgr,
-            base_context,
+            {**base_context, "document_excerpt": full_text, "document_excerpt_chars": len(full_text)},
             CognitionProbePlan(need_more_probe=False),
             {},
         )
@@ -1328,4 +1328,3 @@ def _map_role(text: str) -> FileRole:
         "unknown": FileRole.unknown,
     }
     return mp.get(m, FileRole.unknown)
-

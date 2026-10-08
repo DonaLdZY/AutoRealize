@@ -577,6 +577,7 @@ def compact_detail_table_card_for_prompt(card: dict[str, Any], *, field_limit: i
             "detected_header_row": card.get("detected_header_row"),
             "read_strategy_kind": card.get("read_strategy_kind"),
             "recommended_read": str(card.get("recommended_read", "") or "")[:240],
+            "reading_risks": card.get("reading_risks"),
             "fields": compact_fields,
             "reading_notes": [str(x)[:180] for x in (card.get("reading_notes") or [])[:4]],
             "warnings": [str(x)[:180] for x in (card.get("warnings") or [])[:4]],
@@ -642,6 +643,7 @@ def build_table_cards(
 def reconcile_table_shape(
     table: dict[str, Any],
     column_profiles: list[dict[str, Any]] | None = None,
+    *, is_worksheet: bool = True,
 ) -> dict[str, Any]:
     """Separate worksheet used range from verified parsed data rows.
 
@@ -670,7 +672,7 @@ def reconcile_table_shape(
     profile_rows = Counter(counts).most_common(1)[0][0] if counts else None
 
     parsed_rows: int | None = None
-    basis = "worksheet_used_range"
+    basis = "worksheet_used_range" if is_worksheet else "reader_shape_unverified"
     confidence = "medium"
     if not is_sampled:
         if profile_rows is not None:
@@ -682,8 +684,7 @@ def reconcile_table_shape(
             basis = "full_profiled_shape"
             confidence = "high"
 
-    if parsed_rows is None and physical_shape:
-        parsed_rows = physical_shape[0]
+    reported_rows = physical_shape[0] if physical_shape else None
     column_count = (
         (profiled_shape or sampled_shape or physical_shape or [0, 0])[1]
         or len(table.get("columns") or [])
@@ -700,7 +701,9 @@ def reconcile_table_shape(
         "verified_row_count": parsed_rows,
         "row_count_basis": basis,
         "row_count_confidence": confidence,
-        "worksheet_used_range_shape": physical_shape,
+        "reported_row_count": reported_rows,
+        "worksheet_used_range_shape": physical_shape if is_worksheet else None,
+        "reader_reported_shape": physical_shape if not is_worksheet else None,
         "profiled_shape": profiled_shape,
         "sampled_shape": sampled_shape,
         "profile_is_sampled": is_sampled,
@@ -715,9 +718,16 @@ def reconcile_table_shape(
     elif is_sampled:
         result["row_count_note"] = (
             "Field profiles are sampled; their row_count is not the full table population. "
-            "Use worksheet/reader shape until a full count is computed."
+            "Worksheet/reader shape is provisional, not a verified population count. Compute a full count before evaluation."
         )
     return _drop_empty(result)
+
+
+def source_columns_exact(fs: Any) -> list[str]:
+    metadata = getattr(fs, "source_metadata", {}) or {}
+    contract = metadata.get("csv_read_contract") or {}
+    columns = contract.get("validated_columns_exact") or getattr(fs, "columns", []) or []
+    return [str(column) for column in columns]
 
 
 def primary_key_candidates(fields: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
@@ -796,14 +806,16 @@ def build_source_coverage_ledger(
                     "table_kind": table_kind,
                     "source_role": role,
                     "coverage_status": coverage_status,
-                    "verified_shape": card.get("shape"),
+                    "verified_shape": card.get("shape") if card.get("verified_row_count") is not None else None,
+                    "reader_reported_shape": card.get("reader_reported_shape"),
                     "verified_row_count": card.get("verified_row_count"),
                     "row_count_basis": card.get("row_count_basis"),
                     "worksheet_used_range_shape": card.get("worksheet_used_range_shape"),
                     "row_count_conflict": card.get("row_count_conflict"),
                     "layout_kind": card.get("layout_kind"),
                     "recommended_read": card.get("recommended_read"),
-                    "schema_signature_fields": [str(field.get("name")) for field in fields[:16] if field.get("name")],
+                    "schema_signature_fields": (card.get("physical_columns_exact") or [str(field.get("name")) for field in fields if field.get("name")])[:16],
+                    "schema_signature_scope": "preview_only; not a complete ordered physical schema",
                     "field_count": len(fields),
                     "primary_key_candidates": card.get("primary_key_candidates") or primary_key_candidates(fields),
                     "coverage_rule": (
@@ -884,6 +896,8 @@ def build_population_verification_queue(
         if not isinstance(card, dict):
             continue
         row_count = card.get("verified_row_count")
+        if row_count is None:
+            row_count = card.get("reported_row_count")
         try:
             rows = int(row_count)
         except (TypeError, ValueError):
@@ -903,13 +917,19 @@ def build_population_verification_queue(
                 non_null = int(field.get("non_null_count"))
             except (TypeError, ValueError):
                 continue
-            if 0 < non_null < rows:
+            try:
+                profile_rows = int(field.get("row_count"))
+            except (TypeError, ValueError):
+                profile_rows = None if card.get("profile_is_sampled") else rows
+            if profile_rows is not None and 0 <= non_null < profile_rows:
                 relevant_fields.append(
                     {
                         "field": name,
+                        "profile_row_count": profile_rows,
+                        "statistics_scope": "sample" if profile_rows != rows or card.get("profile_is_sampled") else "full_table",
                         "non_null_count": non_null,
-                        "missing_count": rows - non_null,
-                        "non_null_ratio": round(non_null / max(1, rows), 6),
+                        "missing_count": profile_rows - non_null,
+                        "non_null_ratio": round(non_null / max(1, profile_rows), 6),
                     }
                 )
             datetime_stats = field.get("datetime_stats") if isinstance(field.get("datetime_stats"), dict) else {}
@@ -929,7 +949,8 @@ def build_population_verification_queue(
         queue.append(
             {
                 "table_id": card.get("table_id"),
-                "verified_row_count": rows,
+                "verified_row_count": card.get("verified_row_count"),
+                "reported_row_count": rows,
                 "best_statistical_key_candidate": best_key,
                 "population_sensitive_fields": relevant_fields[:12],
                 "status": "needs_evaluation_population_rule",
@@ -1014,11 +1035,13 @@ def file_to_table_cards(
                         "file_cognition": summary[:350],
                         "shape": shape_facts.get("verified_shape"),
                         "verified_row_count": shape_facts.get("verified_row_count"),
+                        "reported_row_count": shape_facts.get("reported_row_count"),
                         "row_count_basis": shape_facts.get("row_count_basis"),
                         "row_count_confidence": shape_facts.get("row_count_confidence"),
                         "worksheet_used_range_shape": shape_facts.get("worksheet_used_range_shape"),
                         "row_count_conflict": shape_facts.get("row_count_conflict"),
                         "row_count_note": shape_facts.get("row_count_note"),
+                        "profile_is_sampled": shape_facts.get("profile_is_sampled"),
                         "profile_policy": sheet.get("profile_policy"),
                         "sheet_group_id": sheet.get("sheet_group_id"),
                         "sheet_group_size": sheet.get("sheet_group_size"),
@@ -1028,6 +1051,7 @@ def file_to_table_cards(
                         "detected_header_row": sheet.get("detected_header_row"),
                         "read_strategy_kind": sheet.get("read_strategy_kind"),
                         "recommended_read": sheet.get("recommended_read"),
+                        "reading_risks": sheet.get("reading_risks"),
                         "fields": field_cards,
                         "primary_key_candidates": primary_key_candidates(field_cards),
                         "reading_notes": _reading_notes(path, meta, sheet_name=sheet_name, sheet=sheet),
@@ -1038,9 +1062,9 @@ def file_to_table_cards(
             )
         return cards
 
-    columns = [str(x) for x in (getattr(fs, "columns", []) or [])]
+    columns = source_columns_exact(fs)
     non_excel_fields = _field_cards(columns, profiles, semantics, limit=field_limit)
-    non_excel_shape = reconcile_table_shape(meta, profiles)
+    non_excel_shape = reconcile_table_shape(meta, profiles, is_worksheet=False)
     return [
         _drop_empty(
             {
@@ -1051,11 +1075,15 @@ def file_to_table_cards(
                 "file_cognition": summary[:350],
                 "shape": non_excel_shape.get("verified_shape"),
                 "verified_row_count": non_excel_shape.get("verified_row_count"),
+                "reported_row_count": non_excel_shape.get("reported_row_count"),
                 "row_count_basis": non_excel_shape.get("row_count_basis"),
                 "worksheet_used_range_shape": non_excel_shape.get("worksheet_used_range_shape"),
+                "reader_reported_shape": non_excel_shape.get("reader_reported_shape"),
                 "row_count_conflict": non_excel_shape.get("row_count_conflict"),
                 "row_count_note": non_excel_shape.get("row_count_note"),
+                "profile_is_sampled": non_excel_shape.get("profile_is_sampled"),
                 "fields": non_excel_fields,
+                "physical_columns_exact": columns,
                 "primary_key_candidates": primary_key_candidates(non_excel_fields),
                 "reading_notes": _reading_notes(path, meta),
                 "warnings": _warnings(fs, {}),
@@ -1157,44 +1185,17 @@ def build_filename_group_cards(groups: Any, *, file_summaries: list[Any], limit:
 
 
 def compact_constraint_memory(memory: Any) -> dict[str, Any]:
+    """Preserve the complete ledger; prompt serialization removes duplication."""
     if not isinstance(memory, dict):
         return {}
-    items = [
-        item
-        for item in (memory.get("items", []) or [])
-        if not isinstance(item, dict)
-        or str(item.get("status", "current_candidate") or "current_candidate")
-        not in {"superseded", "not_current", "resolved"}
-    ]
-    return {
-        "summary": str(memory.get("summary", ""))[:1200],
-        "items": items[:40],
-        "unresolved_questions": [str(x)[:500] for x in (memory.get("unresolved_questions", []) or [])[:20]],
-    }
+    return dict(memory)
 
 
 def compact_authoritative_memory(memory: Any) -> dict[str, Any]:
+    """Keep exact requirements and their statuses, including long tail rules."""
     if not isinstance(memory, dict):
         return {}
-    return {
-        "summary": str(memory.get("summary", ""))[:1500],
-        "task_goal": str(memory.get("task_goal", ""))[:1500],
-        "source_files": [str(x) for x in (memory.get("source_files", []) or [])[:30]],
-        "input_requirements": [str(x)[:500] for x in (memory.get("input_requirements", []) or [])[:20]],
-        "output_requirements": [str(x)[:500] for x in (memory.get("output_requirements", []) or [])[:20]],
-        "evaluation_requirements": [str(x)[:500] for x in (memory.get("evaluation_requirements", []) or [])[:20]],
-        "constraints": [str(x)[:500] for x in (memory.get("constraints", []) or [])[:30]],
-        "leakage_guards": [str(x)[:500] for x in (memory.get("leakage_guards", []) or [])[:20]],
-        "unresolved_questions": [str(x)[:500] for x in (memory.get("unresolved_questions", []) or [])[:20]],
-        "authority_conflicts": (memory.get("authority_conflicts", []) or [])[:20],
-        "requirement_fact_matrix": [
-            item
-            for item in (memory.get("requirement_fact_matrix", []) or [])
-            if isinstance(item, dict)
-            and str(item.get("status", "") or "") in {"current", "unresolved"}
-        ][:40],
-        "submission_contract": memory.get("submission_contract", {}) if isinstance(memory.get("submission_contract", {}), dict) else {},
-    }
+    return dict(memory)
 
 
 def compact_sampled_patterns(patterns: Any) -> list[dict[str, Any]]:
@@ -1315,17 +1316,17 @@ def _order_columns(columns: list[str], semantics: dict[str, Any], profiles: dict
 
 def field_role(field: str, meaning: str = "") -> str:
     text = f"{field} {meaning}".lower()
-    if any(k in text for k in ["id", "key", "code", "??", "??", "???", "??", "??", "??", "??"]):
+    if any(k in text for k in ["id", "key", "code", "编号", "编码", "单号", "标识", "代码", "主键", "外键", "序号"]):
         return "id_or_key"
-    if any(k in text for k in ["date", "time", "??", "??", "??", "??"]):
+    if any(k in text for k in ["date", "time", "日期", "时间", "时刻", "月份"]):
         return "time"
-    if any(k in text for k in ["target", "label", "??", "??"]):
+    if any(k in text for k in ["target", "label", "目标", "标签"]):
         return "target"
-    if any(k in text for k in ["cost", "price", "amount", "fee", "rate", "??", "??", "??", "??", "??", "score", "??"]):
+    if any(k in text for k in ["cost", "price", "amount", "fee", "rate", "金额", "价格", "成本", "费用", "费率", "score", "分数"]):
         return "cost_or_value"
-    if any(k in text for k in ["constraint", "limit", "capacity", "??", "??", "??", "??", "??"]):
+    if any(k in text for k in ["constraint", "limit", "capacity", "约束", "限制", "容量", "上限", "下限"]):
         return "constraint"
-    if any(k in text for k in ["submission", "output", "??", "??", "??", "????"]):
+    if any(k in text for k in ["submission", "output", "提交", "输出", "交付物", "预测结果"]):
         return "output"
     return "other"
 
@@ -1354,7 +1355,7 @@ def _reading_notes(path: str, meta: dict[str, Any], *, sheet_name: str = "", she
             notes.append("Detected sparse/irregular sheet; inspect with header=None before deciding a table schema.")
         raw_preview = sheet.get("raw_preview")
         if raw_preview:
-            notes.append("This sheet has header=None raw preview in artifact; opening rows may contain notes or non-default headers.")
+            notes.append("A header=None raw preview is available in the artifact for checking the detected layout.")
     if lower.endswith(".csv"):
         dialect = meta.get("csv_dialect") if isinstance(meta.get("csv_dialect"), dict) else {}
         encoding = str(meta.get("csv_encoding", "") or "")

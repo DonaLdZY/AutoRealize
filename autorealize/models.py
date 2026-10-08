@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 ShortReviewText = Annotated[str, StringConstraints(max_length=240)]
 
@@ -465,6 +465,15 @@ class QDIArtifactExcerptRequest(BaseModel):
     reason: str = ""
 
 
+class QDIMemoryResolution(BaseModel):
+    """Explicitly retire one prior interpretation; source evidence stays intact."""
+
+    field: Literal["open_gaps", "confirmed_facts", "temporary_conclusions"]
+    text: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
 class QDIWorkingMemoryUpdate(BaseModel):
     """Evidence-linked incremental memory emitted by an existing QDI action call."""
 
@@ -474,6 +483,7 @@ class QDIWorkingMemoryUpdate(BaseModel):
     open_gaps: list[str] = Field(default_factory=list)
     invalidated_hypotheses: list[str] = Field(default_factory=list)
     recommended_next_focus: str = ""
+    resolutions: list[QDIMemoryResolution] = Field(default_factory=list)
 
 
 class QDIActionDigest(BaseModel):
@@ -491,7 +501,7 @@ class QDIActionDigest(BaseModel):
 class QuestionInvestigationAction(BaseModel):
     """Tool-call style action for the single-question QDI loop."""
 
-    action: str = "give_up"  # answer/request_script/request_context/search_document/read_document_chunks/read_qdi_artifact_excerpt/...
+    action: str = Field(min_length=1)  # answer/request_script/request_context/search_document/read_document_chunks/read_qdi_artifact_excerpt/...
     question_id: str = ""
     answer: str = ""
     confidence: str = "medium"
@@ -512,6 +522,14 @@ class QuestionInvestigationAction(BaseModel):
     action_digest_updates: list[QDIActionDigest] = Field(default_factory=list)
     followup_questions: list[QuestionInvestigationFollowupQuestion] = Field(default_factory=list)
     notes: str = ""
+
+    @model_validator(mode="after")
+    def require_explicit_action_and_give_up_reason(self) -> "QuestionInvestigationAction":
+        if not self.action.strip():
+            raise ValueError("A QDI response must specify a nonempty action.")
+        if self.action.strip().lower() == "give_up" and not self.unresolved_reason.strip():
+            raise ValueError("A give_up action must include a nonempty unresolved_reason.")
+        return self
 
 
 class QuestionInvestigationReport(BaseModel):
@@ -559,6 +577,11 @@ class EvaluationContractReview(BaseModel):
     passed: bool = False
     executable: bool = False
     authority_status: str = "unresolved"  # official/autorealize_assumption/unresolved
+    ranking_scope: Literal["task_effectiveness", "software_contract_checks"] = "task_effectiveness"
+    score_representation: Literal["scalar", "lexicographic", "vector", "pareto"] = Field(
+        default="scalar",
+        description="Shape of the FINAL search score, not intermediate objective components. Only scalar is executable; repair other representations into one finite numeric formula.",
+    )
     primary_metric: str = ""
     metric_direction: str = ""  # minimize/maximize
     metric_formula: str = ""
@@ -596,8 +619,8 @@ class SubmissionContract(BaseModel):
 
     is_defined: bool = False
     is_authoritative: bool = False
-    output_filename: str = "submission.csv"
-    sample_filename: str = "sample_submission.csv"
+    output_filename: str = ""
+    sample_filename: str = ""
     columns: list[str] = Field(default_factory=list)
     column_descriptions: dict[str, str] = Field(default_factory=dict)
     row_unit: str = ""
@@ -756,6 +779,8 @@ class ConstraintItem(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     related_fields: list[str] = Field(default_factory=list)
     priority: str = "medium"  # high/medium/low
+    strength: Literal["hard", "soft", "unknown"] = "unknown"
+    acceptance_check: str = ""
     status: str = "current_candidate"  # current_candidate/superseded/not_current/unresolved
     status_reason: str = ""
 
@@ -824,6 +849,7 @@ class AutoMLContextPack(BaseModel):
     requirement_fact_matrix: list[dict[str, Any]] = Field(default_factory=list)
     output_contract: dict[str, Any] = Field(default_factory=dict)
     evaluation_contract: dict[str, Any] = Field(default_factory=dict)
+    execution_contract: dict[str, Any] = Field(default_factory=dict)
     method_strategy: dict[str, Any] = Field(default_factory=dict)
     relation_cards: list[dict[str, Any]] = Field(default_factory=list)
     filename_sample_groups: list[dict[str, Any]] = Field(default_factory=list)
@@ -927,4 +953,16 @@ class ArtifactConsistencyReview(BaseModel):
 class ArtifactConsistencyPatch(BaseModel):
     revised_sections: dict[str, str] = Field(default_factory=dict)
     addressed_issue_ids: list[str] = Field(default_factory=list)
+    unresolved_issue_ids: list[str] = Field(default_factory=list)
+
+
+class OpenQuestionResolution(BaseModel):
+    original_text: str
+    remaining_questions: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    reason: str
+
+
+class OpenQuestionRepair(BaseModel):
+    resolutions: list[OpenQuestionResolution] = Field(default_factory=list)
     unresolved_issue_ids: list[str] = Field(default_factory=list)

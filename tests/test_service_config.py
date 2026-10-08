@@ -4,7 +4,20 @@ import json
 from pathlib import Path
 
 from autorealize.config import AutoRealizeConfig
-from autorealize.service_api import _build_snapshot
+from autorealize.service_api import _build_snapshot, _extract_last_error_from_output
+
+
+def test_error_summary_preserves_final_deadline_exception():
+    text = ("Traceback (most recent call last):\nhttpx.ReadError: socket closed\n"
+            "The above exception was the direct cause of the following exception:\n"
+            "Traceback (most recent call last):\n  File 'client.py', line 1\n"
+            "autorealize.llm.client.StreamDeadlineExceeded: Completion stream exceeded its wall-clock deadline\n")
+    assert _extract_last_error_from_output(text) == text.splitlines()[-1]
+
+
+def test_error_summary_skips_pydantic_documentation():
+    text = "ValueError: invalid contract\nFor further information visit https://errors.pydantic.dev/2\n"
+    assert _extract_last_error_from_output(text) == "ValueError: invalid contract"
 
 
 def test_snapshot_uses_resolved_yaml_filenames_and_limits(tmp_path: Path) -> None:

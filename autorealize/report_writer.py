@@ -16,7 +16,9 @@ from .models import (
     PipelinePlan,
 )
 from .entity_alias import build_entity_alias_candidates, enrich_entity_alias_candidates_with_coverage
-from .context_compiler import build_relation_verification_queue, build_source_coverage_ledger, reconcile_table_shape
+from .context_compiler import build_relation_verification_queue, build_source_coverage_ledger, reconcile_table_shape, source_columns_exact
+from .execution_contract import build_execution_contract
+from .scalar_score import scalar_score_shape_defects
 from .profiling.relations import RelationHint
 
 
@@ -504,6 +506,52 @@ def _excel_sheet_names_from_metadata(fs: FileSummary) -> list[str]:
     return _dedupe_any(raw, limit=20)
 
 
+def _standard_excel_read_contract(fs: FileSummary, sheet: dict) -> dict:
+    profiled = sheet.get("profiled_read_contract", {})
+    if profiled.get("columns_exact") == sheet.get("columns") and profiled.get("read_parameters_verified") is True:
+        kwargs = dict(profiled["pandas_kwargs"])
+        example = "pd.read_excel(" + repr(_quote_input_path(fs.path)) + ", " + ", ".join(
+            f"{key}={value!r}" for key, value in kwargs.items()) + ")"
+        return {**profiled, "path": fs.path, "read_example": example, "column_access": "named",
+                "requires_full_parse_before_evaluation": True, "population_verified": False}
+    empty = (reconcile_table_shape(sheet).get("verified_row_count") == 0
+             and not sheet.get("columns"))
+    layout = sheet.get("layout_kind")
+    header = sheet.get("detected_header_row")
+    explicit = layout in {"standard_table", "non_default_header"} and type(header) is int and header >= 0
+    positional = layout in {"headerless_table", "sparse_or_irregular_sheet", "document_like_sheet"}
+    if not empty and not explicit and not positional:
+        return {}
+    name = str(sheet.get("sheet_name") or "")
+    if not name:
+        return {}
+    kwargs = {"sheet_name": name, "header": header if explicit and not empty else None, "skiprows": 0}
+    if Path(fs.path).suffix.lower() == ".xlsx":
+        kwargs["engine"] = "openpyxl"
+    example = "pd.read_excel(" + repr(_quote_input_path(fs.path)) + ", " + ", ".join(
+        f"{key}={value!r}" for key, value in kwargs.items()) + ")"
+    return {"schema_version": "autorealize.excel_read_contract.v1", "path": fs.path,
+            "pandas_kwargs": kwargs, "read_example": example,
+            "columns_exact": list(sheet.get("columns") or []) if explicit and not empty else [],
+            "column_access": "named" if explicit and not empty else "integer_position",
+            "profiled_signature_fields": list(sheet.get("columns") or []) if positional else [],
+            "verification_scope": ("verified_empty_sheet_inspection" if empty else
+                                   "raw_layout_inspection_required" if positional else "profiled_sheet_name_and_header_layout"),
+            "population_verified": False, "requires_full_parse_before_evaluation": True}
+
+
+def _sole_populated_excel_sheet(fs: FileSummary) -> dict | None:
+    names = set(_excel_sheet_names_from_metadata(fs))
+    sheets = _excel_sheet_profiles(fs)
+    if not names or {item.get("sheet_name") for item in sheets} != names:
+        return None
+    counts = [(item, reconcile_table_shape(item).get("verified_row_count")) for item in sheets]
+    if any(count is None for _, count in counts):
+        return None
+    populated = [item for item, count in counts if count > 0]
+    return populated[0] if len(populated) == 1 and _standard_excel_read_contract(fs, populated[0]) else None
+
+
 def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
     """Return read method, executable example, and parsing notes for a file."""
     path = str(fs.path or "")
@@ -540,12 +588,22 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
     if suffix in {".xlsx", ".xls"}:
         sheet_names = _excel_sheet_names_from_metadata(fs)
         sheet_profiles = _excel_sheet_profiles(fs)
+        if len(sheet_names) == 1:
+            sheet = next((item for item in sheet_profiles if item.get("sheet_name") == sheet_names[0]), {})
+            if sheet.get("profiled_read_contract", {}).get("read_parameters_verified"):
+                contract = _standard_excel_read_contract(fs, sheet)
+                if contract:
+                    return "pandas.read_excel", contract["read_example"], list(sheet.get("reading_risks") or [])
         abnormal = [
             sheet
             for sheet in sheet_profiles
             if isinstance(sheet, dict) and str(sheet.get("layout_kind", "") or "") not in {"", "standard_table"}
         ]
         if len(sheet_names) > 1:
+            sole = _sole_populated_excel_sheet(fs)
+            if sole:
+                notes.append("Full sheet profiles identify one populated sheet; the other sheets are verified empty. Recheck every sheet on new input; never discard a newly populated sheet.")
+                return "pandas.read_excel", _standard_excel_read_contract(fs, sole)["read_example"], notes
             notes.append("检测到多工作表 Excel，必须显式读取需要的 sheet；不要依赖 `pd.read_excel(path)` 默认读取第一个工作表。")
             shown = sheet_names[:8]
             notes.append("已识别工作表：" + "、".join(f"`{x}`" for x in shown) + (" 等。" if len(sheet_names) > len(shown) else "。"))
@@ -562,12 +620,19 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
             return "pandas.read_excel", f"pd.read_excel({input_path!r}, sheet_name=None)", notes
         if abnormal:
             sheet = abnormal[0]
-            example = str(sheet.get("recommended_read") or f"pd.read_excel({input_path!r}, header=None)")
+            example = str(_standard_excel_read_contract(fs, sheet).get("read_example") or
+                          sheet.get("recommended_read") or f"pd.read_excel({input_path!r}, header=None)")
             notes.append(
                 f"检测到 sheet `{sheet.get('sheet_name')}` 为 {sheet.get('layout_kind')}，不要盲信默认表头；"
                 f"建议读取方式：{example}。"
             )
             return "pandas.read_excel", example, notes
+        if len(sheet_names) == 1:
+            sheet = next((item for item in sheet_profiles if item.get("sheet_name") == sheet_names[0]), {})
+            contract = _standard_excel_read_contract(fs, sheet)
+            if contract:
+                return "pandas.read_excel", contract["read_example"], notes
+            return "pandas.read_excel", f"pd.read_excel({input_path!r}, sheet_name={sheet_names[0]!r})", notes
         return "pandas.read_excel", f"pd.read_excel({input_path!r})", notes
     if suffix == ".json":
         json_strategy = str((fs.source_metadata or {}).get("json_strategy", "") or "")
@@ -584,9 +649,33 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
 
 
 def _read_contract_for_file(fs: FileSummary, read_example: str) -> dict[str, Any]:
+    if Path(fs.path).suffix.lower() in {".xlsx", ".xls"}:
+        sheets = _excel_sheet_profiles(fs)
+        names = _excel_sheet_names_from_metadata(fs)
+        if len(names) == 1:
+            sheet = next((item for item in sheets if item.get("sheet_name") == names[0]), {})
+            return _standard_excel_read_contract(fs, sheet)
+        sole = _sole_populated_excel_sheet(fs)
+        if sole:
+            return _standard_excel_read_contract(fs, sole)
+        return {}
     contract = dict((fs.source_metadata or {}).get("csv_read_contract") or {})
     if not contract:
         return {}
+    if "verified" in contract:
+        contract["read_parameters_verified"] = contract.pop("verified")
+    if "validated_shape" in contract:
+        contract["reader_reported_shape"] = contract.pop("validated_shape")
+    contract["verification_scope"] = "reader_parameters_and_header_only"
+    contract["population_verified"] = False
+    contract["requires_full_parse_before_evaluation"] = True
+    if "validated_dtypes" in contract and contract.get("dtype_validation_scope") != "full_table":
+        contract["observed_preview_dtypes"] = contract.pop("validated_dtypes")
+        contract["dtype_validation_scope"] = "preview_only"
+        contract["validation_rules"] = list(dict.fromkeys([
+            *contract.get("validation_rules", []),
+            "Preview dtypes are observations, not full-table constraints. Validate complete data before coercion; never truncate fractional values based on a preview.",
+        ]))
     contract["path"] = str(fs.path)
     contract["read_example"] = str(read_example or "")
     return contract
@@ -605,6 +694,14 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
         if suffix not in {".csv", ".xlsx", ".xls", ".json", ".parquet", ".pq", ".txt", ".md"} and not fs.columns:
             continue
         read_method, read_example, notes = _read_example_for_file(fs)
+        row_grain = str(fs.summary or "").strip()[:240]
+        sheets = _excel_sheet_profiles(fs)
+        if sheets:
+            row_grain = "; ".join(
+                f"{sheet.get('sheet_name')}: verified_rows={facts.get('verified_row_count', 'unverified')}, "
+                f"columns={len(sheet.get('columns') or [])}, row_count_basis={facts.get('row_count_basis')}"
+                for sheet in sheets for facts in [reconcile_table_shape(sheet)]
+            )
         profiles = _profile_map(fs)
         key_fields: list[str] = []
         target_fields: list[str] = []
@@ -615,10 +712,13 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
             meaning = _llm_field_description(fs, c).lower()
             if any(k in lower for k in ["id", "编号", "订单号", "用户", "user", "key"]):
                 key_fields.append(c)
-            if any(k in lower for k in ["target", "label", "标签", "结果", "y", "class", "category"]) or "目标" in meaning or "标签" in meaning:
+            if lower == "y" or any(k in lower for k in ["target", "label", "标签", "结果", "class", "category"]) or "目标" in meaning or "标签" in meaning:
                 target_fields.append(c)
             if c in profiles or c in key_fields or c in target_fields:
                 important_fields.append(c)
+        resolved_target = str((fs.source_metadata or {}).get("target_column_hint") or "").strip()
+        if resolved_target in fs.columns:
+            target_fields = [resolved_target]
         # Keep a bounded physical-column list so repeated-file groups can show
         # both shared and variant columns instead of only task-scored fields.
         for col in fs.columns[:30]:
@@ -632,7 +732,7 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
                 read_method=read_method,
                 read_example=read_example,
                 read_contract=_read_contract_for_file(fs, read_example),
-                row_grain=str(fs.summary or "").strip()[:240],
+                row_grain=row_grain,
                 key_fields=key_fields[:12],
                 target_fields=target_fields[:8],
                 relation_keys=[str(x) for x in fs.key_entities[:12]],
@@ -707,6 +807,10 @@ def _filename_pattern_signature(path_value: str) -> tuple[str, str, str] | None:
     stem = path.stem
     pattern = re.sub(r"[A-Za-z0-9]+", "{id}", stem)
     pattern = re.sub(r"(?:\{id\})+", "{id}", pattern)
+    # Composite carrier identifiers such as ``14SZ-ZT-01`` are one varying
+    # identifier, just like ``01BZWL01``. Keep their surrounding literals as
+    # the grouping boundary while collapsing separators inside the identifier.
+    pattern = re.sub(r"\{id\}(?:[-_ ]+\{id\})+", "{id}", pattern)
     literal = pattern.replace("{id}", "")
     literal = re.sub(r"[\s_\-()（）\[\]【】.]+", "", literal)
     if "{id}" not in pattern or len(literal) < 2:
@@ -839,7 +943,7 @@ def _dedupe_nonempty(values: list[str], limit: int = 12) -> list[str]:
     return out
 
 
-def _dedupe_any(values, limit: int = 12) -> list[str]:
+def _dedupe_any(values, limit: int | None = 12) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for value in values or []:
@@ -848,7 +952,7 @@ def _dedupe_any(values, limit: int = 12) -> list[str]:
             continue
         seen.add(s)
         out.append(s)
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
@@ -1366,6 +1470,10 @@ def _source_schema_entries_from_file(
             shape = shape_facts.get("verified_shape")
             row_counts = _profile_row_counts(profiles)
             warnings = [str(shape_facts.get("row_count_note"))] if shape_facts.get("row_count_note") else []
+            read_contract = _standard_excel_read_contract(fs, sheet)
+            positional = read_contract.get("column_access") == "integer_position"
+            if positional and columns:
+                warnings.append("Raw header=None columns are integer positions. Profiled signature fields are layout hints, not accessible source column names; validate the raw header/layout before explicitly normalizing.")
             entries.append(
                 {
                     "table_id": f"{path}::{sheet_name}" if sheet_name else path,
@@ -1380,24 +1488,27 @@ def _source_schema_entries_from_file(
                     "row_count_conflict": shape_facts.get("row_count_conflict"),
                     "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
                     "column_count": len(columns),
-                    "physical_columns_exact": columns[:max_columns],
-                    "physical_columns_omitted": max(0, len(columns) - max_columns),
+                    "physical_columns_exact": [] if positional else columns[:max_columns],
+                    "physical_columns_omitted": 0 if positional else max(0, len(columns) - max_columns),
+                    "profiled_signature_fields": columns if positional else [],
+                    "column_access": read_contract.get("column_access", "unverified"),
                     "field_summaries": _schema_field_summaries(
                         columns=columns,
                         profiles=profiles,
                         meanings=meanings,
                         max_fields=max_field_summaries,
                     ),
-                    "read_example": f"pd.read_excel('./input/{path}', sheet_name={sheet_name!r})",
+                    "read_example": read_contract.get("read_example") or f"pd.read_excel('./input/{path}', sheet_name={sheet_name!r}, header=None)",
+                    "read_contract": read_contract,
                     "warnings": warnings,
                 }
             )
         return entries
 
-    columns = [str(x) for x in (fs.columns or []) if str(x).strip()]
+    columns = source_columns_exact(fs)
     profiles = fs.column_profiles or []
     meanings = {str(k): str(v) for k, v in (fs.column_semantics or {}).items() if str(k).strip()}
-    shape_facts = reconcile_table_shape(meta, profiles)
+    shape_facts = reconcile_table_shape(meta, profiles, is_worksheet=False)
     shape = shape_facts.get("verified_shape")
     row_counts = _profile_row_counts(profiles)
     warnings = [str(shape_facts.get("row_count_note"))] if shape_facts.get("row_count_note") else []
@@ -1411,7 +1522,7 @@ def _source_schema_entries_from_file(
             "shape": shape,
             "verified_row_count": shape_facts.get("verified_row_count"),
             "row_count_basis": shape_facts.get("row_count_basis"),
-            "worksheet_used_range_shape": shape_facts.get("worksheet_used_range_shape"),
+            "reader_reported_shape": shape_facts.get("reader_reported_shape"),
             "row_count_conflict": shape_facts.get("row_count_conflict"),
             "row_count_from_profiles": row_counts[0] if len(row_counts) == 1 else row_counts[:4],
             "column_count": len(columns),
@@ -1424,7 +1535,7 @@ def _source_schema_entries_from_file(
                 max_fields=max_field_summaries,
             ),
             "read_example": _read_example_for_file(fs)[1],
-            "read_contract": dict(meta.get("csv_read_contract") or {}),
+            "read_contract": _read_contract_for_file(fs, _read_example_for_file(fs)[1]),
             "warnings": warnings,
         }
     )
@@ -1881,6 +1992,9 @@ def build_automl_context_pack(
     entity_alias_source_aliases: dict[str, str] = {}
     if compact_table_cards:
         protocol_by_path = {str(item.path): item for item in list(bundle.data_access.files or [])}
+        # Grouped schema entries use patterns; actual readers still need each physical sheet.
+        schema_by_table = {str(item.get("table_id")): item for fs in file_summaries
+                           for item in _source_schema_entries_from_file(fs)}
         for card in compact_table_cards[:40]:
             if not isinstance(card, dict):
                 continue
@@ -1900,9 +2014,21 @@ def build_automl_context_pack(
                         fields = _sheet_profile_items(sheet, fs, max_cols=24)
                 else:
                     fields = _compact_file_profiles_for_automl(fs, limit=24)
-            columns = [str(f.get("name", "")) for f in fields if str(f.get("name", "")).strip()]
-            if not columns:
-                columns = field_hints or ([str(x) for x in (fs.columns or [])[:80]] if fs is not None else [])
+            # Field profiles are sampled summaries, not the physical schema.
+            exact_columns = None
+            if fs is not None:
+                sheet_name = str(card.get("sheet_name", "") or "")
+                if sheet_name:
+                    sheet = _find_excel_sheet_profile(fs, sheet_name)
+                    if sheet is not None:
+                        exact_columns = sheet.get("columns")
+                else:
+                    exact_columns = source_columns_exact(fs)
+            columns = (
+                [str(x) for x in exact_columns]
+                if exact_columns is not None
+                else [str(f["name"]) for f in fields if str(f.get("name", "")).strip()] or field_hints
+            )
             entry = {
                 "kind": card.get("table_kind") or "table_card",
                 "path": path,
@@ -1914,7 +2040,9 @@ def build_automl_context_pack(
                 "read_method": protocol.read_method if protocol is not None else "",
                 "read_example": protocol.read_example if protocol is not None else "",
                 "read_contract": protocol.read_contract if protocol is not None else {},
-                "columns": columns[:80],
+                "columns": columns,
+                "columns_scope": ("document_terms" if card.get("table_kind") == "document"
+                                  else "physical_schema" if exact_columns is not None else "preview_only"),
                 "fields": fields[:24],
                 "key_fields": protocol.key_fields if protocol is not None else [],
                 "relation_keys": protocol.relation_keys if protocol is not None else [],
@@ -1926,6 +2054,17 @@ def build_automl_context_pack(
                 ),
                 "warnings": card.get("warnings", []),
             }
+            if card.get("sheet_name"):
+                # Workbook defaults cannot stand in for a different sheet's reader.
+                sheet_schema = schema_by_table.get(str(card.get("table_id")), {})
+                entry["read_example"] = sheet_schema.get("read_example") or (
+                    f"pd.read_excel({_quote_input_path(path)!r}, sheet_name={card['sheet_name']!r}, header=None)")
+                entry["read_contract"] = sheet_schema.get("read_contract", {})
+                if entry["read_contract"].get("column_access") == "integer_position":
+                    entry["columns"] = []
+                    entry["columns_scope"] = "integer_position_raw_layout"
+                    entry["profiled_signature_fields"] = columns
+                    entry["fields_scope"] = "profiled_layout_hints_require_verified_normalization"
             data_entries.append({k: v for k, v in entry.items() if v not in (None, "", [], {})})
     else:
         for is_group, items in _group_data_access_items(list(bundle.data_access.files or [])):
@@ -2006,6 +2145,7 @@ def build_automl_context_pack(
         "output_kind": output.output_kind,
         "output_filename": output.output_filename,
         "sample_submission_required": bool(output.sample_submission_required),
+        "sample_submission_requirement_source": "source_contract" if output.sample_submission_required else "optional_generated_example",
         "columns": _dedupe_any(output.columns or ctx.get("submission_columns") or ctx.get("generated_submission_columns"), limit=40),
         "row_unit": output.row_unit,
         "format_rules": _dedupe_any(output.format_rules, limit=20),
@@ -2018,6 +2158,8 @@ def build_automl_context_pack(
         "sample_submission_source_field_corrections": ctx.get("sample_submission_source_field_corrections", []),
         "generated_submission_path": ctx.get("generated_submission_path", ""),
         "generated_submission_columns": ctx.get("generated_submission_columns", []),
+        "sample_validation_scope": "sample_schema_only",
+        "final_prediction_validated": False,
     }
 
     if contract is not None:
@@ -2112,7 +2254,12 @@ def build_automl_context_pack(
                 limit=24,
             )
         )
-        if explicit_rl_requested:
+        if rl_required:
+            modeling_boundary.extend([
+                "RL is a required solution method for this static optimization task; construct the environment from verified task data when necessary.",
+                "Evaluate policy-generated solutions with the same deterministic score_solution contract; any non-RL baseline is a comparison, not a replacement for the required RL deliverable.",
+            ])
+        elif explicit_rl_requested:
             modeling_boundary.extend(
                 [
                     "RL is a requested/allowed solver branch, not the task paradigm; do not replace the deterministic evaluator with a reward-only metric.",
@@ -2184,17 +2331,19 @@ def build_automl_context_pack(
             "relation_cards are non-authoritative join hints unless confirmed by task requirements."
         )
 
-    constraints = _dedupe_any(
-        list(bundle.constraints or [])
-        + list((ctx.get("authoritative_memory") or {}).get("constraints", []) if isinstance(ctx.get("authoritative_memory"), dict) else [])
-        + list((ctx.get("constraint_memory") or {}).get("items", []) if isinstance(ctx.get("constraint_memory"), dict) else []),
-        limit=30,
+    execution_contract = build_execution_contract(
+        bundle=bundle.model_dump(), context=ctx, evaluation=evaluation,
+        output=output_contract, data_schema=data_schema_contract,
     )
+    constraints = _dedupe_any([
+        f"[{item['strength']}; {item['status']}] {item['description']}"
+        for item in execution_contract["constraint_ledger"]
+    ], limit=None)
     leakage_guards = _dedupe_any(
         (contract.leakage_guards if contract is not None else [])
         + list(bundle.ml_dl.leakage_guards or [])
         + list(bundle.warnings or []),
-        limit=24,
+        limit=None,
     )
     pitfalls = _dedupe_any(
         [
@@ -2233,6 +2382,7 @@ def build_automl_context_pack(
         requirement_fact_matrix=requirement_fact_matrix,
         output_contract=output_contract,
         evaluation_contract=evaluation,
+        execution_contract=execution_contract,
         method_strategy=method_strategy,
         relation_cards=compact_relations[:80],
         filename_sample_groups=compact_filename_groups[:40],
@@ -2266,6 +2416,42 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     ]
     for item in _dedupe_any(pack.priority_rules, limit=12):
         lines.append(f"- {item}")
+
+    execution = pack.execution_contract or {}
+    if execution:
+        lines.extend(["", "## Execution Contract"])
+        identity = {key: execution.get(key, "") for key in (
+            "schema_version", "contract_id", "evaluation_id", "readiness",
+        )}
+        lines.extend(["", "```json", json.dumps(identity, ensure_ascii=False, indent=2), "```", ""])
+        lines.append("- contract_id/evaluation_id are stable rule fingerprints, valid before training and shared by comparable candidates. Generate evaluation_run_id and realized data/split fingerprints separately during execution; these rule IDs do not prove a model ran.")
+        for key in (
+            "blocking_issues", "assumptions", "open_questions", "authority_conflicts",
+            "constraint_resolution_policy", "reproducibility_requirements", "candidate_comparison_rules", "report_requirements",
+        ):
+            values = execution.get(key) or []
+            if values:
+                lines.append(f"- {key}:")
+                lines.extend(
+                    "  - " + (json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, dict) else str(value))
+                    for value in values
+                )
+        ledger_entries = execution.get("constraint_ledger") or []
+        if ledger_entries:
+            lines.extend(["", "### Constraint Evidence"])
+            for item in ledger_entries:
+                lines.append(
+                    f"- {item['constraint_id']} [{item['strength']}; {item['status']}]: {item['description']}"
+                )
+                if item.get("evidence"):
+                    lines.append("  - evidence: " + "; ".join(item["evidence"]))
+                if item.get("acceptance_check"):
+                    lines.append("  - acceptance_check: " + item["acceptance_check"])
+                for source_record in item.get("additional_sources", []):
+                    lines.append("  - additional_source: " + json.dumps(source_record, ensure_ascii=False, sort_keys=True))
+        if execution.get("resolved_question_history"):
+            lines.append("- resolved_question_history (historical text, not current gaps): " + json.dumps(
+                execution["resolved_question_history"], ensure_ascii=False, separators=(",", ":")))
 
     ledger = pack.source_coverage_ledger or {}
     if ledger:
@@ -2301,7 +2487,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     if pack.requirement_fact_matrix:
         lines.extend(["", "## Current Requirement Fact Matrix"])
         lines.append("- Only status=current facts are executable facts. status=unresolved remains a question; future/examples/superseded items are excluded upstream.")
-        for item in pack.requirement_fact_matrix[:40]:
+        for item in pack.requirement_fact_matrix:
             if not isinstance(item, dict):
                 continue
             lines.append(
@@ -2325,10 +2511,10 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         workbooks = schema_contract.get("workbooks") if isinstance(schema_contract.get("workbooks"), list) else []
         if workbooks:
             lines.append("- excel_workbook_sheet_names:")
-            for item in workbooks[:24]:
+            for item in workbooks:
                 if not isinstance(item, dict):
                     continue
-                sheets = [str(x) for x in (item.get("valid_sheet_names_exact") or [])[:24]]
+                sheets = [str(x) for x in (item.get("valid_sheet_names_exact") or [])]
                 lines.append(
                     f"  - source_file={item.get('source_file')}; "
                     f"valid_sheet_names_exact={sheets}"
@@ -2336,7 +2522,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
         if tables:
             lines.append("- tables:")
-            for table in tables[:40]:
+            for table in tables:
                 if not isinstance(table, dict):
                     continue
                 lines.append(
@@ -2389,7 +2575,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                             )
                 columns = [str(x) for x in (table.get("physical_columns_exact") or [])]
                 if columns:
-                    lines.append("    physical_columns_exact: " + ", ".join(f"`{x}`" for x in columns[:120]))
+                    lines.append("    physical_columns_exact: " + ", ".join(f"`{x}`" for x in columns))
                     omitted = int(table.get("physical_columns_omitted") or 0)
                     if omitted:
                         lines.append(f"    physical_columns_omitted: {omitted}")
@@ -2420,7 +2606,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         lines.append("- purpose: Business/source-field aliases below appeared in requirements, description, constraints, or output specs, but they must be resolved before pandas access.")
         lines.append("- hard_rule: Never use an alias as `df[alias]`, `groupby(alias)`, `merge(on=alias)`, or `sheet_name=alias` unless `status=exact_physical_column` or `exact_physical_column` is provided.")
         lines.append("- hard_rule: If `status=unresolved_business_concept`, implement a conservative derived rule, mark the constraint unresolved in validation details, or avoid using it for raw filtering; do not invent a same-named column.")
-        for item in pack.source_alias_guard[:40]:
+        for item in pack.source_alias_guard:
             if not isinstance(item, dict):
                 continue
             parts = [
@@ -2542,6 +2728,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         "passed",
         "executable",
         "authority_status",
+        "ranking_scope",
         "primary_metric",
         "metric_direction",
         "prediction_unit",
@@ -2553,26 +2740,26 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         if value:
             lines.append(f"- {key}: {value}")
     for key in ["assumptions", "residual_issues"]:
-        values = _dedupe_any(evaluation.get(key, []), limit=12)
+        values = _dedupe_any(evaluation.get(key, []), limit=None)
         if values:
             lines.append(f"- {key}:")
             lines.extend(f"  - {x}" for x in values)
     if final_formula:
         lines.append(f"- final_score_formula: {final_formula}")
     lines.append("- final_validation_score_rule: validation should be comparable by exactly one numeric `Final Validation Score` derived from `final_score_formula`.")
-    for key in ["submission_checks", "invalid_solution_rules", "tie_break_rules", "audit_metrics"]:
-        values = _dedupe_any(evaluation.get(key, []), limit=12)
+    for key in ["submission_checks", "leakage_guards", "invalid_solution_rules", "tie_break_rules", "audit_metrics", "issues", "fixes"]:
+        values = _dedupe_any(evaluation.get(key, []), limit=None)
         if values:
             lines.append(f"- {key}:")
             lines.extend(f"  - {x}" for x in values)
 
     lines.extend(["", "## Output Contract Reference"])
     output = pack.output_contract or {}
-    for key in ["output_kind", "output_filename", "sample_submission_required", "row_unit", "no_sample_submission_reason"]:
+    for key in ["output_kind", "output_filename", "sample_submission_required", "row_unit", "no_sample_submission_reason", "sample_validation_scope", "final_prediction_validated"]:
         value = output.get(key)
         if value not in (None, "", []):
             lines.append(f"- {key}: {value}")
-    columns = _dedupe_any(output.get("columns", []), limit=60)
+    columns = _dedupe_any(output.get("columns", []), limit=None)
     if columns:
         lines.append("- columns: " + ", ".join(f"`{x}`" for x in columns))
         lines.extend(
@@ -2585,7 +2772,7 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
                 "  - Empty, all-unassigned, or no-feasible solutions must be handled by validation/scoring and reported in `Decision Validation Summary`; do not let output CSV construction fail with pandas `KeyError`.",
             ]
         )
-    rules = _dedupe_any(output.get("format_rules", []), limit=16)
+    rules = _dedupe_any(output.get("format_rules", []), limit=None)
     if rules:
         lines.append("- format_rules:")
         lines.extend(f"  - {x}" for x in rules)
@@ -2828,13 +3015,13 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
 
     if pack.modeling_boundary:
         lines.extend(["", "## Problem Boundary Reference"])
-        lines.extend(f"- {x}" for x in _dedupe_any(pack.modeling_boundary, limit=30))
+        lines.extend(f"- {x}" for x in _dedupe_any(pack.modeling_boundary, limit=None))
     if pack.constraints:
         lines.extend(["", "## Constraints Reference"])
-        lines.extend(f"- {x}" for x in _dedupe_any(pack.constraints, limit=30))
+        lines.extend(f"- {x}" for x in _dedupe_any(pack.constraints, limit=None))
     if pack.leakage_guards:
         lines.extend(["", "## Leakage Guards"])
-        lines.extend(f"- {x}" for x in _dedupe_any(pack.leakage_guards, limit=24))
+        lines.extend(f"- {x}" for x in _dedupe_any(pack.leakage_guards, limit=None))
     if pack.pitfalls:
         lines.extend(["", "## Pitfalls"])
         lines.extend(f"- {x}" for x in _dedupe_any(pack.pitfalls, limit=24))
@@ -3326,7 +3513,8 @@ def _render_output_protocol(bundle: DescriptionProtocolBundle, downstream_contex
     cols = [str(x) for x in (output.columns or ctx.get("submission_columns", []) or ctx.get("generated_submission_columns", [])) if str(x).strip()]
     lines = ["## 输出或提交格式"]
     lines.append(f"- 输出类型：{output.output_kind or 'submission_table'}。")
-    lines.append(f"- 输出文件名：`{output.output_filename or ctx.get('submission_output_filename', 'submission.csv')}`。")
+    output_name = output.output_filename or ctx.get("submission_output_filename", "")
+    lines.append(f"- 输出文件名：`{output_name}`。" if output_name else "- 输出文件名：未指定。")
     if cols:
         lines.append("- 列顺序：" + "，".join(f"`{x}`" for x in cols) + "。")
     if output.row_unit:
@@ -4481,15 +4669,30 @@ def _direction_label(direction: str) -> str:
     return d
 
 
+def _ranking_tie_rules(contract: EvaluationContractReview) -> list[str]:
+    rules = []
+    for rule in _nonempty_list(contract.tie_break_rules):
+        for clause in re.split(r"[。；;\n]", rule):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if ("candidate_id" in clause.lower() and
+                    _contains_any(clause, ["显示顺序", "展示顺序", "display order"]) and
+                    not _contains_any(clause, ["成本", "cost", "runtime", "运行时长", "accuracy", "准确率"])):
+                continue
+            if _contains_any(clause, ["不构成第二个效果指标", "不得成为第二排序目标", "does not change the score"]):
+                continue
+            rules.append(clause)
+    return rules
+
+
 def _evaluation_mentions_multiple_objectives(contract: EvaluationContractReview) -> bool:
     packed = "\n".join(
         [
             str(contract.primary_metric),
             str(contract.metric_formula),
             str(contract.aggregation_rule),
-            str(contract.validation_protocol),
-            "\n".join(_nonempty_list(contract.tie_break_rules)),
-            "\n".join(_nonempty_list(contract.audit_metrics)),
+            "\n".join(_ranking_tie_rules(contract)),
         ]
     ).lower()
     multi_markers = [
@@ -4503,7 +4706,6 @@ def _evaluation_mentions_multiple_objectives(contract: EvaluationContractReview)
         "weight",
         "多目标",
         "次要",
-        "并列",
         "字典序",
         "权重",
         "加权",
@@ -4523,32 +4725,11 @@ def _evaluation_mentions_multiple_objectives(contract: EvaluationContractReview)
 
 
 def _evaluation_has_scalarization(contract: EvaluationContractReview) -> bool:
-    packed = "\n".join(
-        [
-            str(contract.scalar_score_formula),
-            str(contract.metric_formula),
-            str(contract.aggregation_rule),
-            "\n".join(_nonempty_list(contract.tie_break_rules)),
-        ]
-    ).lower()
-    if str(contract.scalar_score_formula or "").strip():
-        return True
-    scalar_markers = [
-        "weighted",
-        "weight",
-        "penalty",
-        "large constant",
-        "score =",
-        "scalar",
-        "权重",
-        "加权",
-        "惩罚",
-        "罚",
-        "大常数",
-        "单一数值",
-        "标量",
-    ]
-    return any(marker in packed for marker in scalar_markers)
+    if scalar_score_shape_defects(contract.model_dump()):
+        return False
+    formula = _final_score_formula(contract)
+    # Names such as 'weighted' or 'scalar' alone are not an executable formula.
+    return bool(re.search(r"[+*/×÷Σ∑]|(?<![\w])-(?![\w])|\b(?:mean|sum|min|max|sqrt|abs)\s*\(", formula, re.IGNORECASE))
 
 
 def _contains_any(text: str, markers: list[str]) -> bool:
@@ -4571,7 +4752,7 @@ def _scalar_formula_duplicates_metric(contract: EvaluationContractReview) -> boo
         return True
     if not metric:
         return False
-    return metric == scalar or metric in scalar or scalar in metric
+    return metric == scalar
 
 
 def _final_score_formula(contract: EvaluationContractReview) -> str:
@@ -4585,9 +4766,15 @@ def _evaluation_scalarization_defects(contract: EvaluationContractReview) -> lis
     rate then lower cost wins", a score that only contains success rate is not
     operationally equivalent to the evaluation protocol.
     """
-    defects: list[str] = []
+    defects: list[str] = scalar_score_shape_defects(contract.model_dump())
     effective_formula = _final_score_formula(contract)
-    tie_text = "\n".join(_nonempty_list(contract.tie_break_rules))
+    if contract.ranking_scope == "software_contract_checks":
+        # Business objectives are invariants tested inside the software cases,
+        # not measured business values to add to the candidate ranking scalar.
+        if str(contract.scalar_score_formula or "").strip() and not _scalar_formula_duplicates_metric(contract):
+            defects.append("evaluation_contract metric_formula and scalar_score_formula define competing scores")
+        return defects
+    tie_text = "\n".join(_ranking_tie_rules(contract))
     aggregation_text = str(contract.aggregation_rule or "")
     objective_text = "\n".join(
         [
@@ -4595,7 +4782,6 @@ def _evaluation_scalarization_defects(contract: EvaluationContractReview) -> lis
             str(contract.metric_formula or ""),
             aggregation_text,
             tie_text,
-            "\n".join(_nonempty_list(contract.audit_metrics)),
         ]
     )
     has_multi = _evaluation_mentions_multiple_objectives(contract)
@@ -4608,7 +4794,7 @@ def _evaluation_scalarization_defects(contract: EvaluationContractReview) -> lis
     groups = {
         "cost": ["成本", "费用", "运费", "cost", "expense", "fee"],
         "failure_or_unassigned": ["未分配", "失败数", "失败数量", "违约数", "违规数", "不可行数", "fail_count", "failed_count", "failure_count", "unassigned", "violation_count", "infeasible_count"],
-        "trip_count": ["发车次数", "车次数", "车辆数", "派车数", "trip", "dispatch", "vehicle_count"],
+        "trip_count": ["发车次数", "车次数", "车辆数", "派车数", "trip_count", "dispatch_count", "vehicle_count", "number of trips", "number of vehicles"],
         "utilization": ["装载率", "利用率", "载荷", "体积利用", "重量利用", "utilization", "load_rate"],
     }
     for group_name, markers in groups.items():
@@ -4651,7 +4837,6 @@ def evaluation_contract_defects(review: EvaluationContractReview | dict[str, Any
         "submission_checks": contract.submission_checks,
         "leakage_guards": contract.leakage_guards,
         "invalid_solution_rules": contract.invalid_solution_rules,
-        "tie_break_rules": contract.tie_break_rules,
     }
     for name, values in required_lists.items():
         if not _nonempty_list(values):
@@ -4670,9 +4855,15 @@ def evaluation_contract_defects(review: EvaluationContractReview | dict[str, Any
             "\n".join(_nonempty_list(contract.invalid_solution_rules)),
         ]
     )
-    for bad in ["推荐", "可选", "通常", "视情况", "可以考虑", "unknown", "tbd", "待补充", "待确认"]:
-        if bad in packed.lower():
-            defects.append(f"evaluation_contract contains ambiguous placeholder: {bad}")
+    # Missing rule values are defects; explicit rejection of missing business
+    # inputs (for example "reject unknown IDs") is an executable guardrail.
+    placeholder = r"(?:unknown|tbd|to be determined|待补充|待确认|视情况)"
+    for name, value in required_text_fields.items():
+        if re.fullmatch(rf"\s*{placeholder}[.。]?\s*", str(value), re.IGNORECASE):
+            defects.append(f"evaluation_contract contains ambiguous placeholder: {name}")
+    for line in packed.splitlines():
+        if re.fullmatch(rf"\s*(?:[^:：\n]+[:：]\s*)?{placeholder}[.。]?\s*", line, re.IGNORECASE):
+            defects.append("evaluation_contract contains an unresolved rule value")
 
     return defects
 
@@ -4912,4 +5103,3 @@ def _render_data_inventory(file_summaries: list[FileSummary], inventory_digest: 
                     lines.append(f"    - {_metadata_label(k)}：`{_clean_inline(meta.get(k))}`")
         lines.append("")
     return "\n".join(lines).strip()
-

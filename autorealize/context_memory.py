@@ -111,14 +111,6 @@ class CrossStageContextLedger:
             "original_chars": int(stable_ref.get("original_chars") or 0),
             "retrieval_policy": "按需使用 artifact_id 和 json_path 取回；不得从省略内容中猜测。",
         }
-        task_hint = bounded.get("task_hint")
-        if isinstance(task_hint, str) and estimate_text_tokens(task_hint) > 800:
-            bounded["task_hint"] = {
-                "artifact_id": str(stable_ref.get("artifact_id") or ""),
-                "json_path": "payload.task_hint",
-                "visible_excerpt": _truncate_to_token_budget(task_hint, 800),
-                "truncated": True,
-            }
         if self._serialized_chars(bounded) <= budget and estimate_text_tokens(
             json.dumps(bounded, ensure_ascii=False, sort_keys=True, default=str)
         ) <= token_budget:
@@ -129,6 +121,9 @@ class CrossStageContextLedger:
             "context_policy",
             "output_language_policy",
             "task_hint",
+            "original_requirements_full",
+            "authoritative_memory",
+            "constraint_memory",
             "full_stable_context_artifact",
         }
         replacement_order = sorted(
@@ -153,7 +148,7 @@ class CrossStageContextLedger:
             }
             omitted.append({"key": key, "original_chars": len(text)})
         bounded["stable_context_compaction"] = {
-            "lossy": True,
+            "lossy": bool(omitted),
             "omitted_sections": omitted,
             "full_artifact_id": str(stable_ref.get("artifact_id") or ""),
         }
@@ -227,7 +222,17 @@ class CrossStageContextLedger:
         latest_request: Any,
         dynamic_title: str = "Latest stage request",
         dynamic_limit: int | None = None,
+        complete_current_snapshot: bool = False,
     ) -> tuple[str, str]:
+        if complete_current_snapshot:
+            # Final cross-artifact review already carries every current contract,
+            # exact source schema and QDI result. Old draft retrieval is redundant.
+            return self.static_context_prompt, json_block(dynamic_title, {
+                "context_policy": "Complete current artifacts plus the unchanged authoritative prefix; prior drafts remain in the audit trail.",
+                "current_stage": stage,
+                "current_stage_evidence": json_safe(stage_evidence),
+                "latest_request": json_safe(latest_request),
+            }, sort_keys=False)
         self._compact_if_needed(stage)
         recovered = self._retrieve_if_needed(stage, latest_request)
         payload = {
@@ -258,7 +263,7 @@ class CrossStageContextLedger:
                 str(stage),
                 full_payload,
                 visible_excerpt=(
-                    f"阶段 {stage} 的完整动态 prompt payload；模型只直接看到有界首尾预览。"
+                    f"阶段 {stage} 的完整动态 prompt payload；当前证据与返修要求完整传递。"
                 ),
             )
             artifact_id = str(ref.get("artifact_id") or "")
@@ -282,37 +287,6 @@ class CrossStageContextLedger:
                 "original_chars": int(ref.get("original_chars") or 0),
                 "policy": "完整载荷可审计并可供后续关键阶段按需取回；当前不可见部分不得猜测。",
             }
-            preview_chars = max(120, min(1200, int(dynamic_limit) // 4))
-
-            def bounded_preview(value: Any, json_path: str) -> Any:
-                value_text = json.dumps(
-                    json_safe(value),
-                    ensure_ascii=False,
-                    sort_keys=False,
-                    indent=2,
-                    default=str,
-                )
-                if len(value_text) <= preview_chars:
-                    return value
-                head_chars = max(40, int(preview_chars * 0.4))
-                tail_chars = max(40, preview_chars - head_chars)
-                return {
-                    "truncated": True,
-                    "artifact_id": artifact_id,
-                    "json_path": json_path,
-                    "original_chars": len(value_text),
-                    "visible_json_head": value_text[:head_chars],
-                    "visible_json_tail": value_text[-tail_chars:],
-                }
-
-            payload["current_stage_evidence"] = bounded_preview(
-                payload["current_stage_evidence"],
-                "payload.current_stage_evidence",
-            )
-            safe_latest_request = bounded_preview(
-                safe_latest_request,
-                "payload.latest_request",
-            )
             self._persist()
         payload["latest_request"] = safe_latest_request
         # Preserve insertion order so recent evidence and the latest request stay
@@ -320,7 +294,7 @@ class CrossStageContextLedger:
         return self.static_context_prompt, json_block(
             dynamic_title,
             payload,
-            limit=dynamic_limit,
+            limit=None,
             sort_keys=False,
         )
 

@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 
 from ..agents.architect import Architect
+from ..artifact_contract_repair import DerivedContractRepair, apply_derived_repairs, repairable_fields, section_fact_fields, apply_section_fact_repairs, section_fact_evidence_refs
 from ..config import AutoRealizeConfig
 from ..context_memory import CrossStageContextLedger
 from ..context_compiler import (
@@ -26,9 +27,14 @@ from ..context_compiler import (
     compact_detail_table_card_for_prompt,
     compact_table_cards_for_prompt,
     context_telemetry,
+    reconcile_table_shape,
 )
 from ..logging_utils import log_event
 from ..prompt_cache import stable_dynamic_prompt
+from ..review_prompt import (
+    ArtifactConsistencyAudit, EVALUATION_REVIEW_INSTRUCTIONS, REVIEW_COVERAGE_INSTRUCTIONS,
+    review_prompt_parts,
+)
 from ..report_writer import (
     SECTION_ALIASES,
     append_constraint_memory_section,
@@ -53,6 +59,7 @@ from ..models import (
     AmbiguityReview,
     ArtifactConsistencyPatch,
     ArtifactConsistencyReview,
+    OpenQuestionRepair,
     DownstreamContextResolution,
     DescriptionProtocolBundle,
     DescriptionSectionDraft,
@@ -126,16 +133,25 @@ class TaskDefinitionModule:
         dynamic_title: str,
         stable_limit: int | None = None,
         dynamic_limit: int | None = None,
+        complete_current_snapshot: bool = False,
     ) -> tuple[str, str]:
         ledger = self._cross_stage_context
+        if (getattr(self.config.prompt, "lossless_review_prompts", False)
+                and stage.startswith(("artifact_consistency_reviewer", "evaluation_contract_finalizer"))):
+            return review_prompt_parts(
+                authority=ledger.stable_context if ledger else {},
+                stage_evidence=stable,
+                latest_request=dynamic,
+                dynamic_title=dynamic_title,
+            )
         if ledger is None:
             return stable_dynamic_prompt(
                 stable=stable,
                 dynamic=dynamic,
                 stable_title=stable_title,
                 dynamic_title=dynamic_title,
-                stable_limit=stable_limit,
-                dynamic_limit=dynamic_limit,
+                stable_limit=None,
+                dynamic_limit=None,
             )
         return ledger.prompt_parts(
             stage=stage,
@@ -143,6 +159,7 @@ class TaskDefinitionModule:
             latest_request=dynamic,
             dynamic_title=dynamic_title,
             dynamic_limit=dynamic_limit,
+            complete_current_snapshot=complete_current_snapshot,
         )
 
     def _initialize_cross_stage_context(
@@ -264,17 +281,15 @@ class TaskDefinitionModule:
             "hybrid_ml_optimization": "hybrid_ml_optimization",
             "unknown_but_executable": "unknown_but_executable",
         }
-        auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context, dict) else {}
-        eval_reqs = auth.get("evaluation_requirements", []) if isinstance(auth, dict) else []
-        primary_metric = str(eval_reqs[0])[:240] if eval_reqs else ""
         return TaskClassification(
             task_type=mapping.get(problem_review.problem_paradigm, "unknown_but_executable"),
             confidence=float(problem_review.confidence or 0.0),
             reasoning=(
                 "Derived from ProblemParadigmReview in low-token mode; "
-                "legacy task_classifier LLM call was skipped."
+                "legacy task_classifier LLM call was skipped. "
+                "Metric fields are deferred to the evaluation contract."
             ),
-            primary_metric=primary_metric,
+            primary_metric="",
             metric_formula="",
         )
 
@@ -338,8 +353,8 @@ class TaskDefinitionModule:
             contract = memory.get("submission_contract") or {}
             if isinstance(contract, dict) and contract.get("is_defined"):
                 contract_lines = [
-                    f"output_filename: {contract.get('output_filename') or 'submission.csv'}",
-                    f"sample_filename: {contract.get('sample_filename') or 'sample_submission.csv'}",
+                    f"{key}: {contract[key]}" for key in ("output_filename", "sample_filename")
+                    if contract.get(key)
                 ]
                 cols = [str(x) for x in contract.get("columns", []) if str(x).strip()]
                 if cols:
@@ -837,7 +852,7 @@ class TaskDefinitionModule:
             if cols and not bundle.output.columns:
                 bundle.output.columns = cols
             if not bundle.output.output_filename:
-                bundle.output.output_filename = str(downstream_context.get("submission_output_filename", "submission.csv"))
+                bundle.output.output_filename = str(downstream_context.get("submission_output_filename", ""))
             if paradigm in {"static_optimization", "reinforcement_learning"} and not bundle.output.no_sample_submission_reason:
                 bundle.output.no_sample_submission_reason = (
                     "优化/强化学习任务以方案或策略评估为中心；只有权威输出合同明确要求时才需要 sample_submission。"
@@ -1482,36 +1497,32 @@ class TaskDefinitionModule:
         ]
 
     def _question_memory_pack(self, downstream_context: dict) -> dict:
+        from ..investigation import reconcile_question_memory
+
         pack = downstream_context.get("agent_context_pack") if isinstance(downstream_context.get("agent_context_pack"), dict) else {}
         qmem = pack.get("question_memory") if isinstance(pack.get("question_memory"), dict) else {}
         if not qmem and isinstance(downstream_context.get("knowledge_base"), dict):
             qmem = downstream_context["knowledge_base"].get("question_investigation", {}) or {}
+        qmem = reconcile_question_memory(qmem)
         answers = qmem.get("answers") if isinstance(qmem.get("answers"), list) else []
         unresolved = qmem.get("unresolved_questions") if isinstance(qmem.get("unresolved_questions"), list) else []
         records = qmem.get("question_records") if isinstance(qmem.get("question_records"), list) else []
         return {
-            "summary": str(qmem.get("summary", ""))[:1200],
-            "answers": [
-                {
-                    "question": str(a.get("question", ""))[:260] if isinstance(a, dict) else "",
-                    "answer": str(a.get("answer", ""))[:500] if isinstance(a, dict) else str(a)[:500],
-                    "confidence": a.get("confidence") if isinstance(a, dict) else None,
-                }
-                for a in answers[:12]
-            ],
+            "summary": str(qmem.get("summary", "")),
+            "answers": [dict(a) if isinstance(a, dict) else {"answer": str(a)} for a in answers],
             "question_records": [
                 {
                     "question_id": r.get("question_id"),
-                    "question": str(r.get("question", ""))[:260],
+                    "question": str(r.get("question", "")),
                     "status": r.get("status"),
-                    "short_answer": str(r.get("short_answer") or r.get("answer") or "")[:360],
-                    "unresolved_reason": str(r.get("unresolved_reason", ""))[:360],
+                    "short_answer": str(r.get("short_answer") or r.get("answer") or ""),
+                    "unresolved_reason": str(r.get("unresolved_reason", "")),
                 }
-                for r in records[:20]
+                for r in records
                 if isinstance(r, dict)
             ],
-            "unresolved_questions": [str(x)[:360] for x in unresolved[:12]],
-            "context_routing_notes": [str(x)[:260] for x in (qmem.get("context_routing_notes") or [])[:10]],
+            "unresolved_questions": [str(x) for x in unresolved],
+            "context_routing_notes": [str(x) for x in (qmem.get("context_routing_notes") or [])],
         }
 
     def _build_task_authority_pack(
@@ -1530,17 +1541,7 @@ class TaskDefinitionModule:
                 "官方说明/其他说明文档再次之",
                 "数据统计和 LLM 推断最低",
             ],
-            "authoritative_memory": {
-                "summary": str(auth.get("summary", ""))[:1200],
-                "task_goal": str(auth.get("task_goal", ""))[:1000],
-                "input_requirements": [str(x)[:360] for x in (auth.get("input_requirements") or [])[:10]],
-                "output_requirements": [str(x)[:360] for x in (auth.get("output_requirements") or [])[:10]],
-                "evaluation_requirements": [str(x)[:360] for x in (auth.get("evaluation_requirements") or [])[:10]],
-                "constraints": [str(x)[:360] for x in (auth.get("constraints") or [])[:12]],
-                "leakage_guards": [str(x)[:360] for x in (auth.get("leakage_guards") or [])[:8]],
-                "authority_conflicts": (auth.get("authority_conflicts") or [])[:8],
-                "unresolved_questions": [str(x)[:360] for x in (auth.get("unresolved_questions") or [])[:8]],
-            },
+            "authoritative_memory": dict(auth),
             "problem_paradigm_review": problem_review.model_dump(),
             "downstream_context": {
                 "train_table": downstream_context.get("train_table", ""),
@@ -1577,19 +1578,16 @@ class TaskDefinitionModule:
         )
         return {
             "problem_paradigm": problem_review.model_dump(),
-            "evaluation_requirements": [str(x)[:500] for x in (auth.get("evaluation_requirements") or [])[:12]],
+            "evaluation_requirements": [str(x) for x in (auth.get("evaluation_requirements") or [])],
             "objective_priority": [
-                str(x)[:500]
+                str(x)
                 for x in (auth.get("constraints") or [])
                 if any(k in str(x).lower() for k in ["目标", "优先", "成本", "最小", "最大", "score", "metric", "penalty", "reward"])
-            ][:10],
-            "submission_or_output_requirements": [str(x)[:500] for x in (auth.get("output_requirements") or [])[:12]],
+            ],
+            "submission_or_output_requirements": [str(x) for x in (auth.get("output_requirements") or [])],
             "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
-            "constraint_memory": {
-                "summary": str(constraint_memory.get("summary", ""))[:1000],
-                "items": (constraint_memory.get("items") or [])[:16],
-            },
-            "leakage_facts": [str(x)[:360] for x in (auth.get("leakage_guards") or [])[:12]],
+            "constraint_memory": dict(constraint_memory),
+            "leakage_facts": [str(x) for x in (auth.get("leakage_guards") or [])],
             # Compatibility key: tiny file/table handles only, not a full metadata bundle.
             "evaluation_related_files": self._table_cards_as_file_index(table_cards),
             "table_index": table_cards,
@@ -1641,7 +1639,7 @@ class TaskDefinitionModule:
             "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
             "submission_columns": downstream_context.get("submission_columns", []),
             "generated_submission_columns": downstream_context.get("generated_submission_columns", []),
-            "output_requirements": [str(x)[:500] for x in (auth.get("output_requirements") or [])[:12]],
+            "output_requirements": [str(x) for x in (auth.get("output_requirements") or [])],
             "evaluation_contract": evaluation_contract.model_dump() if evaluation_contract else {},
             "qdi_output_conclusions": self._question_memory_pack(downstream_context),
             "table_index": table_cards,
@@ -2002,6 +2000,8 @@ class TaskDefinitionModule:
             columns = self._read_sample_submission_columns(target_file)
             report = {
                 "passed": True,
+                "validation_scope": "sample_schema_only",
+                "final_prediction_validated": False,
                 "source": "official_sample_reused",
                 "sample_source": probe.get("path", sample_src.name),
                 "target_file": "sample_submission.csv",
@@ -2125,13 +2125,20 @@ class TaskDefinitionModule:
         }
 
     @staticmethod
+    def _table_physical_columns(table: dict) -> list[str]:
+        read_contract = table.get("read_contract") or {}
+        verified = read_contract.get("validated_columns_exact") or read_contract.get("columns_exact") or []
+        return list(dict.fromkeys(str(col) for col in [*(table.get("physical_columns_exact") or []), *verified]
+                                  if str(col).strip()))
+
+    @staticmethod
     def _exact_schema_columns(schema_contract: dict) -> set[str]:
         columns: set[str] = set()
         tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
         for table in tables:
             if not isinstance(table, dict):
                 continue
-            for col in table.get("physical_columns_exact") or []:
+            for col in TaskDefinitionModule._table_physical_columns(table):
                 text = str(col or "").strip()
                 if text:
                     columns.add(text)
@@ -2162,7 +2169,9 @@ class TaskDefinitionModule:
         return names
 
     @staticmethod
-    def _source_field_alias_tokens(text: str) -> list[str]:
+    def _source_field_alias_tokens(
+        text: str, non_column_names: set[str] | None = None, physical_columns: set[str] | None = None,
+    ) -> list[str]:
         tokens: list[str] = []
         for pattern in [r"`([^`]+)`", r"“([^”]+)”", r'"([^"]+)"']:
             for match in re.findall(pattern, text or ""):
@@ -2173,23 +2182,36 @@ class TaskDefinitionModule:
         # file.xlsx::sheet::column without quotes.  The final segment is the
         # dangerous one for pandas access, so inspect every :: segment and let
         # the schema-name filter below discard file/sheet names.
-        for match in re.findall(r"::([^:\s`'\"，,。；;、\)\]）】]+)", text or ""):
+        # Mask complete schema names before scanning unquoted references. Spaces
+        # and unit brackets belong to columns such as Process temperature [K].
+        reference_text = text or ""
+        if physical_columns:
+            exact = "|".join(re.escape(name) for name in sorted(physical_columns, key=len, reverse=True))
+            reference_text = re.sub(rf"(?<!\w)(?:{exact})(?!\w)", " ", reference_text)
+        for match in re.findall(r"::([^:\s`'\"，,。；;、\)\]）】]+)", reference_text):
             token = str(match or "").strip()
             token = re.split(r"[（(]", token, maxsplit=1)[0].strip()
             if token and token not in tokens:
                 tokens.append(token)
-        # Also catch common source references such as "订单明细信息.标准箱数（汇总）".
-        # File/sheet/table names are later discarded by the schema-name filter.
-        for raw_part in re.split(r"[\s,，;；、]+", text or ""):
-            part = str(raw_part or "").strip("`'\"“”‘’()（）[]【】{}<>")
-            if "." not in part and "：" not in part and ":" not in part:
-                continue
-            for segment in re.split(r"[.。:：/\\]+", part):
-                token = re.split(r"[（(]", segment, maxsplit=1)[0].strip("`'\"“”‘’()（）[]【】{}<>")
-                token = re.sub(r"^(从|来自|源自|派生自|由|按|以|和|与|或)+", "", token).strip()
+        # Dotted references need a real source qualifier. A sentence-ending
+        # period does not turn its last English word into a dataframe column.
+        for name in sorted(non_column_names or [], key=len, reverse=True):
+            for match in re.findall(re.escape(name) + r"(?:::|[.：:])([^:\s`'\"，,。；;、]+)", reference_text):
+                token = re.split(r"[（(]", match, maxsplit=1)[0].strip()
                 if token and token not in tokens:
                     tokens.append(token)
-        return tokens
+        fields: list[str] = []
+        for token in tokens:
+            key, separator, value = token.partition("=")
+            if separator and key in {"source_file", "sheet_name", "table_id", "source_path"}:
+                continue
+            if separator and key in {"physical_field", "physical_column"}:
+                token = value.strip()
+            if token in {"DataFrame", "pd.DataFrame", "OUTPUT_COLUMNS"}:
+                continue
+            if token and token not in fields:
+                fields.append(token)
+        return fields
 
     @staticmethod
     def _source_field_candidate_columns(alias: str, schema_contract: dict, *, limit: int = 6) -> list[str]:
@@ -2211,7 +2233,7 @@ class TaskDefinitionModule:
                     name = str(field.get("name", "") or "")
                     if name:
                         meanings[name] = str(field.get("meaning", "") or "")
-            for idx, raw_col in enumerate(table.get("physical_columns_exact") or []):
+            for idx, raw_col in enumerate(TaskDefinitionModule._table_physical_columns(table)):
                 col = str(raw_col or "").strip()
                 if not col or col in seen:
                     continue
@@ -2262,10 +2284,43 @@ class TaskDefinitionModule:
         field = str(alias or "").strip()
         if not field or field in physical_columns or field in non_column_names:
             return None, []
+        # Resolve qualified references within their actual table, before fuzzy
+        # matching names across tables. A file extension is not a field alias.
+        for table in schema_contract.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            source = str(table.get("source_file") or "")
+            sheet = str(table.get("sheet_name") or "")
+            qualifiers = [str(table.get("table_id") or "")]
+            qualifiers += [f"{source}::{sheet}", f"{source}.{sheet}"] if sheet else [source]
+            if source and sheet:
+                qualifiers.append(f"{source} | {sheet}")
+            for qualifier in qualifiers:
+                if not qualifier:
+                    continue
+                for separator in ("::", ".", " | "):
+                    prefix = qualifier + separator
+                    if not field.startswith(prefix):
+                        continue
+                    column = field[len(prefix):]
+                    exact = TaskDefinitionModule._table_physical_columns(table)
+                    if column in exact:
+                        return column, []
+                    # A duplicated closing delimiter is a serialization typo,
+                    # not permission to fuzzy-match another physical field.
+                    if len(column) > 1 and column[-1] == column[-2] and column[-1] in "])}":
+                        if column[:-1] in exact and column not in exact:
+                            return column[:-1], []
+                    return None, TaskDefinitionModule._source_field_candidate_columns(column, {"tables": [table]})
         # Very short business words such as "重量" or "体积" are commonly
         # ambiguous across order, line-item, vehicle, and contract tables. Keep
         # them as unresolved with candidates instead of silently choosing one.
         if len(field) <= 2:
+            return None, TaskDefinitionModule._source_field_candidate_columns(field, schema_contract)
+        if any(table.get("physical_columns_omitted", 0) and not
+               ((table.get("read_contract") or {}).get("validated_columns_exact") or
+                (table.get("read_contract") or {}).get("columns_exact"))
+               for table in schema_contract.get("tables", []) if isinstance(table, dict)):
             return None, TaskDefinitionModule._source_field_candidate_columns(field, schema_contract)
         matches = difflib.get_close_matches(field, physical_columns, n=1, cutoff=0.72)
         if matches:
@@ -2285,18 +2340,15 @@ class TaskDefinitionModule:
         new = str(new or "").strip()
         if not old or not new or old == new:
             return out
-        for left, right in [("`", "`"), ("“", "”"), ('"', '"')]:
-            out = out.replace(f"{left}{old}{right}", f"{left}{new}{right}")
-        out = re.sub(rf"(?<=::){re.escape(old)}(?=($|[（(\s`'\"，,。；;、\)\]）】]))", new, out)
-        # Safe bare-word replacement for Chinese aliases in source-field prose.
-        # The negative CJK/word boundaries avoid changing generated output
-        # columns such as "总标准箱数".
-        out = re.sub(
-            rf"(?<![\w\u4e00-\u9fff]){re.escape(old)}(?![\w\u4e00-\u9fff])",
-            new,
-            out,
-        )
-        return out
+        escaped = re.escape(old)
+        aliases = [rf"(?P<quoted>(?<=`){escaped}(?=`)|(?<=“){escaped}(?=”)|(?<=\"){escaped}(?=\"))",
+                   rf"(?P<qualified>(?<=::){escaped}(?=$|[（(\s`'\"，,。；;、\)\]）】]))"]
+        if re.search(r"[\u4e00-\u9fff]", old):
+            aliases.append(rf"(?P<bare>(?<!\w){escaped}(?!\w))")
+        # Consume existing exact names first, and replace once. This prevents
+        # an alias inside the replacement from being expanded on the next pass.
+        pattern = rf"(?P<exact>{re.escape(new)})|" + "|".join(aliases)
+        return re.sub(pattern, lambda match: match[0] if match.group("exact") else new, out)
 
     @staticmethod
     def _apply_source_field_alias_corrections_to_text(text: str, corrections: list[dict]) -> str:
@@ -2362,6 +2414,16 @@ class TaskDefinitionModule:
         return contract
 
     @staticmethod
+    def _is_declared_output_reference(field: str, sample_spec: SampleSubmissionSpec, text: str) -> bool:
+        if field not in sample_spec.columns:
+            return False
+        escaped = re.escape(field)
+        return bool(re.search(
+            rf"(?:输出(?:列|字段)?|派生(?:列|字段)?|output(?: column| field)?|derive(?:d)?(?: output)?)\s*[`\"“']?{escaped}(?!\w)",
+            text, flags=re.IGNORECASE,
+        ))
+
+    @staticmethod
     def _correct_sample_spec_source_fields(
         sample_spec: SampleSubmissionSpec,
         *,
@@ -2380,6 +2442,12 @@ class TaskDefinitionModule:
         non_column_names = TaskDefinitionModule._exact_schema_non_column_names(schema_contract)
         if not physical_columns or not sample_spec.source_fields:
             return []
+        # These diagnostics are derived, not source rules. Recompute them when
+        # the parser/schema changes; their prior versions remain in the audit.
+        sample_spec.validation_rules = [rule for rule in sample_spec.validation_rules
+            if not str(rule).startswith(("AutoRealize corrected source field alias",
+                                         "AutoRealize could not resolve source field alias",
+                                         "AutoRealize resolved source field alias"))]
 
         corrections: list[dict] = []
         unresolved: list[dict] = []
@@ -2387,9 +2455,10 @@ class TaskDefinitionModule:
         for output_col, raw in sample_spec.source_fields.items():
             text = str(raw or "")
             new_text = text
-            for token in TaskDefinitionModule._source_field_alias_tokens(text):
+            for token in TaskDefinitionModule._source_field_alias_tokens(text, non_column_names, physical_column_set):
                 field = str(token or "").strip()
-                if not field or field in physical_column_set or field in non_column_names:
+                if (not field or field in physical_column_set or field in non_column_names
+                        or TaskDefinitionModule._is_declared_output_reference(field, sample_spec, text)):
                     continue
                 replacement, candidates = TaskDefinitionModule._resolve_exact_source_field_alias(
                     field,
@@ -2397,6 +2466,9 @@ class TaskDefinitionModule:
                     physical_columns=physical_columns,
                     non_column_names=non_column_names,
                 )
+                if field in sample_spec.columns:
+                    candidates = [replacement] if replacement else candidates
+                    replacement = None
                 if not replacement:
                     unresolved.append(
                         {
@@ -2461,9 +2533,10 @@ class TaskDefinitionModule:
         candidate_rows: list[dict] = []
         groups: list[dict] = []
         for output_column, raw in (sample_spec.source_fields or {}).items():
-            for alias in self._source_field_alias_tokens(str(raw or "")):
+            for alias in self._source_field_alias_tokens(str(raw or ""), non_column_names, physical_column_set):
                 field = str(alias or "").strip()
-                if not field or field in physical_column_set or field in non_column_names:
+                if (not field or field in physical_column_set or field in non_column_names
+                        or field in sample_spec.columns):
                     continue
                 deterministic, exact_candidates = self._resolve_exact_source_field_alias(
                     field,
@@ -2660,6 +2733,7 @@ class TaskDefinitionModule:
             return []
 
         alias_sources: dict[str, set[str]] = {}
+        output_used_as_input: set[str] = set()
 
         def add(alias: str, source: str) -> None:
             field = str(alias or "").strip().strip("`'\"“”‘’")
@@ -2670,8 +2744,11 @@ class TaskDefinitionModule:
             alias_sources.setdefault(field, set()).add(source)
 
         for output_col, raw in (sample_spec.source_fields or {}).items():
-            for token in TaskDefinitionModule._source_field_alias_tokens(str(raw or "")):
+            for token in TaskDefinitionModule._source_field_alias_tokens(str(raw or ""), non_column_names, physical_column_set):
                 add(token, f"sample_submission_spec.source_fields.{output_col}")
+                if token in sample_spec.columns and not TaskDefinitionModule._is_declared_output_reference(
+                        token, sample_spec, str(raw or "")):
+                    output_used_as_input.add(token)
 
         constraint_memory = downstream_context.get("constraint_memory")
         items = constraint_memory.get("items", []) if isinstance(constraint_memory, dict) else []
@@ -2685,17 +2762,28 @@ class TaskDefinitionModule:
         if isinstance(authoritative, dict):
             for key in ["output_requirements", "evaluation_requirements", "constraints"]:
                 for text in authoritative.get(key, []) if isinstance(authoritative.get(key), list) else []:
-                    for token in TaskDefinitionModule._source_field_alias_tokens(str(text or "")):
+                    for token in TaskDefinitionModule._source_field_alias_tokens(str(text or ""), non_column_names, physical_column_set):
                         add(token, f"authoritative_memory.{key}")
 
         guard: list[dict] = []
         for alias in sorted(alias_sources):
+            if alias in sample_spec.columns and alias not in output_used_as_input:
+                guard.append({
+                    "alias": alias, "source": sorted(alias_sources[alias]),
+                    "status": "declared_output_not_physical_column",
+                    "derivation_source": sample_spec.source_fields.get(alias, "See output contract"),
+                    "rule": "This is a declared output column, not an unresolved input alias. Generate it using the output/evaluation contract; never replace it with a similar input column or read it as an input feature.",
+                })
+                continue
             replacement, candidates = TaskDefinitionModule._resolve_exact_source_field_alias(
                 alias,
                 schema_contract=schema_contract,
                 physical_columns=physical_columns,
                 non_column_names=non_column_names,
             )
+            if alias in output_used_as_input:
+                candidates = [replacement] if replacement else candidates
+                replacement = None
             entry: dict[str, object] = {
                 "alias": alias,
                 "source": sorted(alias_sources[alias])[:6],
@@ -2753,7 +2841,9 @@ class TaskDefinitionModule:
                 status = item.get("status")
                 exact = item.get("exact_physical_column")
                 candidates = item.get("candidate_exact_columns")
-                if exact:
+                if status == "declared_output_not_physical_column":
+                    lines.append(f"- `{alias}`: 已声明的输出列；按输出和评估合同生成，不是输入物理字段，不得按名称相似性替换或读取。")
+                elif exact:
                     lines.append(f"- `{alias}`: 使用精确物理列 `{exact}` 读取；业务词只作解释或派生名。")
                 elif candidates:
                     lines.append(f"- `{alias}`: 未确认同名物理列；候选精确字段 {candidates}，需显式派生或保守记录假设。")
@@ -3304,6 +3394,8 @@ class TaskDefinitionModule:
                     "issues": [],
                     "purpose": current_plan.purpose,
                 }
+                self._synchronize_generated_sample_metadata(
+                    sample_spec, report, build_data_schema_contract(file_summaries), target_file)
                 self._write_submission_report(report)
                 return report
             last_issues = blocking or validator.fixes or ["validator_rejected_sample_submission"]
@@ -3376,7 +3468,7 @@ class TaskDefinitionModule:
             "约束与防泄漏",
             "关键坑点与待确认事项",
         }
-        title = str(section_title or "").strip()
+        title = re.sub(r"^##\s+", "", str(section_title or "").strip())
         text = self._strip_markdown_fence(replacement).strip()
         if title not in allowed or not text.startswith(f"## {title}"):
             return desc
@@ -3412,9 +3504,196 @@ class TaskDefinitionModule:
             item = sections.get(key)
             if isinstance(item, dict):
                 item["markdown"] = self._h2_section_text(desc, title)
+                if key == "output" and downstream_context.get("sample_submission_spec"):
+                    item["sample_submission_spec"] = downstream_context["sample_submission_spec"]
         downstream_context["final_description_sha256_16"] = hashlib.sha256(
             desc.encode("utf-8", errors="replace")
         ).hexdigest()[:16]
+
+    @staticmethod
+    def _source_requires_sample(downstream_context: dict, official_sample_probe: dict) -> bool:
+        authority = downstream_context.get("authoritative_submission_contract", {})
+        return bool(official_sample_probe.get("columns") or authority.get("sample_filename"))
+
+    def _sync_sample_requirement(self, problem_review, protocol_bundle, downstream_context, official_sample_probe):
+        required = self._source_requires_sample(downstream_context, official_sample_probe)
+        protocol_bundle.output.sample_submission_required = required
+        problem_review.requires_sample_submission = required
+        authority = downstream_context.get("authoritative_submission_contract", {})
+        sample = downstream_context.get("sample_submission_spec", {})
+        if (problem_review.problem_paradigm in {"static_optimization", "reinforcement_learning"}
+                and authority.get("is_defined") is False and not authority.get("output_filename")
+                and sample.get("should_generate") is False and sample.get("output_filename") == ""
+                and protocol_bundle.output.output_filename == "submission.csv"):
+            downstream_context.setdefault("source_diagnostic_history", []).append({
+                "field": "output.output_filename", "previous": "submission.csv", "current": "",
+                "reason": "Remove the default filename where both source contract and generated output protocol explicitly leave it unspecified.",
+            })
+            protocol_bundle.output.output_filename = ""
+            downstream_context["submission_output_filename"] = ""
+        prior_notes = [note for note in problem_review.method_routing_notes if "requires_sample_submission" in note]
+        if prior_notes:
+            downstream_context.setdefault("source_diagnostic_history", []).append({
+                "field": "problem_paradigm_review.method_routing_notes", "previous_notes": prior_notes,
+                "reason": "Revalidated sample requirement against source contract; table output alone does not require a sample file.",
+            })
+            problem_review.method_routing_notes = [note for note in problem_review.method_routing_notes
+                                                   if "requires_sample_submission" not in note]
+            problem_review.method_routing_notes.append(
+                f"来源核验后 requires_sample_submission={str(required).lower()}；"
+                "是否生成可选格式样例由 should_generate 单独决定，格式样例不代表最终预测已验证。"
+            )
+        downstream_context["problem_paradigm_review"] = problem_review.model_dump()
+
+    @staticmethod
+    def _remove_generated_diagnostic_section(desc: str, title: str, level: int) -> str:
+        lines = desc.splitlines()
+        start = next((idx for idx, line in enumerate(lines) if line.strip() == "#" * level + " " + title), None)
+        if start is None:
+            return desc
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            heading = re.match(r"^(#{1,6}) ", lines[idx])
+            if heading and len(heading[1]) <= level:
+                end = idx
+                break
+        return "\n".join(lines[:start] + lines[end:]).strip() + "\n"
+
+    @staticmethod
+    def _synchronize_generated_sample_metadata(sample_spec, report, schema, target_file):
+        if (report.get("source") != "sample_spec_builder+validator" or report.get("passed") is not True
+                or sample_spec.source == "official_sample" or not target_file.is_file()):
+            return
+        from itertools import islice
+        with target_file.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != sample_spec.columns:
+                raise ValueError("Generated sample metadata cannot be synchronized with different file columns")
+            preview = list(islice(reader, 5))
+        sample_spec.sample_filename = target_file.name
+        report["target_file"] = target_file.name
+        report["preview"] = preview
+        source_text = "\n".join(sample_spec.source_fields.values())
+        tables = [str(table.get("table_id", "")) for table in schema.get("tables", [])]
+        declared = sorted({table for table in tables if table and table in source_text})
+        report.setdefault("seed_table", report.get("candidate_table", ""))
+        report["candidate_table"] = declared[0] if len(declared) == 1 else ""
+        report["declared_source_tables"] = declared
+        report["source_table_basis"] = "Explicit table references in the sample specification; not a runtime IO trace. seed_table is only the initially supplied dataframe."
+
+    def refresh_output_source_diagnostics(
+        self, *, desc: str, sample_spec: SampleSubmissionSpec,
+        protocol_bundle: DescriptionProtocolBundle, problem_review: ProblemParadigmReview,
+        downstream_context: dict, file_summaries: list,
+    ) -> str:
+        """Refresh parser-owned diagnostics without regenerating source evidence."""
+        from ..investigation import reconcile_question_memory
+
+        for owner, key in (
+            (downstream_context.get("agent_context_pack", {}), "question_memory"),
+            (downstream_context.get("knowledge_base", {}), "question_investigation"),
+            (downstream_context, "question_investigation"),
+        ):
+            if isinstance(owner, dict) and isinstance(owner.get(key), dict):
+                owner[key] = reconcile_question_memory(owner[key])
+        qdi_path = self.report_dir / "question_investigation_report.json"
+        if qdi_path.is_file():
+            qdi = json.loads(qdi_path.read_text(encoding="utf-8"))
+            write_json_safe(qdi_path, reconcile_question_memory(qdi), indent=2)
+        agent_pack = downstream_context.get("agent_context_pack")
+        if isinstance(agent_pack, dict):
+            write_json_safe(self.report_dir / "agent_context_pack.json", agent_pack, indent=2)
+        refreshed_access = build_data_access_protocol(file_summaries)
+        read_contracts = {item.path: item.read_contract for item in refreshed_access.files}
+        for item in protocol_bundle.data_access.files:
+            if item.path in read_contracts:
+                item.read_contract = read_contracts[item.path]
+        access = downstream_context.get("data_access_protocol", {})
+        for item in access.get("files", []):
+            if item.get("path") in read_contracts:
+                item["read_contract"] = read_contracts[item["path"]]
+        if access:
+            write_json_safe(self.report_dir / "data_access_protocol.json", access, indent=2)
+        schema = build_data_schema_contract(file_summaries)
+        for section_name, section in downstream_context.get("description_sections", {}).items():
+            if not isinstance(section, dict):
+                continue
+            for index, fact in enumerate(section.get("facts_used", [])):
+                corrected = fact
+                for fs in file_summaries:
+                    if fs.path not in fact or Path(fs.path).suffix.lower() in {".xlsx", ".xls", ".xlsm"}:
+                        continue
+                    facts = reconcile_table_shape(fs.source_metadata or {}, fs.column_profiles, is_worksheet=False)
+                    corrected = re.sub(r"\brow_count_basis=\w+", "row_count_basis=" + facts["row_count_basis"], corrected)
+                    rows = facts.get("verified_row_count")
+                    corrected = re.sub(r"\bverified_row_count=(?:\d+|unverified)",
+                                       "verified_row_count=" + (str(rows) if rows is not None else "unverified"), corrected)
+                if corrected != fact:
+                    downstream_context.setdefault("source_diagnostic_history", []).append({
+                        "field": f"description_sections.{section_name}.facts_used[{index}]",
+                        "previous": fact, "current": corrected,
+                        "reason": "Refresh reader-owned population metadata; preserve all other source claims.",
+                    })
+                    section["facts_used"][index] = corrected
+        previous_sample = downstream_context.get("sample_submission_spec", {})
+        corrections = self._correct_sample_spec_source_fields(sample_spec, schema_contract=schema)
+        downstream_context["sample_submission_spec"] = sample_spec.model_dump()
+        downstream_context["sample_submission_source_field_corrections"] = corrections
+        submission_path = self.report_dir / "submission_report.json"
+        if submission_path.is_file():
+            previous_submission = json.loads(submission_path.read_text(encoding="utf-8"))
+            self._synchronize_generated_sample_metadata(
+                sample_spec, previous_submission, schema, self.run_dir / "sample_submission.csv")
+            downstream_context["sample_submission_spec"] = sample_spec.model_dump()
+            if previous_submission.get("source") == "sample_spec_builder+validator" and previous_submission.get("passed"):
+                write_json_safe(submission_path, previous_submission, indent=2)
+                downstream_context["sample_submission_status"] = previous_submission
+            if (previous_submission.get("source") in {"sample_spec_generation_failed", "not_regenerated_after_schema_repair"}
+                    and not (self.run_dir / "sample_submission.csv").is_file()):
+                history_path = self.report_dir / "submission_diagnostic_history.json"
+                history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.is_file() else []
+                history.append({"sample_spec_at_refresh": previous_sample, "report": previous_submission})
+                write_json_safe(history_path, history, indent=2)
+                unresolved = [rule for rule in sample_spec.validation_rules
+                              if rule.startswith("AutoRealize could not resolve source field alias")]
+                refreshed_submission = {
+                    "schema_version": "autorealize.submission_report.v1", "passed": False,
+                    "source": "not_regenerated_after_schema_repair", "target_file": None,
+                    "columns": sample_spec.columns, "issues": unresolved,
+                    "validation_scope": "source_schema_diagnostics_only",
+                    "current_source_mapping_checked": not unresolved,
+                    "sample_submission_available": False, "final_prediction_validated": False,
+                    "previous_attempt_report": history_path.name,
+                    "reason": "Source mapping diagnostics were refreshed. The earlier failed generation is historical; no sample file or final model predictions were generated by this refresh.",
+                }
+                write_json_safe(submission_path, refreshed_submission, indent=2)
+                downstream_context["sample_submission_status"] = refreshed_submission
+                downstream_context["sample_submission_generation_status"] = refreshed_submission["source"]
+                downstream_context["sample_submission_generation_issues"] = list(unresolved)
+                downstream_context["sample_submission_available"] = False
+                downstream_context["generated_submission_path"] = ""
+                downstream_context["generated_submission_columns"] = []
+        self._sync_sample_requirement(problem_review, protocol_bundle, downstream_context,
+                                      {"columns": sample_spec.columns} if sample_spec.source == "official_sample" else {})
+        downstream_context["description_protocol_bundle"] = protocol_bundle.model_dump()
+        downstream_context["problem_paradigm_review"] = problem_review.model_dump()
+        guard = self._collect_source_alias_guard(
+            sample_spec=sample_spec, schema_contract=schema, downstream_context=downstream_context,
+        )
+        downstream_context["source_alias_guard"] = guard
+        current = self._remove_generated_diagnostic_section(desc, "源字段精确性修正", 3)
+        current = self._remove_generated_diagnostic_section(current, "源字段别名警戒", 2)
+        output = self._h2_section_text(current, "输出或提交格式")
+        output = self._apply_source_field_corrections_to_output_markdown(output, sample_spec, corrections)
+        current = self._replace_h2_section(current, "输出或提交格式", output)
+        self._sync_final_description_sections(current, downstream_context)
+        section = downstream_context.get("description_sections", {}).get("output", {})
+        section["sample_submission_spec"] = sample_spec.model_dump()
+        self._write_protocol_artifacts(
+            problem_review=problem_review, deterministic_data_access=downstream_context.get("data_access_protocol", {}),
+            protocol_bundle=protocol_bundle,
+        )
+        return self._apply_source_alias_guard_to_description(current, guard)
 
     def _review_final_artifact_consistency(
         self,
@@ -3442,37 +3721,72 @@ class TaskDefinitionModule:
             ],
         }
         dynamic_payload = {
-            "instruction": "审查当前最终候选产物；列出最小、可定位、可修复的问题。",
-            "round": round_idx,
-            "description_markdown": desc,
             "problem_paradigm_review": problem_review.model_dump(),
-            "description_protocol_bundle": protocol_bundle.model_dump(),
             "evaluation_contract": evaluation_contract.model_dump(),
             "sample_submission_spec": sample_spec.model_dump(),
             "submission_report": submission_report,
-            "automl_context_pack": automl_context_pack,
-            "main_task_protocol": main_task_protocol,
             "qdi_conclusions": self._question_memory_pack(downstream_context),
             "source_alias_guard": downstream_context.get("source_alias_guard", []),
+            "description_protocol_bundle": protocol_bundle.model_dump(),
+            "automl_context_pack": automl_context_pack,
+            "main_task_protocol": main_task_protocol,
+            "description_markdown": desc,
             "deterministic_defects": deterministic_defects,
+            "instruction": "审查当前最终候选产物；列出最小、可定位、可修复的问题。",
+            "round": round_idx,
         }
         stable, dynamic = self._stage_prompt(
-            stage=f"artifact_consistency_reviewer_{round_idx}",
+            stage="artifact_consistency_reviewer",
             stable=stable_payload,
             dynamic=dynamic_payload,
             stable_title="Stable artifact audit rules",
             dynamic_title="Latest final artifact candidates",
             dynamic_limit=52000,
+            complete_current_snapshot=True,
         )
+        review_model = ArtifactConsistencyReview
+        review_system = self.services.prompt_mgr.load("system/artifact_consistency_reviewer.md")
+        if getattr(self.config.prompt, "lossless_review_prompts", False):
+            review_model = ArtifactConsistencyAudit
+            review_system += "\n" + REVIEW_COVERAGE_INSTRUCTIONS
         return self.services.llm_client.ask_structured(
-            model_cls=ArtifactConsistencyReview,
-            system_prompt=self.services.prompt_mgr.load("system/artifact_consistency_reviewer.md"),
+            model_cls=review_model,
+            system_prompt=review_system,
             user_prompt=dynamic,
             prompt_name=f"artifact_consistency_reviewer_{round_idx}",
-            max_tokens=4500,
+            max_tokens=32768,
             static_context_prompt=stable,
             dynamic_user_prompt=dynamic,
         )
+
+    @staticmethod
+    def _artifact_description_issues(review: ArtifactConsistencyReview) -> list[dict]:
+        repairable = []
+        mirror_titles = {"output.markdown": "输出或提交格式", "data.markdown": "数据说明",
+                         "fields.markdown": "关键字段说明", "constraints_leakage.markdown": "约束与防泄漏",
+                         "tips.markdown": "关键坑点与待确认事项",
+                         "overview_task_definition.overview_markdown": "任务概述",
+                         "overview_task_definition.task_definition_markdown": "任务定义"}
+        for issue in review.issues:
+            item = issue.model_dump()
+            section = str(issue.section or "").strip()
+            if issue.repair_target == "machine_contract":
+                match = re.match(r"^main_task_protocol\.frozen_description_sections\.([a-z_]+\.[a-z_]+)(?:$|\s|/)", section)
+                titles = [mirror_titles[match.group(1)]] if match and match.group(1) in mirror_titles else []
+                for ref in issue.evidence_refs:
+                    prose = re.match(r"^(?:description\.md|description_markdown)\s*(?:::|>)\s*([^/>:]+)", ref)
+                    if prose and prose.group(1).strip() in mirror_titles.values():
+                        titles.append(prose.group(1).strip())
+                for title in dict.fromkeys(titles):
+                    repairable.append({**item, "repair_target": "description_section", "section": title})
+                continue
+            if item["repair_target"] != "description_section" or not section:
+                continue
+            if " > " in section:
+                section = section.split(" > ", 1)[0].strip()
+            item["section"] = section
+            repairable.append(item)
+        return repairable
 
     def _build_artifact_consistency_patch(
         self,
@@ -3481,11 +3795,7 @@ class TaskDefinitionModule:
         review: ArtifactConsistencyReview,
         round_idx: int,
     ) -> ArtifactConsistencyPatch:
-        repairable = [
-            issue.model_dump()
-            for issue in review.issues
-            if str(issue.repair_target or "") == "description_section" and str(issue.section or "").strip()
-        ]
+        repairable = self._artifact_description_issues(review)
         if not repairable:
             return ArtifactConsistencyPatch()
         stable_payload = {
@@ -3522,6 +3832,226 @@ class TaskDefinitionModule:
             dynamic_user_prompt=dynamic,
         )
 
+    def _repair_final_evaluation_contract(
+        self,
+        *,
+        desc: str,
+        feedback: list[str],
+        evaluation_contract: EvaluationContractReview,
+        problem_review: ProblemParadigmReview,
+        protocol_bundle: DescriptionProtocolBundle,
+        downstream_context: dict,
+        automl_context_pack: dict,
+        main_task_protocol: dict,
+        repair_context: dict,
+    ) -> str:
+        """Recompile from preserved evidence, then refresh every live handoff copy."""
+        evidence = self._build_evaluation_evidence_pack(
+            downstream_context=downstream_context,
+            problem_review=problem_review,
+            relations=repair_context["relations"],
+            file_summaries=repair_context["file_summaries"],
+            protocol_bundle=protocol_bundle,
+        )
+        repaired = self._review_evaluation_contract(
+            original_text=repair_context["original_text"],
+            downstream_context=downstream_context,
+            evaluation_evidence_pack=evidence,
+            frozen_task_sections={title: self._h2_section_text(desc, title)
+                                  for title in ("任务概述", "任务定义")},
+            previous_contract=evaluation_contract,
+            reflection_feedback=feedback,
+        )
+        defects = evaluation_contract_defects(repaired)
+        if defects or not repaired.passed or not repaired.executable:
+            self._write_evaluation_contract_report(evaluation_contract)
+            raise RuntimeError("Evaluation repair rejected: " + "; ".join(defects or repaired.issues))
+        return self._synchronize_final_evaluation_contract(
+            desc=desc, repaired=repaired, evaluation_contract=evaluation_contract,
+            problem_review=problem_review, protocol_bundle=protocol_bundle, downstream_context=downstream_context,
+            automl_context_pack=automl_context_pack, main_task_protocol=main_task_protocol,
+            repair_context=repair_context,
+        )
+
+    def _synchronize_final_evaluation_contract(
+        self, *, desc, repaired, evaluation_contract, problem_review, protocol_bundle,
+        downstream_context, automl_context_pack, main_task_protocol, repair_context,
+    ) -> str:
+        defects = evaluation_contract_defects(repaired)
+        if defects or not repaired.passed or not repaired.executable:
+            raise RuntimeError("Cannot synchronize an invalid evaluation contract: " + "; ".join(defects))
+        # Callers retain these object identities until the final report is saved.
+        for field, value in repaired.model_dump().items():
+            setattr(evaluation_contract, field, value)
+        downstream_context["evaluation_contract"] = repaired.model_dump()
+        self._write_evaluation_contract_report(repaired)
+        self._remember_stage("evaluation_contract", repaired.model_dump(), authority=repaired.authority_status)
+        current = self._replace_h2_section(
+            desc, "评估协议", self._render_evaluation_section(repaired, downstream_context)
+        )
+        self._sync_final_description_sections(current, downstream_context)
+        refreshed_pack = self._write_automl_context_pack(
+            protocol_bundle=protocol_bundle,
+            file_summaries=repair_context["file_summaries"],
+            downstream_context=downstream_context,
+            evaluation_contract=repaired,
+            relations=repair_context["relations"],
+        )
+        automl_context_pack.clear()
+        automl_context_pack.update(refreshed_pack)
+        refreshed_protocol = self._write_main_task_protocol(
+            task_hint=downstream_context.get("task_hint", ""),
+            problem_review=problem_review,
+            protocol_bundle=protocol_bundle,
+            deterministic_data_access=downstream_context.get("data_access_protocol", {}),
+            evaluation_contract=repaired,
+            automl_context_pack=automl_context_pack,
+            downstream_context=downstream_context,
+        )
+        main_task_protocol.clear()
+        main_task_protocol.update(refreshed_protocol)
+        return current
+
+    def _repair_final_open_questions(
+        self, *, review, evaluation_contract, problem_review, protocol_bundle,
+        downstream_context, automl_context_pack, main_task_protocol, repair_context,
+    ) -> None:
+        questions = automl_context_pack.get("execution_contract", {}).get("open_questions", [])
+        qdi = self._question_memory_pack(downstream_context)
+        evidence = {f"qdi:{answer['question_id']}": answer for answer in qdi["answers"]
+                    if answer.get("question_id") and answer.get("evidence")}
+        evidence["evaluation_contract"] = evaluation_contract.model_dump()
+        stable, dynamic = self._stage_prompt(
+            stage="open_question_repair", stable={"instruction": "Resolve only evidence-backed stale open-question text."},
+            dynamic={"available_evidence": evidence, "current_questions": questions,
+                     "issues": [item.model_dump() for item in review.issues]},
+            stable_title="Stable task evidence", dynamic_title="Current question state and verified evidence",
+            complete_current_snapshot=True,
+        )
+        repair = self.services.llm_client.ask_structured(
+            model_cls=OpenQuestionRepair,
+            system_prompt=self.services.prompt_mgr.load("system/open_question_repair.md"),
+            user_prompt=dynamic, prompt_name="open_question_repair", max_tokens=5000,
+            static_context_prompt=stable, dynamic_user_prompt=dynamic,
+        )
+        records = []
+        seen = set()
+        for item in repair.resolutions:
+            if (item.original_text not in questions or item.original_text in seen
+                    or not item.evidence_refs or not set(item.evidence_refs).issubset(evidence)
+                    or not item.reason.strip() or item.remaining_questions == [item.original_text]):
+                raise RuntimeError("Open-question repair lacks an exact current question or visible supporting evidence")
+            seen.add(item.original_text)
+            records.append(item.model_dump())
+        if not records:
+            raise RuntimeError("Open-question repair produced no supported changes")
+        downstream_context.setdefault("open_question_resolutions", []).extend(records)
+        self._remember_stage("open_question_repair", repair.model_dump(), authority="evidence_backed_question_state")
+        write_json_safe(self.report_dir / "open_question_resolution_report.json", {
+            "resolutions": downstream_context["open_question_resolutions"],
+            "unresolved_issue_ids": repair.unresolved_issue_ids,
+        }, indent=2)
+        refreshed_pack = self._write_automl_context_pack(
+            protocol_bundle=protocol_bundle, file_summaries=repair_context["file_summaries"],
+            downstream_context=downstream_context, evaluation_contract=evaluation_contract,
+            relations=repair_context["relations"],
+        )
+        automl_context_pack.clear()
+        automl_context_pack.update(refreshed_pack)
+        refreshed_protocol = self._write_main_task_protocol(
+            task_hint=downstream_context.get("task_hint", ""), problem_review=problem_review,
+            protocol_bundle=protocol_bundle, deterministic_data_access=downstream_context.get("data_access_protocol", {}),
+            evaluation_contract=evaluation_contract, automl_context_pack=automl_context_pack,
+            downstream_context=downstream_context,
+        )
+        main_task_protocol.clear()
+        main_task_protocol.update(refreshed_protocol)
+
+    def _repair_final_section_facts(self, *, issues, downstream_context, evaluation_contract, repair_context):
+        sections = downstream_context.get("description_sections", {})
+        fields = section_fact_fields(sections, issues)
+        if not fields:
+            return False
+        evidence = {"evaluation_contract": evaluation_contract.model_dump(),
+                    "original_requirements": repair_context["original_text"],
+                    "verified_data_access": downstream_context.get("data_access_protocol", {}),
+                    "current_section_markdown": {name: section.get("markdown", "") for name, section in sections.items()
+                                                 if isinstance(section, dict) and any(f"/{name}/" in path for path in fields)}}
+        evidence_refs = section_fact_evidence_refs(evidence, issues)
+        stable, dynamic = self._stage_prompt(
+            stage="section_fact_repair", stable={"evidence": evidence},
+            dynamic={"current_repairable_fields": fields, "allowed_evidence_refs": sorted(evidence_refs),
+                     "issues": [issue.model_dump() for issue in issues]},
+            stable_title="Verified evidence for audited facts", dynamic_title="Exact fact repairs",
+            complete_current_snapshot=True)
+        repair = self.services.llm_client.ask_structured(
+            model_cls=DerivedContractRepair, system_prompt=self.services.prompt_mgr.load("system/section_fact_repair.md"),
+            user_prompt=dynamic, prompt_name="section_fact_repair", max_tokens=32768,
+            static_context_prompt=stable, dynamic_user_prompt=dynamic)
+        updated = apply_section_fact_repairs(sections, repair, issues=issues, evidence_refs=evidence_refs)
+        downstream_context["description_sections"] = updated
+        write_json_safe(self.report_dir / "section_fact_repair_report.json", repair.model_dump(), indent=2)
+        return True
+
+    def _repair_final_derived_contracts(
+        self, *, review, evaluation_contract, problem_review, protocol_bundle, sample_spec,
+        downstream_context, automl_context_pack, main_task_protocol, repair_context,
+    ) -> None:
+        authority = downstream_context.get("authoritative_submission_contract", {})
+        allow_output_columns = (isinstance(authority, dict) and authority.get("is_defined") is False
+            and authority.get("is_authoritative") is False and not authority.get("columns")
+            and not authority.get("sample_filename") and sample_spec.source != "official_sample")
+        evidence = {"evaluation_contract": evaluation_contract.model_dump(),
+                    "original_requirements": repair_context["original_text"],
+                    "verified_data_access": downstream_context.get("data_access_protocol", {})}
+        stable, dynamic = self._stage_prompt(
+            stage="derived_contract_repair",
+            stable={"instruction": "Repair audited derived rules against preserved authoritative evidence."},
+            dynamic={"available_evidence": evidence, "allowed_evidence_refs": sorted(evidence),
+                     "current_repairable_fields": repairable_fields(protocol_bundle, sample_spec, allow_output_columns=allow_output_columns),
+                     "issues": [issue.model_dump() for issue in review.issues]},
+            stable_title="Stable repair policy", dynamic_title="Audited conflicts and exact current field values",
+            complete_current_snapshot=True,
+        )
+        repair = self.services.llm_client.ask_structured(
+            model_cls=DerivedContractRepair,
+            system_prompt=self.services.prompt_mgr.load("system/derived_contract_repair.md"),
+            user_prompt=dynamic, prompt_name="derived_contract_repair", max_tokens=32768,
+            static_context_prompt=stable, dynamic_user_prompt=dynamic,
+        )
+        bundle, sample = apply_derived_repairs(
+            protocol_bundle, sample_spec, repair,
+            issue_ids={issue.issue_id for issue in review.issues}, evidence_refs=set(evidence),
+            allow_output_columns=allow_output_columns,
+        )
+        for field, value in bundle.__dict__.items():
+            setattr(protocol_bundle, field, value)
+        for field, value in sample.__dict__.items():
+            setattr(sample_spec, field, value)
+        downstream_context["sample_submission_spec"] = sample.model_dump()
+        output_section = downstream_context.get("description_sections", {}).get("output")
+        if isinstance(output_section, dict) and "sample_submission_spec" in output_section:
+            output_section["sample_submission_spec"] = sample.model_dump()
+        self._write_protocol_artifacts(problem_review=problem_review,
+            deterministic_data_access=bundle.data_access, protocol_bundle=bundle)
+        write_json_safe(self.report_dir / "derived_contract_repair_report.json", repair.model_dump(), indent=2)
+        self._remember_stage("derived_contract_repair", repair.model_dump(), authority="evidence_backed_derived_contract")
+        refreshed_pack = self._write_automl_context_pack(
+            protocol_bundle=protocol_bundle, file_summaries=repair_context["file_summaries"],
+            downstream_context=downstream_context, evaluation_contract=evaluation_contract,
+            relations=repair_context["relations"],
+        )
+        automl_context_pack.clear()
+        automl_context_pack.update(refreshed_pack)
+        refreshed_protocol = self._write_main_task_protocol(
+            task_hint=downstream_context.get("task_hint", ""), problem_review=problem_review,
+            protocol_bundle=protocol_bundle, deterministic_data_access=downstream_context.get("data_access_protocol", {}),
+            evaluation_contract=evaluation_contract, automl_context_pack=automl_context_pack,
+            downstream_context=downstream_context,
+        )
+        main_task_protocol.clear()
+        main_task_protocol.update(refreshed_protocol)
+
     def _audit_and_repair_final_artifacts(
         self,
         *,
@@ -3538,6 +4068,7 @@ class TaskDefinitionModule:
         downstream_context: dict,
         deterministic_defects: list[str],
         source_coverage_ledger: dict,
+        evaluation_repair_context: dict | None = None,
     ) -> tuple[str, ArtifactConsistencyReview, list[str]]:
         if not bool(getattr(self.config.prompt, "artifact_consistency_enabled", True)):
             return desc, ArtifactConsistencyReview(passed=True, summary="disabled_by_config"), deterministic_defects
@@ -3578,12 +4109,102 @@ class TaskDefinitionModule:
                 break
             if round_idx >= max_rounds:
                 break
+            machine_repaired = False
+            question_issues = [issue for issue in review.issues if issue.repair_target == "machine_contract"
+                               and issue.section in {"open_questions", "execution_contract.open_questions"}]
+            if question_issues and evaluation_repair_context is not None:
+                try:
+                    self._repair_final_open_questions(
+                        review=ArtifactConsistencyReview(passed=False, issues=question_issues),
+                        evaluation_contract=evaluation_contract, problem_review=problem_review,
+                        protocol_bundle=protocol_bundle, downstream_context=downstream_context,
+                        automl_context_pack=automl_context_pack, main_task_protocol=main_task_protocol,
+                        repair_context=evaluation_repair_context,
+                    )
+                    rounds[-1]["open_questions_repaired"] = [issue.issue_id for issue in question_issues]
+                except Exception as exc:  # noqa: BLE001
+                    rounds[-1]["question_repair_error"] = str(exc)
+                    break
+                machine_repaired = True
+            machine_issues = [issue for issue in review.issues
+                              if issue.repair_target == "machine_contract"
+                              and (re.match(r"^evaluation_contract(?:$|[.\[/\s])", issue.section.strip())
+                                   or "evaluation_contract" in re.split(r"[;,，；、\s]+", issue.artifact))]
+            if machine_issues and evaluation_repair_context is not None:
+                try:
+                    current = self._repair_final_evaluation_contract(
+                        desc=current,
+                        feedback=[dumps_json_safe(issue.model_dump()) for issue in machine_issues],
+                        evaluation_contract=evaluation_contract,
+                        problem_review=problem_review,
+                        protocol_bundle=protocol_bundle,
+                        downstream_context=downstream_context,
+                        automl_context_pack=automl_context_pack,
+                        main_task_protocol=main_task_protocol,
+                        repair_context=evaluation_repair_context,
+                    )
+                    deterministic_defects = self._artifact_sanity_check(
+                        desc=current, data_root=data_root, legacy=legacy, sample_spec=sample_spec,
+                        evaluation_contract=evaluation_contract, source_coverage_ledger=source_coverage_ledger,
+                    )
+                    rounds[-1]["evaluation_contract_repaired"] = [issue.issue_id for issue in machine_issues]
+                except Exception as exc:  # noqa: BLE001
+                    rounds[-1]["evaluation_repair_error"] = str(exc)
+                    break
+                machine_repaired = True
+            derived_issues = [issue for issue in review.issues if issue.repair_target == "machine_contract"
+                              and (re.match(r"^(?:sample_submission_spec|description_protocol_bundle)(?:$|[.\[/\s])", issue.section.strip())
+                                   or issue.artifact.strip() in {"sample_submission_spec", "description_protocol_bundle"}
+                                   or any(re.match(r"^(?:sample_submission_spec|description_protocol_bundle)\.", ref)
+                                          for ref in issue.evidence_refs))]
+            if derived_issues and evaluation_repair_context is not None:
+                try:
+                    self._repair_final_derived_contracts(
+                        review=ArtifactConsistencyReview(passed=False, issues=derived_issues),
+                        evaluation_contract=evaluation_contract, problem_review=problem_review,
+                        protocol_bundle=protocol_bundle, sample_spec=sample_spec,
+                        downstream_context=downstream_context, automl_context_pack=automl_context_pack,
+                        main_task_protocol=main_task_protocol, repair_context=evaluation_repair_context,
+                    )
+                    deterministic_defects = self._artifact_sanity_check(
+                        desc=current, data_root=data_root, legacy=legacy, sample_spec=sample_spec,
+                        evaluation_contract=evaluation_contract, source_coverage_ledger=source_coverage_ledger,
+                    )
+                    rounds[-1]["derived_contract_repaired"] = [issue.issue_id for issue in derived_issues]
+                    machine_repaired = True
+                except Exception as exc:  # noqa: BLE001
+                    rounds[-1]["derived_repair_error"] = str(exc)
+                    break
+            fact_issues = [issue for issue in review.issues
+                           if section_fact_fields(downstream_context.get("description_sections", {}), [issue])]
+            if fact_issues and evaluation_repair_context is not None:
+                try:
+                    self._repair_final_section_facts(issues=fact_issues, downstream_context=downstream_context,
+                        evaluation_contract=evaluation_contract, repair_context=evaluation_repair_context)
+                    main_task_protocol["frozen_description_sections"] = downstream_context["description_sections"]
+                    refreshed_pack = self._write_automl_context_pack(
+                        protocol_bundle=protocol_bundle, file_summaries=evaluation_repair_context["file_summaries"],
+                        downstream_context=downstream_context, evaluation_contract=evaluation_contract,
+                        relations=evaluation_repair_context["relations"])
+                    automl_context_pack.clear()
+                    automl_context_pack.update(refreshed_pack)
+                    rounds[-1]["section_facts_repaired"] = [issue.issue_id for issue in fact_issues]
+                    machine_repaired = True
+                except Exception as exc:
+                    rounds[-1]["section_fact_repair_error"] = str(exc)
+                    break
+            if machine_repaired and not self._artifact_description_issues(review):
+                continue
             patch = self._build_artifact_consistency_patch(desc=current, review=review, round_idx=round_idx)
             if not patch.revised_sections:
                 break
             candidate = current
             for section, markdown in patch.revised_sections.items():
                 candidate = self._replace_h2_section(candidate, section, markdown)
+            if candidate == current:
+                rounds[-1]["patch"] = patch.model_dump()
+                rounds[-1]["patch_rejected"] = "no_effective_section_change"
+                break
             patch_missing_refs = legacy._find_missing_file_references(candidate, data_root)
             rounds[-1]["patch"] = patch.model_dump()
             rounds[-1]["patch_missing_file_references"] = patch_missing_refs
@@ -3610,6 +4231,8 @@ class TaskDefinitionModule:
                 patch.model_dump(),
                 authority="bounded_description_patch",
             )
+            self._sync_final_description_sections(current, downstream_context)
+            main_task_protocol["frozen_description_sections"] = downstream_context.get("description_sections", {})
         write_json_safe(
             self.report_dir / "artifact_consistency_report.json",
             {"final": review.model_dump(), "rounds": rounds},
@@ -4401,17 +5024,20 @@ class TaskDefinitionModule:
             }
             evaluation_evidence_pack = {
                 "downstream_context": compact_context,
-                "legacy_current_evaluation_section": self._h2_section_text(desc, "评估协议")[:5000] if desc else "",
-                "legacy_current_output_section": self._h2_section_text(desc, "输出或提交格式")[:4000] if desc else "",
+                "legacy_current_evaluation_section": self._h2_section_text(desc, "评估协议") if desc else "",
+                "legacy_current_output_section": self._h2_section_text(desc, "输出或提交格式") if desc else "",
             }
         stable_payload = {
             "context_policy": self._headroom_context_policy(),
             "output_language_policy": self._output_language_policy(),
             "instruction": (
                 "根据紧凑证据包编译或修复严格的 EvaluationContractReview。"
-                "不要检查或改写完整 description。普通审查轮在证据不足时可以设置 passed=false，"
-                "并给出简短 issues/fixes；最终轮必须在必要时使用明确标注的 AutoRealize 假设，"
-                "写出完整且可执行的合同。"
+                "首轮即编译完整可执行规则，后续只修复具体缺陷，不改写其它章节。"
+                "最终评分必须是唯一有限数值，score_representation=scalar，不允许分层或元组排名。"
+                "多目标缺少官方权重时按系统规则定义并披露固定的标量化假设，不得仅因缺权重而拒绝标量化。"
+                "区分可配置的实现默认值、执行时必须核验的数据事实以及缺失的业务输入。"
+                "缺少业务日期、容量或安全限制不得靠假设补齐；尚待代码核验的数据统计可写为前置检查，"
+                "不得假装这些检查已经运行。"
             ),
             "original_requirements_full": original_text,
             "evaluation_evidence_pack": evaluation_evidence_pack,
@@ -4435,19 +5061,20 @@ class TaskDefinitionModule:
             }
         review: EvaluationContractReview | None = None
         revision_log: list[dict] = []
-        max_rounds = max(3, int(getattr(self.config.prompt, "evaluation_contract_max_rounds", 3)))
+        max_rounds = max(1, int(getattr(self.config.prompt, "evaluation_contract_max_rounds", 3)))
         for idx in range(max_rounds):
             is_finalizer_round = idx == max_rounds - 1
             if review is None:
-                dynamic_payload = reflection_payload or {"instruction": "生成评估合同审查结果。"}
+                dynamic_payload = reflection_payload or {"instruction": "编译完整评估合同，包含精确评分规则、失败处理、数据前置检查和已标注的实现默认值。"}
             else:
                 defects = evaluation_contract_defects(review)
                 dynamic_payload = {
                     **reflection_payload,
                     "repair_instruction": (
                         "上一轮评估协议合同没有通过审查，必须返修后重新输出完整 JSON。"
-                        "如果 passed=false 是因为证据缺口，请先尝试转化为明确的评估假设、惩罚规则、数据需求或外部配置要求。"
-                        "只有当缺失信息会让主指标无法计算时才保留 passed=false，并必须给出 issues/fixes。"
+                        "可配置的技术选择写入 assumptions，待执行的数据检查写入 validation_protocol。"
+                        "真实业务输入或安全约束缺失必须保留，不能编造日期、容量或成本以求通过。"
+                        "规则仍无法执行时保留 passed=false，并给出具体 issues/fixes。"
                     ),
                     "previous_defects": defects,
                     "previous_issues": review.issues,
@@ -4460,16 +5087,19 @@ class TaskDefinitionModule:
                     "finalizer_instruction": (
                         "这是最后一轮，你现在是最终评估合同作者。"
                         "必须输出完整 EvaluationContractReview JSON，但不得为了通过而隐藏证据缺口。"
-                        "不得输出未明确、待补充、待确认、unknown、tbd、推荐、可选、通常、视情况、可以考虑。"
+                        "评分规则不得留未绑定占位符；缺失业务事实须如实写入 issues/residual_issues。"
                         "如果官方材料缺少唯一评分公式、权重、惩罚系数或非法解处理规则，"
                         "请将缺口转化为清晰标注的 AutoRealize-defined evaluation assumption、"
-                        "由输入数据上界推导的规则，或外部评估配置参数；仍要给出一个当前可执行的默认公式。"
+                        "由冻结输入推导的规则，或已绑定值与来源的评估配置参数；不得把参数留待用户填入。"
+                        "禁止用假设替代缺失的真实日期、运力、成本或安全条件。"
                         "此时设置 executable=true、authority_status=autorealize_assumption，并把假设写进 assumptions。"
                         "只有在缺失信息使唯一标量仍不可执行时才设置 passed=false、executable=false、authority_status=unresolved。"
                         "不要编造不存在的输入字段、官方样例列、车牌号、车辆唯一 ID 或官方规则。"
                         "如果需要资源实例但输入没有唯一实体 ID，只能使用方案输出中的确定性派生 ID 或占位资源 ID，"
                         "并在 y_pred_source/submission_checks 中说明。"
                         "已经由明确假设解决的问题进入 assumptions/residual_issues；仍阻塞执行的问题保留在 issues/fixes。"
+                        "只定义评估合同，不预先固定候选算法、模型超参或禁用Fusion；仅保留用户已明确的建模限制。"
+                        "软件检查评分与被测试求解器内部的业务目标分开，按用户实际授权范围填写ranking_scope。"
                     ),
                 }
                 if review is not None:
@@ -4492,7 +5122,7 @@ class TaskDefinitionModule:
             )
             review = self.services.llm_client.ask_structured(
                 model_cls=EvaluationContractReview,
-                system_prompt=system,
+                system_prompt=system + "\n" + EVALUATION_REVIEW_INSTRUCTIONS,
                 user_prompt=dynamic,
                 prompt_name=(
                     f"evaluation_contract_finalizer_{idx+1}"
@@ -4502,23 +5132,18 @@ class TaskDefinitionModule:
                 static_context_prompt=stable,
                 dynamic_user_prompt=dynamic,
             )
+            if review.authority_status not in {"official", "autorealize_assumption", "unresolved"}:
+                review.authority_status = "unresolved"
+            if review.assumptions and (review.passed or review.authority_status == "official"):
+                review.authority_status = "autorealize_assumption"
             if is_finalizer_round:
-                if review.authority_status not in {"official", "autorealize_assumption", "unresolved"}:
-                    review.authority_status = "unresolved"
-                if review.assumptions and review.authority_status == "unresolved" and review.passed:
-                    review.authority_status = "autorealize_assumption"
-                elif review.passed and review.authority_status == "unresolved" and not review.assumptions:
-                    review.authority_status = "official"
                 review.executable = bool(review.executable or review.passed)
                 defects = evaluation_contract_defects(review)
                 if defects:
                     review.passed = False
                     review.executable = False
                     review.authority_status = "unresolved"
-                    review.residual_issues = self._dedupe_strings(
-                        list(review.residual_issues or []) + defects,
-                        limit=20,
-                    )
+                    review.residual_issues = list(dict.fromkeys(list(review.residual_issues or []) + defects))
             else:
                 defects = evaluation_contract_defects(review)
             revision_log.append(
@@ -4649,6 +5274,7 @@ class TaskDefinitionModule:
             ),
             "evaluation_contract": evaluation_contract.model_dump(),
             "output_contract": protocol_bundle.output.model_dump(),
+            "execution_contract": automl_context_pack.get("execution_contract", {}),
             "sample_submission_spec": downstream_context.get("sample_submission_spec", {}),
             "sample_submission_status": {
                 "available": bool(downstream_context.get("sample_submission_available", False)),
@@ -4749,7 +5375,7 @@ class TaskDefinitionModule:
     ) -> tuple[str, EvaluationContractReview]:
         current_contract = evaluation_contract
         current_desc = desc
-        max_rounds = max(3, int(getattr(self.config.prompt, "evaluation_reflection_max_rounds", 3)))
+        max_rounds = max(1, int(getattr(self.config.prompt, "evaluation_reflection_max_rounds", 3)))
         for idx in range(1, max_rounds + 1):
             current_desc, current_contract = self._safe_apply_evaluation_contract(
                 desc=current_desc,
@@ -4805,9 +5431,14 @@ class TaskDefinitionModule:
                 self._write_evaluation_contract_report(current_contract)
                 return current_desc, current_contract
             feedback = reflection.ambiguity_points + reflection.fixes
-            if not feedback:
+            if not feedback or idx == max_rounds:
+                current_contract.passed = False
+                current_contract.executable = False
+                current_contract.residual_issues = list(dict.fromkeys(
+                    current_contract.residual_issues + feedback + ["Evaluation reflection did not establish an unambiguous contract."]
+                ))
                 self._write_evaluation_contract_report(current_contract)
-                return current_desc, current_contract
+                raise RuntimeError("Evaluation reflection budget exhausted with unresolved ambiguity")
             current_contract = self._review_evaluation_contract(
                 desc=current_desc,
                 original_text=original_text,
@@ -4885,6 +5516,7 @@ class TaskDefinitionModule:
             file_summaries=cognition.file_summaries,
         )
 
+        legacy._refine_file_summaries_by_downstream_context(cognition.file_summaries, downstream_context)
         deterministic_data_access = build_data_access_protocol(cognition.file_summaries)
         downstream_context["data_access_protocol"] = deterministic_data_access.model_dump()
         self._initialize_cross_stage_context(
@@ -4956,7 +5588,6 @@ class TaskDefinitionModule:
             plan.evaluation_formula = task_cls.metric_formula
         self.services.trajectory.log("task_definition_module", "task_classifier", task_cls.model_dump())
 
-        legacy._refine_file_summaries_by_downstream_context(cognition.file_summaries, downstream_context)
         rel_hints_refined = legacy.detect_relations(
             cognition.table_columns,
             file_summaries=cognition.file_summaries,
@@ -4964,8 +5595,9 @@ class TaskDefinitionModule:
             max_workers=self.config.parallel.relations_max_workers,
         )
         dir_summaries_refined = legacy._summarize_dirs(data_root, cognition.file_summaries)
-        write_data_description(data_description_path, cognition.file_summaries, dir_summaries_refined, rel_hints_refined)
-        append_constraint_memory_section(data_description_path, cognition.constraint_memory)
+        if not self.config.switches.resume_task_definition:
+            write_data_description(data_description_path, cognition.file_summaries, dir_summaries_refined, rel_hints_refined)
+            append_constraint_memory_section(data_description_path, cognition.constraint_memory)
         data_description_text = data_description_path.read_text(encoding="utf-8")
         data_digest = data_description_text[:16000]
 
@@ -5025,6 +5657,13 @@ class TaskDefinitionModule:
             data_digest=data_description_text,
         )
         downstream_context["evaluation_contract"] = evaluation_contract.model_dump()
+        task_cls.primary_metric = evaluation_contract.primary_metric
+        task_cls.metric_formula = evaluation_contract.metric_formula or evaluation_contract.scalar_score_formula
+        plan.evaluation_metric = task_cls.primary_metric
+        plan.evaluation_formula = task_cls.metric_formula
+        self._remember_stage(
+            "task_classification", task_cls.model_dump(), authority="derived_from_evaluation_contract"
+        )
         self._remember_stage(
             "evaluation_contract",
             evaluation_contract.model_dump(),
@@ -5079,9 +5718,7 @@ class TaskDefinitionModule:
             sample_spec.columns = [str(x) for x in official_sample_probe.get("columns", []) if str(x).strip()]
         protocol_bundle.output.columns = sample_spec.columns or protocol_bundle.output.columns
         protocol_bundle.output.output_filename = sample_spec.output_filename or protocol_bundle.output.output_filename
-        protocol_bundle.output.sample_submission_required = bool(
-            sample_spec.should_generate or (isinstance(official_sample_probe, dict) and official_sample_probe.get("columns"))
-        )
+        self._sync_sample_requirement(problem_review, protocol_bundle, downstream_context, official_sample_probe)
         if sample_spec.format_rules:
             protocol_bundle.output.format_rules = list(dict.fromkeys(protocol_bundle.output.format_rules + sample_spec.format_rules))
         if sample_spec.no_sample_submission_reason:
@@ -5354,6 +5991,14 @@ class TaskDefinitionModule:
             "constraints_leakage": constraint_section.model_dump(),
             "tips": tips_section.model_dump(),
         }
+        desc = self.refresh_output_source_diagnostics(
+            desc=desc, sample_spec=sample_spec, protocol_bundle=protocol_bundle,
+            problem_review=problem_review, downstream_context=downstream_context,
+            file_summaries=cognition.file_summaries,
+        )
+        self._sync_final_description_sections(desc, downstream_context)
+        if downstream_context.get("sample_submission_status", {}).get("source") == "not_regenerated_after_schema_repair":
+            submission_report = downstream_context["sample_submission_status"]
         self._write_protocol_artifacts(
             problem_review=problem_review,
             deterministic_data_access=deterministic_data_access,
@@ -5390,11 +6035,27 @@ class TaskDefinitionModule:
             downstream_context=downstream_context,
             deterministic_defects=defects,
             source_coverage_ledger=final_source_ledger,
+            evaluation_repair_context={
+                "original_text": original_text,
+                "file_summaries": cognition.file_summaries,
+                "relations": rel_hints_refined,
+            },
         )
         downstream_context["artifact_consistency_review"] = consistency_review.model_dump()
+        downstream_context["defects_after_gate"] = list(defects)
         self._sync_final_description_sections(desc, downstream_context)
-        # The consistency patcher can only change reader-facing sections. Rebuild
-        # the protocol snapshot so it cannot retain pre-patch frozen markdown.
+        automl_context_pack = self._write_automl_context_pack(
+            protocol_bundle=protocol_bundle,
+            file_summaries=cognition.file_summaries,
+            downstream_context=downstream_context,
+            evaluation_contract=evaluation_contract,
+            relations=rel_hints_refined,
+        )
+        task_cls.primary_metric = evaluation_contract.primary_metric
+        task_cls.metric_formula = evaluation_contract.metric_formula or evaluation_contract.scalar_score_formula
+        plan.evaluation_metric = task_cls.primary_metric
+        plan.evaluation_formula = task_cls.metric_formula
+        # The audit may repair both the contract and its reader-facing sections.
         main_task_protocol = self._write_main_task_protocol(
             task_hint=task_hint,
             problem_review=problem_review,

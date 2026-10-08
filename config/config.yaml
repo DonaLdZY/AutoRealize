@@ -286,6 +286,8 @@ prompt:
   artifact_consistency_max_rounds: 2
   # Convert remaining blocking semantic issues into task defects / 是否将阻断级语义问题写入最终 defects
   artifact_consistency_fail_on_blocking: false
+  # strict blocks downstream stages; continue_on_exhaustion records review findings as risks
+  review_gate_policy: strict
   # Resolve ambiguous downstream candidates with a bounded LLM choice / 对歧义下游候选进行受约束 LLM 消歧
   downstream_context_llm_resolution_enabled: true
   downstream_context_resolution_max_dimensions: 5

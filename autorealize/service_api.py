@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -174,7 +175,6 @@ def _extract_last_error_from_output(text: str, *, limit: int = 1200) -> str:
         "ValidationError",
         "Pydantic validation failed",
         "LLM structured output failed",
-        "Traceback",
         "Error:",
         "error:",
     ]
@@ -182,6 +182,8 @@ def _extract_last_error_from_output(text: str, *, limit: int = 1200) -> str:
         lower = line.lower()
         if any(noise in lower for noise in noisy_fragments):
             continue
+        if re.match(r"^[\w.]+(?:Error|Exception|Exceeded):", line):
+            return line[-limit:]
         if any(sig.lower() in lower for sig in signal_fragments):
             return line[-limit:]
     for line in reversed(lines):

@@ -43,12 +43,18 @@ def detect_relations(
         for path in summary_index
         if "::" in path
     }
-    for workbook_path in workbook_paths_with_sheets:
-        relation_columns.pop(workbook_path, None)
     for path, summary in summary_index.items():
         columns = [str(column) for column in (summary.get("columns") or []) if str(column).strip()]
         if columns:
             relation_columns[path] = columns
+    # The workbook-level profile aliases its default sheet, not another table.
+    for workbook_path in workbook_paths_with_sheets:
+        relation_columns.pop(workbook_path, None)
+    for path, summary in summary_index.items():
+        meta = summary.get("source_metadata") or {}
+        if (meta.get("kind") == "document" or meta.get("parsed_kind") == "document") and not summary.get("profiles"):
+            # Described field names in prose are not observed columns to join.
+            relation_columns.pop(path, None)
     items = list(relation_columns.items())
     pairs: list[tuple[tuple[str, list[str]], tuple[str, list[str]]]] = []
     for i in range(len(items)):

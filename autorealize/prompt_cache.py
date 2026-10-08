@@ -50,7 +50,7 @@ def json_block(
     sort_keys: bool = True,
 ) -> str:
     """Render deterministic JSON under a stable title."""
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=sort_keys, indent=2, default=str)
+    text = lossless_json(payload, sort_keys=sort_keys)
     if limit is not None and limit > 0 and len(text) > limit:
         original_chars = len(text)
         visible_budget = max(80, int(limit) - 240)
@@ -66,7 +66,7 @@ def json_block(
                 "visible_json_head": text[:head_chars],
                 "visible_json_tail": text[-tail_chars:],
             }
-            bounded = json.dumps(envelope, ensure_ascii=False, sort_keys=False, indent=2)
+            bounded = json.dumps(envelope, ensure_ascii=False, sort_keys=False, separators=(",", ":"))
             if len(bounded) <= limit or (head_chars <= 20 and tail_chars <= 20):
                 # Valid JSON is more important than a tiny limit overrun caused
                 # by the fixed truncation metadata itself.
@@ -78,6 +78,45 @@ def json_block(
             tail_chars -= tail_reduction
             head_chars -= head_reduction
     return f"{title}\n{text}"
+
+
+def lossless_json(
+    payload: Any, *, sort_keys: bool = True,
+    canonical_matches: bool = False, min_shared_chars: int = 512,
+) -> str:
+    """Factor exact repeated values using backward JSON Pointers, without clipping."""
+    def dumps(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), default=str)
+
+    plain = dumps(payload)
+    # Avoid ambiguity with source objects that already use this marker.
+    if len(plain) < 2048 or '"$prompt_ref"' in plain:
+        return plain
+    safe = json.loads(plain)
+    seen: dict[str, str] = {}
+
+    def visit(value: Any, pointer: str) -> Any:
+        serialized = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if canonical_matches else dumps(value)
+        )
+        if len(serialized) >= min_shared_chars:
+            previous = seen.get(serialized)
+            if previous is not None:
+                return {"$prompt_ref": previous}
+            seen[serialized] = pointer
+        if isinstance(value, dict):
+            return {key: visit(item, pointer + "/" + key.replace("~", "~0").replace("/", "~1"))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [visit(item, pointer + "/" + str(index)) for index, item in enumerate(value)]
+        return value
+
+    factored = dumps({
+        "_prompt_encoding": "Lossless input encoding: a sole $prompt_ref object aliases the complete earlier value at that JSON Pointer in this envelope. Resolve aliases when reading; all facts and constraints apply in every referenced location. This is not the requested output schema.",
+        "data": visit(safe, "/data"),
+    })
+    return factored if len(factored) + 200 < len(plain) else plain
 
 
 def text_block(title: str, text: Any, *, limit: int | None = None) -> str:
@@ -94,16 +133,27 @@ def join_blocks(*blocks: str) -> str:
 
 
 def _stable_payload(payload: Any) -> Any:
+    if isinstance(payload, (list, tuple)):
+        return [_canonical_payload(item) for item in payload]
     if not isinstance(payload, dict):
         return payload
     ordered: dict[str, Any] = {}
     for key in _STABLE_PRIORITY_KEYS:
         if key in payload:
-            ordered[key] = payload[key]
-    for key, value in payload.items():
+            ordered[key] = _canonical_payload(payload[key])
+    for key in sorted(payload, key=str):
         if key not in ordered:
-            ordered[key] = value
+            ordered[key] = _canonical_payload(payload[key])
     return ordered
+
+
+def _canonical_payload(payload: Any) -> Any:
+    """Normalize mapping order without reordering semantic arrays or identifiers."""
+    if isinstance(payload, dict):
+        return {key: _canonical_payload(payload[key]) for key in sorted(payload, key=str)}
+    if isinstance(payload, (list, tuple)):
+        return [_canonical_payload(item) for item in payload]
+    return payload
 
 
 def stable_dynamic_prompt(

@@ -3,6 +3,7 @@
 import base64
 import builtins
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import fnmatch
 import inspect
 import json
 import logging
@@ -196,6 +197,9 @@ def _extract_constraint_memory(
                         "evidence": [fs.path, fs.summary[:160]],
                         "related_fields": [c for c in fs.columns if any(k.lower() in str(c).lower() for k in kws)][:12],
                         "priority": "high" if "约束" in cname or "容量" in cname else "medium",
+                        "strength": "unknown",
+                        "status": "unresolved",
+                        "status_reason": "Keyword observation only; no business constraint has been confirmed.",
                     }
                 )
 
@@ -215,6 +219,11 @@ def _extract_constraint_memory(
         "你是约束抽取器。请仅输出 JSON，结构必须满足给定 schema。"
         "你的任务是从文件摘要与字段中提取对任务有决定作用的业务约束、数据约束、评估约束。"
         "你还要在独立的 entity_alias_candidates 中提出跨表实体别名候选；候选不是约束，也不是等价结论。"
+        "strength=hard 仅用于有证据的必须满足条件；soft 用于允许权衡的偏好；证据不足用 unknown。"
+        "priority 是调查优先级，不是硬约束强度。acceptance_check 写可检查的字段、单位、边界和违约处理，"
+        "无法确定则留空并记录 unresolved_questions；不得从字段名称直接推导容量上限、成本公式或时间窗口。"
+        "文件摘要与其建模建议均为推断，不等于原文证据；不能将建议升级为现场审批、批次映射或固定滞后的硬性前提。"
+        "authority memory 的原文规则及证据优先，保留例外和适用条件；不因关联候选尚未确认就禁止全部离线建模。"
     )
     alias_schema = _compact_entity_alias_schema(
         file_summaries,
@@ -230,6 +239,8 @@ def _extract_constraint_memory(
     stable, dynamic = stable_dynamic_prompt(
         stable={
             "task_hint": task_hint,
+            "authoritative_rules": {key: (authoritative_memory or {}).get(key, []) for key in
+                                    ("input_requirements", "constraints", "leakage_guards", "evidence_items", "authority_conflicts")},
             "file_summaries": _compact_constraint_source_summaries(file_summaries),
             "entity_alias_schema": alias_schema,
             "requirement_fact_matrix": [
@@ -278,12 +289,8 @@ def _extract_constraint_memory(
         ),
     )
     out = mem.model_dump()
-    # Rule hints may enrich the LLM result, but they are never a replacement for LLM extraction.
-    if rule_items:
-        exist = {str(x.get("name", "")) for x in out.get("items", [])}
-        for it in rule_items:
-            if it.get("name") not in exist:
-                out.setdefault("items", []).append(it)
+    # Keyword matches guide later investigation; they cannot create requirements.
+    out["heuristic_observations"] = rule_items
     out["items"] = [
         item
         for item in out.get("items", [])
@@ -489,7 +496,12 @@ class AutoRealizePipeline:
         cognition_result = DataCognitionResult()
         task_result = TaskDefinitionResult()
 
-        if self.config.switches.run_data_cognition:
+        if self.config.switches.resume_task_definition:
+            cognition_module = DataCognitionModule(self.config, services, report_dir)
+            cognition_result = cognition_module.restore(data_out, task_hint)
+            log_event(logger, "module.data_cognition", "COMPLETED", restored_checkpoint=True,
+                      files=len(cognition_result.file_summaries))
+        elif self.config.switches.run_data_cognition:
             cognition_module = DataCognitionModule(self.config, services, report_dir)
             cognition_result = cognition_module.run(data_out, task_hint)
         else:
@@ -1903,6 +1915,24 @@ def _write_submission_report(run_dir: Path, payload: dict) -> None:
     )
 
 
+def _series_unique_ratio(series: pd.Series) -> float:
+    if series is None or len(series) == 0:
+        return 0.0
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return 0.0
+    try:
+        unique_count = non_null.nunique()
+    except TypeError:
+        normalized = non_null.map(
+            lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            if isinstance(value, (dict, list, tuple, set))
+            else f"{type(value).__name__}:{value!r}"
+        )
+        unique_count = normalized.nunique()
+    return float(unique_count) / float(len(non_null))
+
+
 def _infer_downstream_context(
     data_root: Path,
     file_summaries: list[FileSummary],
@@ -1962,13 +1992,7 @@ def _infer_downstream_context(
     def _unique_ratio(df: pd.DataFrame, col: str) -> float:
         if col not in df.columns:
             return 0.0
-        s = df[col]
-        if len(s) == 0:
-            return 0.0
-        nn = s.dropna()
-        if len(nn) == 0:
-            return 0.0
-        return float(nn.nunique()) / float(len(nn))
+        return _series_unique_ratio(df[col])
 
     def _best_col_by_keywords(columns: list[str], keyword_groups: list[list[str]]) -> str:
         lower = [str(c).lower() for c in columns]
@@ -3300,9 +3324,7 @@ def _rewrite_mutable_sections_with_llm(
 
 
 def _enforce_existing_file_references(desc: str, data_root: Path) -> str:
-    existing = {p.name for p in walk_files(data_root)}
-    # 保留系统输出文件名
-    existing |= {"description.md", "description_origin.md", "sample_submission.csv", "submission.csv"}
+    existing_paths, existing_names = _file_reference_inventory(data_root)
 
     pattern = re.compile(r"`([^`]+\.(?:csv|xlsx|xls|json|parquet|txt|md))`", flags=re.I)
     lines = desc.splitlines()
@@ -3310,8 +3332,7 @@ def _enforce_existing_file_references(desc: str, data_root: Path) -> str:
     for line in lines:
         bad = False
         for m in pattern.finditer(line):
-            fname = Path(m.group(1)).name
-            if fname not in existing:
+            if not _file_reference_matches(m.group(1), existing_paths, existing_names):
                 bad = True
                 break
         if bad:
@@ -3322,14 +3343,12 @@ def _enforce_existing_file_references(desc: str, data_root: Path) -> str:
 
 
 def _find_missing_file_references(desc: str, data_root: Path) -> list[str]:
-    existing = {p.name for p in walk_files(data_root)}
-    existing |= {"description.md", "description_origin.md", "sample_submission.csv", "submission.csv"}
+    existing_paths, existing_names = _file_reference_inventory(data_root)
     pattern = re.compile(r"`([^`]+\.(?:csv|xlsx|xls|json|parquet|txt|md))`", flags=re.I)
     missing: list[str] = []
     for m in pattern.finditer(desc):
-        fname = Path(m.group(1)).name
-        if fname not in existing:
-            missing.append(fname)
+        if not _file_reference_matches(m.group(1), existing_paths, existing_names):
+            missing.append(Path(m.group(1).replace("\\", "/")).name)
     uniq: list[str] = []
     seen = set()
     for x in missing:
@@ -3337,6 +3356,50 @@ def _find_missing_file_references(desc: str, data_root: Path) -> list[str]:
             seen.add(x)
             uniq.append(x)
     return uniq
+
+
+def _file_reference_inventory(data_root: Path) -> tuple[set[str], set[str]]:
+    """Return normalized relative paths and basenames accepted by task prose.
+
+    Task descriptions often use a glob such as ``成本/承运商* 承运商成本.xlsx``
+    to describe a family of input workbooks.  Comparing only ``Path.name``
+    makes that valid reference look missing; keeping both forms also preserves
+    compatibility with the existing compact ``file.xlsx::Sheet1`` notation.
+    """
+
+    paths: set[str] = set()
+    names: set[str] = set()
+    for path in walk_files(data_root):
+        names.add(path.name.casefold())
+        try:
+            relative = path.relative_to(data_root).as_posix()
+        except ValueError:
+            relative = path.name
+        paths.add(relative.lstrip("./").casefold())
+    # These are generated outputs and may legitimately be referenced in the
+    # reusable code section even though they are not input files yet.
+    for name in ("description.md", "description_origin.md", "sample_submission.csv", "submission.csv"):
+        paths.add(name.casefold())
+        names.add(name.casefold())
+    return paths, names
+
+
+def _file_reference_matches(reference: str, existing_paths: set[str], existing_names: set[str]) -> bool:
+    raw = str(reference or "").strip().replace("\\", "/").lstrip("./").casefold()
+    if not raw:
+        return False
+    basename = raw.rsplit("/", 1)[-1]
+    # Exact references match either their relative path or their basename;
+    # the latter supports the established ``file.xlsx::sheet`` notation.
+    if raw in existing_paths or basename in existing_names:
+        return True
+    # Glob references are valid only when they resolve to at least one actual
+    # file.  Match both path and basename so directory-qualified and compact
+    # references behave consistently on Windows and POSIX.
+    return any(
+        fnmatch.fnmatchcase(candidate, raw) or fnmatch.fnmatchcase(candidate, basename)
+        for candidate in (*existing_paths, *existing_names)
+    )
 
 
 def _maybe_generate_predict_split(data_root: Path, downstream_context: dict, cfg: AutoRealizeConfig) -> None:
@@ -3424,4 +3487,3 @@ def _generate_predict_split_dataframe(
     if target_col and target_col in out.columns:
         out[target_col] = pd.NA
     return out
-

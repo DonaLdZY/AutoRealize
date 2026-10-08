@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import hashlib
@@ -18,7 +18,7 @@ from ..knowledge.local_store import make_entry_id
 from ..models import AuthoritativeTaskMemory, FileGroupingRegexPlan, FileRole, FileSamplingReview, FileSummary
 from ..prompt_cache import stable_dynamic_prompt
 from ..profiling.csv_utils import read_csv_auto
-from ..profiling.relations import detect_relations
+from ..profiling.relations import RelationHint, detect_relations
 from ..profiling.stats import infer_excel_sheet_layout
 from ..report_writer import append_constraint_memory_section, format_column_profile_inline, write_data_description
 from ..utils.filesystem import rel, walk_dirs, walk_files
@@ -36,6 +36,31 @@ class DataCognitionModule:
         self.services = services
         self.report_dir = report_dir
 
+    def restore(self, data_root: Path, task_hint: str) -> DataCognitionResult:
+        raw = json.loads((self.report_dir / "data_cognition_report.json").read_text(encoding="utf-8"))
+        if (raw.get("task_hint") != task_hint or not raw.get("files")
+                or raw.get("summary", {}).get("file_count") != len(raw["files"])):
+            raise ValueError("A complete cognition checkpoint with an unchanged task hint is required")
+        files = [FileSummary.model_validate(item) for item in raw["files"]]
+        for file in files:
+            path = (data_root / file.path).resolve()
+            if not path.is_relative_to(data_root.resolve()) or not path.exists():
+                raise ValueError(f"Cognition checkpoint source is unavailable: {file.path}")
+        texts = raw.get("original_requirement_texts")
+        if texts is None:
+            texts = [self._read_authoritative_text(data_root / file.path)
+                     for file in files if file.role == FileRole.task_requirement]
+        return DataCognitionResult(
+            file_summaries=files, original_requirement_texts=texts,
+            table_columns=raw.get("table_columns") or {file.path: file.columns for file in files if file.columns},
+            relation_hints=[RelationHint(**item) for item in raw.get("relations", [])],
+            constraint_memory=raw.get("constraint_memory", {}),
+            authoritative_memory=raw.get("authoritative_memory", {}),
+            question_memory=raw.get("question_investigation", {}),
+            knowledge_base=raw.get("knowledge_base", {}), agent_context_pack=raw.get("agent_context_pack", {}),
+            data_description_path=self.report_dir / "data_description.md",
+        )
+
     def run(self, data_root: Path, task_hint: str) -> DataCognitionResult:
         import autorealize.pipeline as legacy
 
@@ -43,6 +68,7 @@ class DataCognitionModule:
         log_event(logger, "module.data_cognition", "ACTIVATED", data_root=str(data_root))
         tree_text = self._write_directory_tree(data_root)
         selected_files, compact_image_dirs, sampled_patterns, filename_sample_groups = self._select_files_with_pattern_sampling(data_root)
+        selected_files = sorted(selected_files, key=lambda file: rel(file, data_root))
         log_event(
             logger,
             "module.data_cognition",
@@ -93,7 +119,8 @@ class DataCognitionModule:
             log_event(logger, "module.data_cognition.parallel", "ACTIVATED", workers=workers, files=len(selected_files))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = [ex.submit(_one, file) for file in selected_files]
-                for fut in as_completed(futures):
+                # Work stays parallel; stable aggregation keeps downstream prompt prefixes reusable.
+                for fut in futures:
                     self._accept_file_result(fut.result(), file_summaries, table_columns, original_requirement_texts)
             log_event(logger, "module.data_cognition.parallel", "COMPLETED", files=len(selected_files))
         else:
@@ -237,6 +264,8 @@ class DataCognitionModule:
             "data_description": "data_description.md",
             "file_cognition_dir": "file_cognition",
             "files": [fs.model_dump() for fs in file_summaries],
+            "original_requirement_texts": original_requirement_texts,
+            "table_columns": table_columns,
             "directories": dir_summaries,
             "relations": [r.model_dump() if hasattr(r, "model_dump") else r.__dict__ for r in relation_hints],
             "filename_relations": filename_relations,
@@ -914,25 +943,55 @@ class DataCognitionModule:
             lines.append(line)
         return lines
 
-    def _read_authoritative_text(self, path: Path, max_chars: int = 24000) -> str:
+    def _read_authoritative_text(self, path: Path) -> str:
+        """Read all rules; decoding errors must not silently delete evidence."""
+        if path.suffix.lower() in {".docx", ".pdf"}:
+            from ..document_retrieval import _extract_document_sections
+            sections, _ = _extract_document_sections(path)
+            return "\n\n".join(f"[{location}]\n{text}" for location, text in sections)
         if path.suffix.lower() not in {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}:
             return ""
-        for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        raw = path.read_bytes()
+        encodings = ("utf-16",) if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else ("utf-8-sig", "gb18030")
+        for enc in encodings:
             try:
-                return path.read_text(encoding=enc, errors="ignore")[:max_chars]
-            except Exception:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
                 continue
-        return ""
+        raise ValueError(f"Cannot decode authoritative document without data loss: {path}")
 
-    def _is_authoritative_doc_name(self, path: Path) -> tuple[bool, str, str]:
+    def _is_authoritative_doc_name(
+        self, path: Path, data_root: Path | None = None
+    ) -> tuple[bool, str, str]:
+        """Workspace directory names do not confer document authority."""
         name = path.name.lower()
         stem = path.stem.lower()
-        rel_name = str(path).replace("\\", "/").lower()
+        suffix = path.suffix.lower()
+        document_suffixes = {".md", ".txt", ".yaml", ".yml", ".json", ".csv", ".docx", ".pdf"}
+        if suffix not in document_suffixes:
+            return False, "", "low"
+        rel_name = path.name.lower()
+        if data_root is not None:
+            try:
+                rel_name = path.resolve().relative_to(data_root.resolve()).as_posix().lower()
+            except (ValueError, OSError):
+                rel_name = path.name.lower()
+        parts = [part for part in rel_name.split("/") if part]
+        parent_parts = set(parts[:-1])
         if name == "description.md":
             return True, "original_description", "high"
         if stem.startswith("readme"):
             return True, "readme", "high"
-        if any(k in rel_name for k in ["requirement", "requirements", "task", "spec", "规则", "需求", "任务", "说明"]):
+        explicit_stem = re.search(
+            r"(?:^|[-\s_.])(?:requirement|requirements|spec|specification|rule|rules|task)(?:$|[-\s_.])",
+            stem,
+        ) or any(word in stem for word in ("需求", "任务", "规则", "说明"))
+        documentation_dir = bool(
+            parent_parts.intersection(
+                {"requirement", "requirements", "spec", "specs", "rules", "docs", "documentation", "需求", "规则", "说明"}
+            )
+        )
+        if explicit_stem or (documentation_dir and suffix in {".md", ".txt"}):
             return True, "requirement_doc", "high"
         return False, "", "low"
 
@@ -983,9 +1042,9 @@ class DataCognitionModule:
                 "source_path": source_path,
                 "source_type": source_type,
                 "priority": priority,
-                "text": text[:24000],
+                "text": text,
                 "columns": columns or [],
-                "evidence": evidence[:2000],
+                "evidence": evidence,
             }
             if payload["text"] or payload["columns"] or payload["evidence"]:
                 sources.append(payload)
@@ -1002,7 +1061,7 @@ class DataCognitionModule:
         for p in walk_files(data_root):
             if not p.is_file():
                 continue
-            is_doc, source_type, priority = self._is_authoritative_doc_name(p)
+            is_doc, source_type, priority = self._is_authoritative_doc_name(p, data_root)
             if is_doc:
                 text = self._read_authoritative_text(p)
                 if text.strip():
@@ -1026,18 +1085,27 @@ class DataCognitionModule:
         for fs in file_summaries:
             if fs.role != FileRole.task_requirement:
                 continue
+            if any(source["source_path"] == fs.path for source in sources):
+                continue
+            path = (data_root / fs.path).resolve()
+            if path.is_relative_to(data_root.resolve()) and path.is_file():
+                raw_text = self._read_authoritative_text(path)
+                if raw_text.strip():
+                    _add_source(source_path=fs.path, source_type="requirement_doc", priority="high",
+                                text=raw_text, evidence=raw_text[:1000])
+                    continue
             summary_text = "\n".join(
                 [
                     fs.summary or "",
                     fs.detailed_report or "",
-                    *[str(x) for x in (fs.extracted_knowledge or [])[:20]],
+                    *[str(x) for x in (fs.extracted_knowledge or [])],
                 ]
             ).strip()
             if summary_text:
                 _add_source(
                     source_path=fs.path,
-                    source_type="requirement_doc",
-                    priority="high",
+                    source_type="llm_inference",
+                    priority="low",
                     text=summary_text,
                     evidence=summary_text[:1000],
                 )
@@ -1083,9 +1151,17 @@ class DataCognitionModule:
                 "resolved/superseded when a later answer document identifies where X exists. Prefer an explicit "
                 "answer and verified source inventory over an earlier question or gap hypothesis. Future capabilities, "
                 "illustrative examples, and unresolved questions must not be promoted to current hard constraints."
+                " Sources labeled llm_inference are unverified navigation only, never original document evidence. "
+                "Do not promote modeling advice, inferred alignment rules or requests for stakeholder approval to "
+                "source requirements. Cite original text for documentary rules and preserve its exceptions."
+                " Priority overrides only actual conflicts: a brief user goal does not erase compatible detailed "
+                "requirements in supporting documents. Preserve exact numerical limits, formulas, units, both "
+                "sides of conflicting limits, and conditional or deferred applicability in the fact matrix. "
+                "Operational rules may be inapplicable to offline prediction while remaining documented limits; "
+                "do not omit them or turn them into a universal training blocker."
                 )
             },
-            dynamic={"sources": sources[:24]},
+            dynamic={"sources": sources},
             stable_title="Stable authoritative extraction rules",
             dynamic_title="Dynamic authoritative sources",
         )
@@ -1109,7 +1185,7 @@ class DataCognitionModule:
                     *[str(s.get("source_path", "")) for s in sources if str(s.get("source_path", "")).strip()],
                 ]
             )
-        )[:80]
+        )
 
         official_samples = [s for s in sources if s.get("source_type") == "official_sample" and s.get("columns")]
         if official_samples:
@@ -1216,9 +1292,9 @@ class DataCognitionModule:
                 "role": fs.role.value if hasattr(fs.role, "value") else str(fs.role),
                 "summary": str(fs.summary or "")[:1200],
                 "detailed_report": str(fs.detailed_report or "")[:6000],
-                "key_entities": [str(x) for x in (fs.key_entities or [])[:20]],
-                "related_files": [str(x) for x in (fs.related_files or [])[:20]],
-                "columns": [str(x) for x in (fs.columns or [])[:120]],
+                "key_entities": [str(x) for x in (fs.key_entities or [])],
+                "related_files": [str(x) for x in (fs.related_files or [])],
+                "columns": [str(x) for x in (fs.columns or [])],
                 "field_descriptions": {
                     str(col): str(desc)[:500]
                     for col, desc in (fs.column_semantics or {}).items()
@@ -1237,15 +1313,17 @@ class DataCognitionModule:
                     for p in (fs.column_profiles or [])[:120]
                     if str(p.get("name", "")).strip()
                 ],
-                "warnings": [str(x) for x in (fs.warnings or [])[:20]],
+                "warnings": [str(x) for x in (fs.warnings or [])],
             }
             if fs.role == FileRole.raw_data_table:
                 table_memories.append(payload)
             elif fs.role in {FileRole.task_requirement, FileRole.data_description}:
+                payload["summary"] = str(fs.summary or "")
+                payload["detailed_report"] = str(fs.detailed_report or "")
                 document_memories.append(payload)
 
         relation_memory: list[dict[str, Any]] = []
-        for hint in relation_hints[:120]:
+        for hint in relation_hints:
             if hasattr(hint, "model_dump"):
                 relation_memory.append(hint.model_dump())
             else:
@@ -1254,8 +1332,8 @@ class DataCognitionModule:
         submission_contract = {
             "is_defined": bool(contract.get("is_defined")),
             "is_authoritative": bool(contract.get("is_authoritative")),
-            "output_filename": str(contract.get("output_filename") or "submission.csv"),
-            "sample_filename": str(contract.get("sample_filename") or "sample_submission.csv"),
+            "output_filename": str(contract.get("output_filename") or ""),
+            "sample_filename": str(contract.get("sample_filename") or ""),
             "columns": [str(x) for x in contract.get("columns", []) if str(x).strip()],
             "column_descriptions": contract.get("column_descriptions", {}),
             "row_unit": str(contract.get("row_unit", "")),
@@ -1263,28 +1341,12 @@ class DataCognitionModule:
             "format_description": str(contract.get("format_description", "")),
             "validation_rules": [str(x) for x in contract.get("validation_rules", []) if str(x).strip()],
             "source": str(contract.get("source", "")),
-            "evidence": [str(x) for x in contract.get("evidence", []) if str(x).strip()][:12],
+            "evidence": [str(x) for x in contract.get("evidence", []) if str(x).strip()],
             "confidence": contract.get("confidence", 0.0),
             "unresolved_questions": [str(x) for x in contract.get("unresolved_questions", []) if str(x).strip()],
         }
 
-        authoritative_summary = {
-            "has_authoritative_sources": bool(memory.get("has_authoritative_sources")),
-            "source_files": source_files[:80],
-            "summary": str(memory.get("summary", ""))[:2000],
-            "task_goal": str(memory.get("task_goal", ""))[:2000],
-            "input_requirements": [str(x) for x in memory.get("input_requirements", []) if str(x).strip()][:30],
-            "output_requirements": [str(x) for x in memory.get("output_requirements", []) if str(x).strip()][:30],
-            "evaluation_requirements": [str(x) for x in memory.get("evaluation_requirements", []) if str(x).strip()][:30],
-            "constraints": [str(x) for x in memory.get("constraints", []) if str(x).strip()][:40],
-            "leakage_guards": [str(x) for x in memory.get("leakage_guards", []) if str(x).strip()][:30],
-            "unresolved_questions": [str(x) for x in memory.get("unresolved_questions", []) if str(x).strip()][:30],
-            "context_routing_notes": [str(x) for x in memory.get("context_routing_notes", []) if str(x).strip()][:30],
-            "authority_conflicts": [
-                item for item in (memory.get("authority_conflicts", []) or [])[:30] if isinstance(item, dict)
-            ],
-            "evidence_items": evidence_items[:40],
-        }
+        authoritative_summary = dict(memory)
 
         route_base = {
             "priority_order": [
@@ -1297,8 +1359,8 @@ class DataCognitionModule:
                 "filename sampling/grouping clues",
             ],
             "do_not_invent": [
-                "Do not invent submission columns or output filenames when no authoritative source defines them.",
-                "Do not invent a primary metric, metric direction, row count rule, or fixed random seed.",
+                "Never present implementation defaults as source facts. Technical filenames, seeds and output conventions may be fixed explicitly as documented assumptions when sources are silent.",
+                "Preserve the user's metric, direction, evaluation population and business constraints. Never assume missing business dates, capacity, costs or safety limits.",
                 "Do not override user task hints, existing description.md, README/spec constraints, or official samples with data-profile heuristics.",
                 "Do not treat field names such as id/target as a submission contract unless official evidence says so.",
                 "For RL or optimization tasks without an official tabular submission contract, keep the output protocol from the original description instead of fabricating sample_submission.csv.",
@@ -1341,7 +1403,7 @@ class DataCognitionModule:
                     "constraint_memory.items",
                     "data_memory.tables field profiles needed for y_true/y_pred",
                 ],
-                "repair_policy": "If strictness fails, return feedback to the LLM and convert gaps into explicit assumptions/rules unless the metric is truly uncomputable.",
+                "repair_policy": "Repair concrete rule defects; separate configurable technical defaults and pending runtime checks from missing real business inputs. Never invent the latter.",
             },
             "sample_submission_builder": {
                 **route_base,
@@ -1369,14 +1431,11 @@ class DataCognitionModule:
             "do_not_invent": route_base["do_not_invent"],
             "authoritative_memory": authoritative_summary,
             "submission_contract": submission_contract,
-            "constraint_memory": {
-                "summary": constraints.get("summary", ""),
-                "items": constraints.get("items", [])[:80] if isinstance(constraints.get("items", []), list) else [],
-            },
+            "constraint_memory": dict(constraints),
             "question_memory": _compact_question_memory(question_memory or (knowledge_base or {}).get("question_investigation", {})),
             "data_memory": {
-                "tables": table_memories[:80],
-                "documents": document_memories[:40],
+                "tables": table_memories,
+                "documents": document_memories,
                 "relations": relation_memory,
                 "sampled_filename_patterns": sampled_patterns[:80],
                 "filename_sample_groups": filename_sample_groups[:120],
@@ -1576,19 +1635,19 @@ def _compact_question_memory(question_memory: dict | None) -> dict:
         answers.append(
             {
                 "question_id": str(item.get("question_id", "")),
-                "question": str(item.get("question", ""))[:600],
-                "answer": str(item.get("answer", ""))[:1200],
-                "evidence": [str(x)[:500] for x in (item.get("evidence", []) or [])[:10]],
+                "question": str(item.get("question", "")),
+                "answer": str(item.get("answer", "")),
+                "evidence": [str(x) for x in (item.get("evidence", []) or [])],
                 "confidence": str(item.get("confidence", "")),
-                "remaining_uncertainty": str(item.get("remaining_uncertainty", ""))[:800],
-                "downstream_notes": [str(x)[:500] for x in (item.get("downstream_notes", []) or [])[:10]],
+                "remaining_uncertainty": str(item.get("remaining_uncertainty", "")),
+                "downstream_notes": [str(x) for x in (item.get("downstream_notes", []) or [])],
             }
         )
     return {
-        "summary": str(question_memory.get("summary", ""))[:2000],
-        "answers": answers[:80],
-        "unresolved_questions": [str(x)[:800] for x in (question_memory.get("unresolved_questions", []) or [])[:40]],
-        "context_routing_notes": [str(x)[:800] for x in (question_memory.get("context_routing_notes", []) or [])[:40]],
+        "summary": str(question_memory.get("summary", "")),
+        "answers": answers,
+        "unresolved_questions": [str(x) for x in (question_memory.get("unresolved_questions", []) or [])],
+        "context_routing_notes": [str(x) for x in (question_memory.get("context_routing_notes", []) or [])],
     }
 
 
@@ -2166,4 +2225,3 @@ def _dominant_schema_kind(values: list[str]) -> str:
 
 def _normalize_schema_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
-

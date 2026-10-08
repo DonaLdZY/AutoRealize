@@ -16,7 +16,7 @@ from autorealize.models import (
 )
 from autorealize.modules.task_definition import TaskDefinitionModule
 from autorealize.modules.types import RuntimeServices
-from autorealize.pipeline import _infer_downstream_context
+from autorealize.pipeline import _infer_downstream_context, _series_unique_ratio
 
 
 class _PromptManager:
@@ -32,6 +32,11 @@ class _ResolutionLLM:
     def ask_structured(self, **_kwargs):
         self.calls += 1
         return self.decision
+
+
+def test_unique_ratio_handles_nested_json_values() -> None:
+    values = pd.Series([["A", "B"], ["A", "B"], ["C"], None], dtype=object)
+    assert _series_unique_ratio(values) == 2 / 3
 
 
 def test_infer_downstream_context_handles_chinese_multisheet_and_placeholders(tmp_path) -> None:

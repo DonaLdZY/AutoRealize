@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import ast
+from copy import deepcopy
 import json
 import logging
 import os
@@ -35,6 +36,42 @@ from .utils.filesystem import rel
 from .utils.safe_json import write_json_safe
 
 logger = logging.getLogger(__name__)
+
+
+def reconcile_question_memory(memory: dict) -> dict:
+    """Keep answered questions with explicit residual uncertainty open in handoffs."""
+    result = deepcopy(memory)
+    latest = {answer.get("question_id"): answer for answer in result.get("answers", [])
+              if isinstance(answer, dict) and answer.get("question_id")}
+    residual = {qid: str(answer.get("remaining_uncertainty") or "").strip()
+                for qid, answer in latest.items() if str(answer.get("remaining_uncertainty") or "").strip()}
+    if not residual:
+        return result
+    unresolved = list(result.get("unresolved_questions") or [])
+    for qid, uncertainty in residual.items():
+        item = f"[{qid}] Remaining uncertainty: {uncertainty}"
+        if item not in unresolved:
+            unresolved.append(item)
+    for record in result.get("question_records", []) or []:
+        if isinstance(record, dict) and record.get("question_id") in residual:
+            record["status"] = "answered_with_uncertainty"
+            record["unresolved_reason"] = residual[record["question_id"]]
+    if result.get("summary") and "summary_before_uncertainty_reconciliation" not in result:
+        result["summary_before_uncertainty_reconciliation"] = result["summary"]
+    result["summary"] = (
+        f"已记录 {len(latest)} 个问题的回答，其中 {len(residual)} 个仍有明确不确定性；"
+        f"保留 {len(unresolved)} 项未解决事项。回答原文与取证历史保持不变。"
+    )
+    result["unresolved_questions"] = unresolved
+    progress = result.get("progress")
+    if isinstance(progress, dict):
+        progress["answered_questions"] = len(latest)
+        progress["resolved_questions"] = len(latest) - len(residual)
+        progress["unresolved_questions"] = len({
+            record.get("question_id") for record in result.get("question_records", [])
+            if isinstance(record, dict) and record.get("status") in {"unresolved", "answered_with_uncertainty"}
+        } | set(residual))
+    return result
 
 
 BUILTIN_TOOL_NAMES = {"custom_readonly_python"}
@@ -216,7 +253,7 @@ def _run_question_investigator_inner(
                 "script_attempts": len(all_results),
             },
         )
-        _write_report(live_report_path, live_report.model_dump())
+        _write_report(live_report_path, reconcile_question_memory(live_report.model_dump()))
 
     persist_live_report(
         phase="planning",
@@ -249,9 +286,10 @@ def _run_question_investigator_inner(
         if int(plan.recommended_max_questions or 0) > 0:
             max_total_questions = min(max_total_questions, max(1, int(plan.recommended_max_questions)))
         if int(plan.recommended_max_actions_per_question or 0) > 0:
+            # A tool action needs a subsequent terminal round to interpret its evidence.
             max_actions_per_question = min(
                 max_actions_per_question,
-                max(1, int(plan.recommended_max_actions_per_question)),
+                max(2, int(plan.recommended_max_actions_per_question)),
             )
         max_scripts_total = max_total_questions * max_scripts_per_question
     automatic_questions = _select_auto_verification_questions(
@@ -334,6 +372,7 @@ def _run_question_investigator_inner(
     )
 
     seen_request_keys: set[str] = set()
+    answerer_stable_prefix = _qdi_answerer_stable_prefix(context)
     while queue:
         qid = queue.pop(0)
         record = question_records.get(qid)
@@ -366,7 +405,7 @@ def _run_question_investigator_inner(
         question_live_actions: list[dict[str, Any]] = []
         working_memory = _empty_working_memory_card(qid)
         working_memory_cards[qid] = working_memory
-        answerer_stable_prefix = _qdi_answerer_stable_prefix(context, record)
+        initial_question = _immutable_question_card(record)
 
         for action_round in range(1, max_actions_per_question + 1):
             available_actions = _available_qdi_actions(
@@ -432,10 +471,11 @@ def _run_question_investigator_inner(
                     "max_depth": max_depth,
                     "max_output_len": max_output_chars,
                     "current_question": record,
+                    "initial_question": initial_question,
                     "context_retrieval_policy": (
-                        "Stable table_cards are route-only manifests. If field meanings, field statistics, "
-                        "reading notes, warnings, or sheet details are needed, choose "
-                        "request_context; the retrieved excerpt will appear in recent_action_window on the next turn."
+                        "Use evidence already visible in stable table_cards, including schema, statistics, "
+                        "reading notes and warnings. Choose request_context only for missing, truncated "
+                        "or insufficient-scope evidence; its excerpt appears in recent_action_window next turn."
                     ),
                     "action_round": action_round,
                     "action_policy": {
@@ -920,7 +960,7 @@ def _run_question_investigator_inner(
         scripts=len(report.step_results),
         answers=len(report.answers),
     )
-    return report.model_dump()
+    return reconcile_question_memory(report.model_dump())
 
 
 def _execute_request_with_repair(
@@ -1259,11 +1299,29 @@ def _reading_strategy_verification_questions(context: dict[str, Any]) -> list[In
         if not isinstance(card, dict):
             continue
         table_id = str(card.get("table_id", "") or "")
+        kind = str(card.get("table_kind", "") or "")
+        source_suffix = Path(table_id.split("::", 1)[0]).suffix.lower()
+        if kind == "document" or source_suffix in {".pdf", ".doc", ".docx", ".md", ".txt"}:
+            continue
         notes = [str(x) for x in (card.get("reading_notes") or [])]
         warnings = [str(x) for x in (card.get("warnings") or [])]
-        evidence = notes + warnings
+        risks = [str(x) for x in (card.get("reading_risks") or [])]
+        evidence = notes + warnings + risks
         text = " ".join(evidence).lower()
         if not table_id or not evidence or not any(marker in text for marker in markers):
+            continue
+        try:
+            header_confidence = float(card.get("header_confidence") or 0)
+        except (TypeError, ValueError):
+            header_confidence = 0.0
+        reading_warning = any(marker in " ".join(warnings + risks).lower() for marker in markers)
+        if (
+            card.get("layout_kind") == "standard_table"
+            and card.get("read_strategy_kind") == "default_header"
+            and header_confidence >= 0.75
+            and not risks
+            and not reading_warning
+        ):
             continue
         out.append(
             InvestigationQuestion(
@@ -2554,7 +2612,7 @@ def validate_custom_readonly_python(code: str) -> list[str]:
             if name in banned_calls:
                 issues.append(f"banned_call:{name}")
             attr = _call_attr(node.func)
-            if attr in banned_attrs:
+            if attr in banned_attrs and not (attr == "copy" and _is_memory_copy_call(node)):
                 issues.append(f"banned_method:{attr}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             issue = _literal_path_issue(node.value)
@@ -2564,6 +2622,25 @@ def validate_custom_readonly_python(code: str) -> list[str]:
     if not has_analyze:
         issues.append("missing_analyze_function")
     return list(dict.fromkeys(issues))[:40]
+
+
+def _is_memory_copy_call(node: ast.Call) -> bool:
+    # File copies require a destination; only allow explicit memory-copy forms.
+    if node.args:
+        return False
+    if not node.keywords:
+        return True
+    if len(node.keywords) != 1:
+        return False
+    keyword = node.keywords[0]
+    if not isinstance(keyword.value, ast.Constant):
+        return False
+    value = keyword.value.value
+    if keyword.arg == "deep":
+        return isinstance(value, bool)
+    if keyword.arg == "order":
+        return isinstance(value, str) and value in {"C", "F", "A", "K"}
+    return False
 
 
 def _custom_python_wrapper(user_code: str) -> str:
@@ -2680,14 +2757,18 @@ def _safe_iterdir(self):
     return _orig_path_iterdir(self)
 
 
-def _safe_glob(self, pattern):
+def _safe_glob(self, pattern, *args, **kwargs):
     _guard_read_path(self)
-    return _orig_path_glob(self, pattern)
+    for path in _orig_path_glob(self, pattern, *args, **kwargs):
+        _guard_read_path(path)
+        yield path
 
 
-def _safe_rglob(self, pattern):
+def _safe_rglob(self, pattern, *args, **kwargs):
     _guard_read_path(self)
-    return _orig_path_rglob(self, pattern)
+    for path in _orig_path_rglob(self, pattern, *args, **kwargs):
+        _guard_read_path(path)
+        yield path
 
 
 builtins.open = _safe_open
@@ -3124,12 +3205,9 @@ def _immutable_question_card(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _qdi_answerer_stable_prefix(context: dict[str, Any], record: dict[str, Any]) -> str:
-    """Keep global context first so providers can reuse it across QDI questions."""
-    return join_blocks(
-        json_block("1. Frozen global QDI context", context),
-        json_block("2. Immutable initial current-question card", _immutable_question_card(record)),
-    )
+def _qdi_answerer_stable_prefix(context: dict[str, Any]) -> str:
+    """Share the planner's exact prefix and routing key across all questions."""
+    return stable_dynamic_prompt(stable=context)[0]
 
 
 def _empty_working_memory_card(question_id: str) -> dict[str, Any]:
@@ -3157,6 +3235,15 @@ def _merge_working_memory_card(
     max_chars: int,
 ) -> dict[str, Any]:
     merged = dict(card or {})
+    # Exact references prevent a new conclusion from erasing unrelated gaps.
+    # Full resolution records remain in the existing action trajectory.
+    evidence_refs = set(merged.get("evidence_refs") or []) | set(getattr(update, "evidence_refs", []) or [])
+    for resolution in getattr(update, "resolutions", []) or []:
+        if (resolution.field in {"open_gaps", "confirmed_facts", "temporary_conclusions"}
+                and resolution.reason.strip() and resolution.evidence_refs
+                and set(resolution.evidence_refs).issubset(evidence_refs)):
+            merged[resolution.field] = [item for item in merged.get(resolution.field, [])
+                                        if item != resolution.text]
     list_fields = (
         "confirmed_facts",
         "temporary_conclusions",
@@ -3573,7 +3660,9 @@ def _call_attr(func: ast.AST) -> str:
 
 def _literal_path_issue(value: str) -> str:
     text = value.strip()
-    if not text:
+    # A slash alone is also a common missing-value marker. Actual I/O remains
+    # guarded by resolved input/scratch paths in the execution wrapper.
+    if not text or text == "/":
         return ""
     if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\") or text.startswith("/"):
         return f"absolute_path_literal_not_allowed:{text[:80]}"

@@ -234,6 +234,45 @@ def test_reconcile_table_shape_prefers_full_profile_over_excel_used_range() -> N
     assert facts["row_count_conflict"] is True
 
 
+def test_population_verification_does_not_count_unprofiled_rows_as_missing() -> None:
+    card = {"table_id": "steel.csv", "verified_row_count": 35040, "profile_is_sampled": True,
+            "fields": [{"name": "date", "role": "time", "row_count": 20000, "non_null_count": 20000}]}
+    assert build_population_verification_queue([card]) == []
+    card["fields"][0]["non_null_count"] = 19990
+    queue = build_population_verification_queue([card])
+    fact = queue[0]["population_sensitive_fields"][0]
+    assert fact["missing_count"] == 10
+    assert fact["statistics_scope"] == "sample"
+    assert fact["profile_row_count"] == 20000
+
+
+def test_sampled_csv_shape_is_not_a_verified_worksheet_population():
+    facts = reconcile_table_shape(
+        {"shape": [10000, 14], "profile_policy": "sampled"},
+        [{"name": "target", "row_count": 2000}], is_worksheet=False,
+    )
+    assert facts["verified_shape"] == [10000, 14]
+    assert facts.get("verified_row_count") is None
+    assert facts["reported_row_count"] == 10000
+    assert facts["row_count_basis"] == "reader_shape_unverified"
+    assert "worksheet_used_range_shape" not in facts
+    assert facts["reader_reported_shape"] == [10000, 14]
+    card = {**facts, "table_id": "data.csv", "fields": [
+        {"name": "target", "role": "target", "row_count": 2000, "non_null_count": 1900},
+    ]}
+    queue = build_population_verification_queue([card])
+    assert queue[0]["verified_row_count"] is None
+    assert queue[0]["population_sensitive_fields"][0]["missing_count"] == 100
+
+
+def test_population_verification_detects_entirely_missing_constraints() -> None:
+    queue = build_population_verification_queue([{
+        "table_id": "capacity.xlsx", "verified_row_count": 51,
+        "fields": [{"name": "date", "role": "time", "row_count": 51, "non_null_count": 0}],
+    }])
+    assert queue[0]["population_sensitive_fields"][0]["missing_count"] == 51
+
+
 def test_population_verification_is_driven_by_generic_profile_evidence() -> None:
     queue = build_population_verification_queue(
         [

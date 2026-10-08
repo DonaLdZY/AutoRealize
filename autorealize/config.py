@@ -39,11 +39,14 @@ class LLMConfig:
     minimum_output_tokens: int = 32768
     # 单次文本输出最大 token；模型仍只按实际生成量计费。
     max_tokens: int | None = 32768
+    context_window_tokens: int = 0
     # 结构化 JSON 输出默认最大 token。
     structured_max_tokens: int | None = 32768
     # 单次 LLM 请求超时时间（秒）。DeepSeek 偶尔会慢，设置超时可避免系统长时间看似卡死。
     # 例子: 180 表示 3 分钟仍未返回则失败并写入事件流。
     request_timeout_seconds: float = 180.0
+    # Consume streaming responses before validating JSON to avoid idle proxy timeouts.
+    stream_responses: bool = True
     # 同一进程内允许并发请求 LLM 的最大数量。数据认知并行时会用它做限流。
     # 调大可更快，但也更容易触发 API 限流；调小更稳。
     max_concurrent_requests: int = 4
@@ -87,6 +90,7 @@ class RuntimeSwitches:
     run_data_cognition: bool = True
     # Run the task definition stage.
     run_task_definition: bool = True
+    resume_task_definition: bool = False
     # Inject prompt few-shot examples where available.
     enable_fewshot: bool = False
     # Prefer a low-token AutoRealize route: skip legacy/redundant LLM stages and
@@ -311,6 +315,9 @@ class VLLMConfig:
 class PromptConfig:
     """Prompt 上下文控制配置。"""
 
+    # Validated final artifact audits and evaluation finalizers; ordinary evaluation reviews retain their layout.
+    lossless_review_prompts: bool = True
+
     # 模型最大上下文预算（粗略 token 预算）。
     prompt_token_budget: int = 12000
     # 超过预算的告警比例。
@@ -345,6 +352,9 @@ class PromptConfig:
     artifact_consistency_enabled: bool = True
     artifact_consistency_max_rounds: int = 2
     artifact_consistency_fail_on_blocking: bool = False
+    # strict blocks downstream stages after review exhaustion; the alternate
+    # policy records the findings as risks and permits a controlled handoff.
+    review_gate_policy: str = "strict"
     # Resolve only ambiguous deterministic downstream candidates with an LLM;
     # every returned candidate is validated against the physical schema.
     downstream_context_llm_resolution_enabled: bool = True
@@ -569,6 +579,7 @@ class AutoRealizeConfig:
 
 
 _CONFIG_DESCRIPTIONS: dict[str, str] = {
+    "lossless_review_prompts": "最终产物审查和评估定稿使用可逐值还原的去重快照；完整约束保留，反馈置于末尾。普通评估审查保留原编排。",
     "base_url": "DeepSeek/OpenAI 兼容 API 地址。",
     "model_name": "文本大模型名称。",
     "api_key": "LLM API key，默认从 DEEPSEEK_API_KEY 读取。",
@@ -578,6 +589,7 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "max_tokens": "普通文本 LLM 输出 token 上限；默认 32768。",
     "structured_max_tokens": "结构化 JSON 输出 token 上限；默认 32768。",
     "request_timeout_seconds": "单次 LLM API 请求超时时间（秒）。",
+    "stream_responses": "流式接收完整响应后再校验 JSON，减少长推理请求的代理空闲超时；保留最终 token 用量。",
     "max_concurrent_requests": "同一进程内 LLM API 最大并发请求数。",
     "enforce_json_retry": "结构化输出不合法时是否追加错误并要求重试。",
     "enable_cache": "是否缓存相同 prompt/schema/model 的 LLM 响应。",
@@ -917,5 +929,3 @@ AutoRealizeConfig.from_file = classmethod(_config_from_file)
 AutoRealizeConfig.write_json = _config_write_json
 AutoRealizeConfig.write_yaml = _config_write_yaml
 AutoRealizeConfig.schema_dict = _config_schema
-
-

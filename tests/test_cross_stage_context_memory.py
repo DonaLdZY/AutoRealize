@@ -60,7 +60,8 @@ def test_cross_stage_memory_compacts_and_retrieves_exact_artifact(tmp_path) -> N
     )
     stable_prefix = ledger.static_context_prompt
     assert "full_stable_context_artifact" in stable_prefix
-    assert estimate_text_tokens(stable_prefix) < 1600
+    assert "规则" * 6000 in stable_prefix
+    assert ledger.stable_context["original_requirements_full"] == "规则" * 6000
 
     first = ledger.add("stage_1", {"fact": "A" * 5000})
     ledger.add("stage_2", {"fact": "B" * 5000})
@@ -99,6 +100,26 @@ def test_cross_stage_memory_compacts_and_retrieves_exact_artifact(tmp_path) -> N
     )
     assert llm.retrievals == 1
     assert (tmp_path / "cross_stage_context.json").is_file()
+
+
+def test_complete_current_snapshot_skips_paid_memory_calls_and_preserves_full_evidence(tmp_path):
+    llm = _MemoryLLM()
+    ledger = CrossStageContextLedger(
+        config=AutoRealizeConfig(), llm_client=llm, prompt_mgr=_PromptManager(),
+        report_dir=tmp_path, stable_context={"original_requirements_full": "EXACT_AUTHORITATIVE_RULE"},
+    )
+    ledger.compaction_count = 1
+    ledger.add("old_draft", {"text": "old interpretation" * 2000})
+    stable, dynamic = ledger.prompt_parts(
+        stage="artifact_consistency_reviewer_1", stage_evidence={"rules": "AUDIT_RULE"},
+        latest_request={"current_contract": "START" + "evidence" * 2000 + "FINAL_HARD_CONSTRAINT"},
+        dynamic_limit=500, complete_current_snapshot=True,
+    )
+    assert llm.compactions == llm.retrievals == 0
+    assert "EXACT_AUTHORITATIVE_RULE" in stable
+    assert "AUDIT_RULE" in dynamic
+    assert "START" + "evidence" * 2000 + "FINAL_HARD_CONSTRAINT" in dynamic
+    assert "old interpretation" not in dynamic
 
 
 def test_body_after_prefix_scope_preserves_more_body_budget(tmp_path) -> None:
@@ -179,8 +200,8 @@ def test_oversized_current_dynamic_payload_is_artifact_backed(tmp_path) -> None:
     )
     _, dynamic = ledger.prompt_parts(
         stage="large_stage",
-        stage_evidence={"evidence": "早期" * 2000},
-        latest_request={"instruction": "LATEST_MARKER", "payload": "最新" * 2000},
+        stage_evidence={"evidence": "早期" * 1000 + "MIDDLE_HARD_CONSTRAINT" + "早期" * 1000},
+        latest_request={"instruction": "LATEST_MARKER", "payload": "最新" * 1000 + "REPAIR_MIDDLE_RULE" + "最新" * 1000},
         dynamic_limit=1200,
     )
 
@@ -191,6 +212,9 @@ def test_oversized_current_dynamic_payload_is_artifact_backed(tmp_path) -> None:
     ]
     assert prompt_artifacts
     assert "LATEST_MARKER" in dynamic
+    assert "MIDDLE_HARD_CONSTRAINT" in dynamic
+    assert "REPAIR_MIDDLE_RULE" in dynamic
+    assert "_prompt_truncation" not in dynamic
     artifact_id = str(prompt_artifacts[-1]["artifact_id"])
     recovered = ledger.artifact_store.read_excerpt(
         artifact_id,

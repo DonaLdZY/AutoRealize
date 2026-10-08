@@ -80,7 +80,7 @@ def test_short_document_uses_one_full_summary_call() -> None:
             "file": "rules.txt",
             "kind": "document",
             "task": "提取规则",
-            "document_excerpt": full_text,
+            "document_excerpt": "stale preview",
         },
         full_text=full_text,
         relative_path="rules.txt",

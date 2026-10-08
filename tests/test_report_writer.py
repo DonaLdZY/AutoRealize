@@ -152,6 +152,41 @@ def test_automl_context_keeps_problem_structure_and_required_rl_separate() -> No
     assert "RL is a later" not in text
 
 
+def test_automl_handoff_preserves_long_constraint_and_output_contracts() -> None:
+    text = render_automl_context_markdown({
+        "constraints": [f"Mandatory constraint {index}" for index in range(80)],
+        "evaluation_contract": {"submission_checks": [f"Exact check {index}" for index in range(70)]},
+        "output_contract": {"columns": [f"output_{index}" for index in range(150)]},
+        "data_schema_contract": {"tables": [{"physical_columns_exact": [f"physical_{index}" for index in range(255)]}]},
+    })
+    assert "Mandatory constraint 79" in text
+    assert "Exact check 69" in text
+    assert "output_149" in text
+    assert "physical_254" in text
+
+
+def test_data_access_target_prefers_resolved_task_over_label_heuristics() -> None:
+    fs = FileSummary(
+        path="Steel_industry_data.csv",
+        role=FileRole.raw_data_table,
+        summary="Energy observations.",
+        columns=["date", "Usage_kWh", "Day_of_week", "Load_Type"],
+        column_semantics={"Load_Type": "load class label"},
+        source_metadata={"target_column_hint": "Usage_kWh"},
+    )
+
+    assert build_data_access_protocol([fs]).files[0].target_fields == ["Usage_kWh"]
+
+
+def test_data_access_target_does_not_match_y_inside_arbitrary_column() -> None:
+    fs = FileSummary(
+        path="train.csv", role=FileRole.raw_data_table, summary="Training observations.",
+        columns=["Day_of_week", "capacity", "y"],
+    )
+
+    assert build_data_access_protocol([fs]).files[0].target_fields == ["y"]
+
+
 def test_data_access_protocol_renders_whitespace_csv_read_example() -> None:
     fs = FileSummary(
         path="trainset.csv",
@@ -177,6 +212,107 @@ def test_data_access_protocol_renders_whitespace_csv_read_example() -> None:
     )
     text = render_description_protocol_markdown(bundle, [fs])
     assert "pd.read_csv('./input/trainset.csv', sep=r'\\s+', engine='python', encoding='utf-8-sig')" in text
+
+
+def test_single_profiled_excel_sheet_keeps_explicit_header_and_source_columns() -> None:
+    fs = FileSummary(path="relations.xlsx", role="raw_data_table", summary="relations", columns=["source", "target"],
+        source_metadata={"excel_sheet_names": ["Relations"], "excel_sheet_profiles": [{
+            "sheet_name": "Relations", "layout_kind": "standard_table", "detected_header_row": 0,
+            "columns": ["source", "target"], "shape": [2, 2]}]})
+    access = build_data_access_protocol([fs]).files[0]
+    schema = build_data_schema_contract([fs])["tables"][0]
+    assert access.read_contract["pandas_kwargs"] == {"sheet_name": "Relations", "header": 0, "skiprows": 0, "engine": "openpyxl"}
+    assert access.read_contract["population_verified"] is False
+    assert access.read_contract["columns_exact"] == ["source", "target"]
+    assert schema["read_contract"] == access.read_contract
+    assert schema["read_example"] == access.read_example
+
+
+def test_multisheet_workbook_does_not_choose_one_sheet_from_its_profile() -> None:
+    fs = FileSummary(path="multi.xlsx", role="raw_data_table", summary="two sources",
+        source_metadata={"excel_sheet_names": ["A", "B"], "excel_sheet_profiles": [
+            {"sheet_name": name, "layout_kind": "standard_table", "detected_header_row": 0} for name in ["A", "B"]]})
+    access = build_data_access_protocol([fs]).files[0]
+    assert "sheet_name=None" in access.read_example
+    assert access.read_contract == {}
+
+
+def test_nondefault_and_headerless_sheet_contracts_preserve_reader_semantics() -> None:
+    fs = FileSummary(path="layout.xlsx", role="raw_data_table", summary="mixed layouts",
+        source_metadata={"excel_sheet_names": ["offset", "raw"], "excel_sheet_profiles": [
+            {"sheet_name": "offset", "layout_kind": "non_default_header", "detected_header_row": 2,
+             "columns": ["customer", "longitude"], "shape": [10, 2]},
+            {"sheet_name": "raw", "layout_kind": "headerless_table", "detected_header_row": None,
+             "columns": ["vehicle", "capacity"], "shape": [10, 2]}]})
+    pack = build_automl_context_pack(DescriptionProtocolBundle(data_access=build_data_access_protocol([fs])), [fs],
+        compiled_context={"table_cards": [{"table_id": f"layout.xlsx::{name}", "source_file": "layout.xlsx",
+                                         "sheet_name": name} for name in ["offset", "raw"]]})
+    readers = {row["sheet_name"]: row for row in pack.data_access}
+    schema = {row["sheet_name"]: row for row in pack.data_schema_contract["tables"]}
+    assert readers["offset"]["read_contract"]["pandas_kwargs"]["header"] == 2
+    assert readers["offset"]["read_example"] == schema["offset"]["read_example"]
+    assert readers["raw"]["read_contract"]["pandas_kwargs"]["header"] is None
+    assert readers["raw"]["columns_scope"] == "integer_position_raw_layout"
+    assert not readers["raw"].get("columns")
+    assert not schema["raw"].get("physical_columns_exact")
+    assert schema["raw"]["profiled_signature_fields"] == ["vehicle", "capacity"]
+
+
+def test_grouped_schema_does_not_erase_individual_sheet_readers() -> None:
+    files = [FileSummary(path=f"cost/carrier{number:02}.xlsx", role="raw_data_table", summary="cost",
+        source_metadata={"excel_sheet_names": ["rates"], "excel_sheet_profiles": [{
+            "sheet_name": "rates", "layout_kind": "standard_table", "detected_header_row": 0,
+            "columns": ["carrier", "rate"], "shape": [10, 2]}]}) for number in range(1, 12)]
+    pack = build_automl_context_pack(DescriptionProtocolBundle(data_access=build_data_access_protocol(files)), files,
+        compiled_context={"table_cards": [{"table_id": f"{fs.path}::rates", "source_file": fs.path,
+                                         "sheet_name": "rates"} for fs in files]})
+    assert len(pack.data_access) == len(files)
+    for row in pack.data_access:
+        assert row["read_contract"]["pandas_kwargs"]["header"] == 0
+        assert row["path"] in row["read_example"]
+        assert "header=None" not in row["read_example"]
+
+
+def test_actual_excel_read_takes_precedence_over_unverified_layout_guess() -> None:
+    fs = FileSummary(path="addresses.xlsx", role="raw_data_table", summary="addresses",
+        source_metadata={"excel_sheet_names": ["A"], "excel_sheet_profiles": [{
+            "sheet_name": "A", "layout_kind": "non_default_header", "detected_header_row": 2,
+            "columns": ["customer", "longitude"], "shape": [10, 2],
+            "profiled_read_contract": {"columns_exact": ["customer", "longitude"], "read_parameters_verified": True,
+                "pandas_kwargs": {"sheet_name": "A", "header": 0, "skiprows": 0}}}]})
+    access = build_data_access_protocol([fs]).files[0]
+    schema = build_data_schema_contract([fs])["tables"][0]
+    assert access.read_contract["pandas_kwargs"]["header"] == 0
+    assert access.read_example == schema["read_example"]
+    assert "header=2" not in access.read_example
+
+
+def test_workbook_selects_only_fully_verified_single_populated_sheet() -> None:
+    fs = FileSummary(path="lab.xls", role="raw_data_table", summary="10-row preview",
+        source_metadata={"excel_sheet_names": ["Sheet1", "Sheet2"], "excel_sheet_profiles": [
+            {"sheet_name": "Sheet1", "layout_kind": "standard_table", "detected_header_row": 0,
+             "columns": ["target"], "shape": [10, 1], "shape_profiled": [8036, 1], "profile_policy": "full_all_sheets"},
+            {"sheet_name": "Sheet2", "columns": [], "shape": [0, 0], "shape_profiled": [0, 0], "profile_policy": "full_all_sheets"}]})
+    access = build_data_access_protocol([fs]).files[0]
+    assert "sheet_name='Sheet1'" in access.read_example
+    assert access.read_contract == build_data_schema_contract([fs])["tables"][0]["read_contract"]
+    assert "verified_rows=8036" in access.row_grain and "verified_rows=0" in access.row_grain
+    assert "10-row preview" not in access.row_grain
+    pack = build_automl_context_pack(
+        DescriptionProtocolBundle(data_access=build_data_access_protocol([fs])), [fs],
+        compiled_context={"table_cards": [
+            {"table_id": f"lab.xls::{name}", "source_file": "lab.xls", "sheet_name": name}
+            for name in ["Sheet1", "Sheet2"]]})
+    readers = {entry["sheet_name"]: entry for entry in pack.data_access}
+    assert readers["Sheet1"]["read_contract"]["pandas_kwargs"]["sheet_name"] == "Sheet1"
+    assert readers["Sheet2"]["read_contract"]["pandas_kwargs"]["sheet_name"] == "Sheet2"
+    assert readers["Sheet2"]["read_contract"]["pandas_kwargs"]["header"] is None
+    assert "Sheet1" not in readers["Sheet2"]["read_example"]
+    assert "target" not in readers["Sheet2"]["read_contract"]["columns_exact"]
+    fs.source_metadata["excel_sheet_profiles"][1]["profile_policy"] = "sampled"
+    uncertain = build_data_access_protocol([fs]).files[0]
+    assert "sheet_name=None" in uncertain.read_example
+    assert uncertain.read_contract == {}
 
 
 def test_data_access_protocol_preserves_executable_csv_read_contract() -> None:
@@ -213,8 +349,40 @@ def test_data_access_protocol_preserves_executable_csv_read_contract() -> None:
     )
     assert protocol.files[0].read_contract["path"] == "input_items.csv"
     assert protocol.files[0].read_contract["read_example"] == protocol.files[0].read_example
+    assert protocol.files[0].read_contract["population_verified"] is False
+    assert "validated_shape" not in protocol.files[0].read_contract
+    assert protocol.files[0].read_contract["reader_reported_shape"] == [203, 19]
     schema = build_data_schema_contract([fs])
     assert schema["tables"][0]["read_contract"]["pandas_kwargs"]["decimal"] == ","
+
+
+def test_legacy_preview_dtype_contract_is_corrected_in_both_handoffs() -> None:
+    fs = FileSummary(path="values.csv", role=FileRole.raw_data_table, summary="Numeric observations", columns=["value"], source_metadata={
+        "csv_read_contract": {"validated_dtypes": {"value": "int64"}, "preview_rows_validated": 2},
+    })
+    access = build_data_access_protocol([fs]).files[0].read_contract
+    schema = build_data_schema_contract([fs])["tables"][0]["read_contract"]
+    for contract in (access, schema):
+        assert contract["observed_preview_dtypes"] == {"value": "int64"}
+        assert contract["dtype_validation_scope"] == "preview_only"
+        assert "validated_dtypes" not in contract
+    assert fs.source_metadata["csv_read_contract"]["validated_dtypes"] == {"value": "int64"}
+
+
+def test_physical_schema_order_comes_from_reader_not_semantic_field_priority():
+    from autorealize.context_compiler import build_source_coverage_ledger
+    fs = FileSummary(path="data.csv", role=FileRole.raw_data_table, summary="Measurements",
+        columns=["ID", "temperature", "Type"], source_metadata={
+            "shape": [10000, 3], "profile_sampling": {"sampled": True},
+            "csv_read_contract": {"verified": True, "validated_shape": [10000, 3],
+                                  "validated_columns_exact": ["ID", "Type", "temperature"]}})
+    schema = build_data_schema_contract([fs])["tables"][0]
+    assert schema["physical_columns_exact"] == ["ID", "Type", "temperature"]
+    ledger = build_source_coverage_ledger(file_summaries=[fs])["entries"][0]
+    assert ledger["schema_signature_fields"] == ["ID", "Type", "temperature"]
+    assert ledger["schema_signature_scope"].startswith("preview_only")
+    assert not ledger.get("verified_shape")
+    assert ledger["reader_reported_shape"] == [10000, 3]
 
 
 def test_repeated_structured_files_are_grouped_in_description() -> None:
@@ -329,6 +497,22 @@ def test_schema_contract_marks_group_union_and_variant_fields() -> None:
     assert group["shared_physical_columns_exact"] == ["lane", "vehicle_type", "cost"]
     assert group["column_variant_count"] == 3
     assert any(row["fields"] == ["settlement_code"] for row in group["variant_fields_by_file"])
+
+
+def test_composite_carrier_identifier_stays_in_repeated_schema_group() -> None:
+    files = [
+        FileSummary(
+            path=f"成本/{name} 承运商成本.xlsx",
+            role=FileRole.raw_data_table,
+            summary="承运商成本表",
+            columns=["承运商代码", "计费费率"],
+        )
+        for name in ["承运商01BZWL01", "承运商02fsd", "承运商14SZ-ZT-01"]
+    ]
+    contract = build_data_schema_contract(files)
+    assert len(contract["tables"]) == 1
+    assert contract["tables"][0]["table_id"] == "成本/承运商{id} 承运商成本.xlsx"
+    assert contract["tables"][0]["schema_group"]["file_count"] == 3
 
 def test_repeated_structured_file_fields_are_group_level_not_sample_constants() -> None:
     carrier_ids = ["BZWL01", "fsd", "fy"]
@@ -708,6 +892,22 @@ def test_evaluation_contract_requires_scalar_score_for_multi_objective() -> None
     assert not any("final metric_formula" in d for d in defects)
 
 
+def test_audit_metrics_and_display_order_do_not_become_ranking_objectives() -> None:
+    contract = EvaluationContractReview(
+        passed=True, executable=True, primary_metric="development_MAE", metric_formula="mean(abs(y-yhat))", metric_direction="minimize",
+        prediction_unit="gantry and origin", y_true_source="observed counts", y_pred_source="prediction table",
+        computation_scope="all development rows", aggregation_rule="average absolute errors",
+        validation_protocol="Fit ensemble weights only in training OOF; report cost and constraint failures.",
+        submission_checks=["complete keys"], leakage_guards=["no future labels"], invalid_solution_rules=["reject NaN"],
+        audit_metrics=["并列报告 30 分钟及 60 分钟诊断，不用于排序", "cost", "failure_count"],
+        tie_break_rules=["仅当主 MAE 完全相等时，按 candidate_id 的字典序确定显示顺序。该规则不构成第二个效果指标，也不改变 metric_formula。",
+                         "60 分钟诊断、运行时长、低流量回退数量均不得成为第二排序目标。"],
+    )
+    assert evaluation_contract_defects(contract) == []
+    contract.tie_break_rules.append("lower total_cost wins after equal MAE")
+    assert any("ignores tie-break/objective term: cost" in item for item in evaluation_contract_defects(contract))
+
+
 def test_evaluation_contract_rejects_scalar_score_that_ignores_tie_break_objective() -> None:
     contract = EvaluationContractReview(
         passed=True,
@@ -790,6 +990,40 @@ def test_apply_evaluation_contract_renders_anti_gaming_sections() -> None:
     assert "Metric Direction" not in text
 
 
+def test_evaluation_contract_accepts_missing_input_rejection_but_not_missing_rules():
+    contract = EvaluationContractReview(
+        passed=True, primary_metric="MAE", metric_direction="minimize",
+        metric_formula="mean(abs(y_true-y_pred))", prediction_unit="row",
+        y_true_source="fixed validation labels", y_pred_source="prediction column",
+        computation_scope="all fixed validation rows", aggregation_rule="equal row weights",
+        validation_protocol="seed=20260907; stratified 60/20/20 split",
+        submission_checks=["Reject unknown IDs and any 待确认 capacity date"],
+        leakage_guards=["Use train-only transforms; optional audit plots cannot change ranking"],
+        invalid_solution_rules=["Reject missing dates; never treat unknown supply as unlimited"],
+    )
+    assert evaluation_contract_defects(contract) == []
+    contract.validation_protocol = "TBD"
+    assert evaluation_contract_defects(contract)
+
+
+def test_software_check_scope_does_not_mix_internal_dispatch_cost_into_ranking():
+    contract = EvaluationContractReview(
+        passed=True, ranking_scope="software_contract_checks", primary_metric="contract_check_pass_fraction",
+        metric_direction="maximize", metric_formula="sum(passed_fixed_checks)/12", prediction_unit="software case",
+        y_true_source="fixed software assertions", y_pred_source="solver outputs", computation_scope="12 fixed checks",
+        aggregation_rule="equal binary checks including lexicographic cost, unassigned orders and capacity",
+        validation_protocol="fixed software fixtures; empirical dispatch unavailable",
+        submission_checks=["missing dates must be rejected"], leakage_guards=["no historical claim from fixtures"],
+        invalid_solution_rules=["exceptions fail the case"],
+        tie_break_rules=["cost inside each instance is verified by the checks, not an extra candidate tie-break"],
+    )
+    assert evaluation_contract_defects(contract) == []
+    contract.ranking_scope = "task_effectiveness"
+    assert any("cost" in issue for issue in evaluation_contract_defects(contract))
+    contract.validation_protocol = "split: unknown"
+    assert evaluation_contract_defects(contract)
+
+
 def test_automl_context_pack_renders_data_access_and_scalar_score() -> None:
     files = [
         FileSummary(
@@ -846,6 +1080,47 @@ def test_automl_context_pack_renders_data_access_and_scalar_score() -> None:
     assert "score = failed_count * LARGE_PENALTY + total_cost" in text
     assert "cost/carrier{id}_cost.xlsx" in text
     assert "pd.read_excel(path)" in text
+
+
+def test_automl_access_uses_exact_csv_schema_and_preserves_provisional_population() -> None:
+    columns = [f"feature_{i}" for i in range(185)] + ["target", "excluded_id"]
+    fs = FileSummary(
+        path="measurements.csv", role=FileRole.raw_data_table, columns=columns, summary="Measurements",
+        source_metadata={"shape": [10000, len(columns)], "profile_sampling": {"sampled": True}},
+        column_profiles=[{"name": columns[0], "row_count": 500, "null_count": 0}],
+    )
+    pack = build_automl_context_pack(
+        DescriptionProtocolBundle(data_access=build_data_access_protocol([fs])), [fs],
+        compiled_context={"table_cards": [{
+            "source_file": fs.path, "table_id": fs.path, "table_kind": "csv_table",
+            "fields": [{"name": columns[0]}],
+        }]},
+    )
+    assert pack.data_access[0]["columns"] == columns
+    assert pack.data_access[0]["columns_scope"] == "physical_schema"
+    table = build_data_schema_contract([fs])["tables"][0]
+    assert table["row_count_basis"] == "reader_shape_unverified"
+    assert table["reader_reported_shape"] == [10000, len(columns)]
+    assert table.get("verified_row_count") is None
+    assert "worksheet_used_range_shape" not in table
+
+
+def test_automl_access_does_not_replace_sheet_schema_with_workbook_or_field_preview() -> None:
+    fs = FileSummary(
+        path="inputs.xlsx", role=FileRole.raw_data_table, columns=["workbook_field"], summary="Orders",
+        source_metadata={"excel_sheet_profiles": [{
+            "sheet_name": "orders", "columns": ["order", "amount", "owner"], "shape": [20, 3],
+        }]},
+    )
+    pack = build_automl_context_pack(
+        DescriptionProtocolBundle(data_access=build_data_access_protocol([fs])), [fs],
+        compiled_context={"table_cards": [
+            {"source_file": fs.path, "sheet_name": "orders", "fields": [{"name": "order"}]},
+            {"source_file": "unprofiled.csv", "field_hints": ["unknown"]},
+        ]},
+    )
+    assert pack.data_access[0]["columns"] == ["order", "amount", "owner"]
+    assert pack.data_access[1]["columns_scope"] == "preview_only"
 
 
 def test_automl_context_renders_entity_alias_candidates_as_unconfirmed() -> None:
@@ -964,5 +1239,3 @@ def test_finalize_description_removes_internal_process_sections() -> None:
     assert "## 输出或提交格式" in cleaned
     assert "Output Layout" not in cleaned
     assert "Contract Status" not in cleaned
-
-

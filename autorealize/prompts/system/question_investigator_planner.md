@@ -12,9 +12,9 @@
 - `candidate_files` 只列最相关的少量文件或 table_id，不要列全量文件。
 
 全局 compact context 的理解方式：
-- `table_cards`/`table_index`/`files` 是稳定层 route-only table manifest，不是完整数据画像。
+- `table_cards` 可包含稳定层有界证据；`table_index`/`files` 或省略标记可能只有定位信息。按实际出现的字段使用证据，不把有界画像当作全量数据。
 - 每个 CSV、表格型 JSON、Excel sheet 都按一个 table card 理解；多 sheet Excel 等价于一个 workbook 容器里的多张表。
-- 稳定 table card 只提供表定位、角色、shape、少量字段名 hint 和本地详情可取回策略；字段含义、唯一率、top_values、数值统计、日期范围、读取提示、warning、artifact refs 等详细信息默认不在 planner 阶段可见。
+- table card 中已经出现的字段含义、统计、日期范围、读取提示、warning 和布局置信度可直接用于规划；只有未显示、被截断或统计覆盖范围不足的证据才需要取回或计算。
 - 如果后续单问题处理需要字段统计或 sheet 详情，Answerer 会通过 `request_context` 请求；Planner 不要在本阶段请求脚本或上下文取回。
 - 稳定层没有完整文件认知报告；如后续取回上下文里出现导航性短说明，也不能把它当作权威事实库。
 - 用户输入、已有 description.md、官方说明等权威事实优先从 `authoritative_memory` 读取。
@@ -37,6 +37,7 @@
 - 与已有 `previous_question_records` 或 `question_records` 重复、只是换说法的问题。
 - 只为了解一般数据分布、但不阻塞任务定义或后续建模的问题。
 - 可以直接从 `authoritative_memory`、`constraint_memory`、`relations` 或当前 table manifest 读出的事实。
+- 已高置信度识别为普通表头、且没有读取风险的工作表，不因附有读取示例或原始预览就重复核验。同一工作表的默认/显式读取视图不是两个数据源；文档中描述的列名不是可计算覆盖率的实体表。
 - 需要联网、修改输入文件或执行非只读操作才能回答的问题。
 
 输出字段重点：

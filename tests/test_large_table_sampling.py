@@ -7,6 +7,16 @@ from autorealize.modules.data_cognition import _table_schema_signature
 from autorealize.parsers.table_parser import TableParser
 from autorealize.pipeline import AutoRealizePipeline
 from autorealize.profiling.stats import excel_sheet_groups_from_profiles, profile_excel_sheets
+from autorealize.profiling.csv_utils import detect_csv_encoding, read_csv_auto
+
+
+def test_western_engineering_degree_unit_is_not_decoded_as_cjk(tmp_path: Path) -> None:
+    path = tmp_path / "temperature.csv"
+    path.write_bytes(b"Time [s];Temperature [\xb0C]\n0;818.5\n1;388.04\n")
+    assert detect_csv_encoding(path) == "cp1252"
+    table = read_csv_auto(path)
+    assert list(table.columns) == ["Time [s]", "Temperature [\N{DEGREE SIGN}C]"]
+    assert list(table.iloc[:, 1]) == [818.5, 388.04]
 
 
 def test_table_parser_only_reads_preview_for_csv(tmp_path: Path) -> None:

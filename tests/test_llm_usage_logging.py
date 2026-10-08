@@ -213,6 +213,37 @@ def test_deepseek_insufficient_system_resource_finish_reason_retries(tmp_path, m
     assert result.choices[0].finish_reason == "stop"
 
 
+def test_failed_network_attempt_retains_input_estimate_and_unknown_usage(tmp_path, monkeypatch):
+    import pytest
+    from autorealize.llm.client import StreamDeadlineExceeded
+
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.model_name = "gpt-5.6-luna"
+    client = LLMClient(cfg, tmp_path)
+
+    def fail(**_kwargs):
+        raise StreamDeadlineExceeded("Completion stream exceeded its wall-clock deadline")
+
+    monkeypatch.setattr(client.client.chat.completions, "create", fail)
+    with pytest.raises(StreamDeadlineExceeded):
+        client._chat_completion_with_network_retry(
+            prompt_name="authority", mode="structured", parse_attempt=1,
+            create_kwargs={"model": cfg.llm.model_name, "max_tokens": 32768,
+                           "messages": [{"role": "user", "content": "Preserve all constraints. " * 100}]},
+        )
+    rows = [json.loads(line) for line in client.usage_path.read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["finish_reason"] == "request_failed" and row["network_attempt"] == 1
+    assert row["error_type"] == "StreamDeadlineExceeded"
+    assert row["estimated_prompt_tokens"] > 0 and row["prompt_tokens"] == 0
+    assert row["usage_available"] is False and row["provider_cache_tokens_known"] is False
+    assert row["max_tokens"] == 32768
+    assert "Preserve all constraints" not in client.usage_path.read_text()
+    assert client._usage_summary["provider_usage_missing_calls"] == 1
+
+
 def test_provider_prompt_cache_key_auto_is_openai_only() -> None:
     cfg = AutoRealizeConfig()
     stable_prefix = "authoritative stable evidence"
@@ -302,7 +333,7 @@ def test_stable_prompt_puts_original_requirements_first() -> None:
         stable_title="varying title that must not lead the prefix",
     )
 
-    assert stable.startswith(f"{STABLE_CONTEXT_TITLE}\n{{\n  \"original_requirements_full\"")
+    assert stable.startswith(f'{STABLE_CONTEXT_TITLE}\n{{"original_requirements_full"')
     assert stable.index("authoritative original text") < stable.index("stage_specific")
     assert "latest" in dynamic
 
@@ -595,6 +626,9 @@ def test_log_provider_usage_marks_unknown_cache_fields(tmp_path) -> None:
     assert row["provider_cache_write_tokens_known"] is False
     summary = json.loads((tmp_path / "llm_usage_summary.json").read_text(encoding="utf-8"))
     assert summary["provider_cache_unknown_prompt_tokens"] == 25
+    assert summary["provider_cache_hit_ratio"] is None
+    assert summary["known_provider_cache_hit_ratio"] is None
+    assert summary["provider_cache_telemetry_coverage"] == 0.0
     assert summary["provider_cache_known_prompt_tokens"] == 0
     assert summary["provider_cache_write_unknown_calls"] == 1
 

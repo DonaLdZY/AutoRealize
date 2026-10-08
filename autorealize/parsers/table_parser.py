@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 import pandas as pd
@@ -262,10 +263,8 @@ class TableParser(BaseParser):
             values = [str(value).strip().lower() for value in series.dropna().unique()[:12]]
             normalized = set(values)
             name = str(column).strip().lower()
-            singleton_boolean_hint = any(
-                token in name
-                for token in [" is ", " has ", "flag", "bool", "multiple", "enabled", "active", "valid"]
-            )
+            name_tokens = set(re.findall(r"[a-z]+", name))
+            singleton_boolean_hint = bool(name_tokens & {"is", "has", "flag", "bool", "multiple", "enabled", "active", "valid"})
             if (
                 normalized
                 and len(normalized) <= 8
@@ -282,19 +281,24 @@ class TableParser(BaseParser):
 
         return {
             "schema_version": "autorealize.csv_read_contract.v1",
-            "verified": True,
+            "read_parameters_verified": True,
+            "verification_scope": "reader_parameters_and_header_only",
+            "population_verified": False,
+            "requires_full_parse_before_evaluation": True,
             "path": str(path.name),
             "reader": "pandas.read_csv",
             "pandas_kwargs": pandas_kwargs,
-            "validated_shape": [int(row_count), int(df.shape[1])],
+            "reader_reported_shape": [int(row_count), int(df.shape[1])],
             "validated_columns_exact": [str(column) for column in df.columns],
-            "validated_dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
+            "observed_preview_dtypes": {str(k): str(v) for k, v in df.dtypes.to_dict().items()},
+            "dtype_validation_scope": "preview_only",
             "preview_rows_validated": int(len(df)),
             "nullable_columns_observed": nullable_observed,
             "boolean_like_columns": boolean_like,
             "validation_rules": [
                 "Use these pandas_kwargs for this source file.",
                 "After reading, compare df.columns.tolist() with validated_columns_exact before renaming.",
+                "Dtypes and boolean-like values are preview observations, not full-table type constraints. Infer or validate types on the complete data; never coerce fractional values to integers from this preview.",
                 "Treat boolean_like_columns according to observed representation; do not assume string values.",
             ],
         }
