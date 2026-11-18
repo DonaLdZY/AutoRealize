@@ -96,12 +96,15 @@ def table_sampling_metadata(
         large_threshold_bytes=large_threshold_bytes,
     )
     is_large_file = bool(file_size and file_size > threshold)
+    sampled = bool(max_rows is not None and (rows_read is None or rows_read >= max_rows))
     if max_rows is None:
         reason = "full_scan_allowed"
-    elif is_large_file:
+    elif sampled and is_large_file:
         reason = "large_file_row_cap"
-    else:
+    elif sampled:
         reason = "configured_row_cap"
+    else:
+        reason = "configured_row_cap_not_reached"
     return {
         "configured_max_rows": max_rows,
         "rows_read": rows_read,
@@ -109,7 +112,7 @@ def table_sampling_metadata(
         "large_threshold_bytes": threshold,
         "is_large_file": is_large_file,
         "sampling_reason": reason,
-        "sampled": bool(max_rows is not None),
+        "sampled": sampled,
     }
 
 

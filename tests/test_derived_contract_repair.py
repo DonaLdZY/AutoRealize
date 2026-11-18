@@ -1,6 +1,6 @@
 import pytest
 
-from autorealize.artifact_contract_repair import DerivedContractRepair, apply_derived_repairs
+from autorealize.artifact_contract_repair import DerivedContractRepair, apply_derived_repairs, repairable_fields
 from autorealize.models import DescriptionProtocolBundle, SampleSubmissionSpec
 
 
@@ -75,3 +75,41 @@ def test_boundary_repair_changes_only_the_audited_entry():
     with pytest.raises(ValueError):
         apply_derived_repairs(bundle, SampleSubmissionSpec(), repair,
             issue_ids={"shared_origin"}, evidence_refs={"evaluation_contract"})
+
+
+def test_derived_contract_repair_accepts_only_explicit_list_leaf_and_handoff_paths():
+    bundle = DescriptionProtocolBundle(
+        problem_paradigm="hybrid_ml_optimization",
+        hybrid={"handoff": "predicted_al_n is quality evidence"},
+        output={"format_rules": ["rule one", "rule two"]},
+    )
+    fields = repairable_fields(bundle, SampleSubmissionSpec())
+    assert fields["/description_protocol_bundle/hybrid/handoff"] == "predicted_al_n is quality evidence"
+    assert fields["/description_protocol_bundle/output/format_rules/1"] == "rule two"
+
+    repair = DerivedContractRepair(repairs=[
+        example_patch(
+            path="/description_protocol_bundle/hybrid/handoff",
+            expected="predicted_al_n is quality evidence",
+            replacement="Only observations visible by cutoff and frozen training references may enter steam advice.",
+        ),
+        example_patch(
+            path="/description_protocol_bundle/output/format_rules/1",
+            expected="rule two",
+            replacement="Preserve the source unit and do not compare it with kg/h until verified.",
+        ),
+    ])
+    updated, _ = apply_derived_repairs(
+        bundle,
+        SampleSubmissionSpec(),
+        repair,
+        issue_ids={"shared_origin"},
+        evidence_refs={"evaluation_contract"},
+    )
+
+    assert updated.hybrid.handoff.startswith("Only observations")
+    assert updated.output.format_rules == [
+        "rule one",
+        "Preserve the source unit and do not compare it with kg/h until verified.",
+    ]
+    assert bundle.output.format_rules == ["rule one", "rule two"]

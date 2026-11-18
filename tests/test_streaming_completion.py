@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from autorealize.llm.client import LLMClient, _degraded_request_kwargs
 
@@ -57,6 +58,41 @@ def test_wall_deadline_closes_stalled_stream_without_automatic_paid_retry():
         LLMClient._consume_completion_stream(stream, timeout_seconds=0.02)
     assert stream.closed.is_set()
     assert not LLMClient._is_retryable_llm_error(error.value)
+
+
+def test_incomplete_chunked_stream_is_retryable_transport_failure():
+    error = httpx.RemoteProtocolError(
+        "peer closed connection without sending complete message body (incomplete chunked read)"
+    )
+    assert LLMClient._is_retryable_llm_error(error)
+
+
+def test_incomplete_chunked_response_retries_once_and_recovers(tmp_path, monkeypatch):
+    from autorealize.config import AutoRealizeConfig
+
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    client = LLMClient(cfg, tmp_path)
+    calls = 0
+
+    def fake_create(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("peer closed connection (incomplete chunked read)")
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop")])
+
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    monkeypatch.setattr("autorealize.llm.client.time.sleep", lambda _seconds: None)
+
+    result = client._chat_completion_with_network_retry(
+        prompt_name="stream_disconnect_retry_test",
+        mode="text",
+        create_kwargs={"model": cfg.llm.model_name, "messages": []},
+    )
+
+    assert calls == 2
+    assert result.choices[0].finish_reason == "stop"
 
 
 def test_deadline_interrupts_real_sdk_socket_read():

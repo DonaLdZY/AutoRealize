@@ -1,23 +1,40 @@
 ﻿from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import asdict
 import json
 import logging
 import hashlib
+import os
 import re
+import tempfile
+import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from ..config import AutoRealizeConfig
-from ..investigation import run_question_investigator
+from ..investigation import (
+    QDI_ACTION_SCHEMA_PROMPT,
+    QDI_CACHE_LAYOUT,
+    QDI_PROJECT_CONTEXT_LAYOUT,
+    run_question_investigator,
+)
 from ..logging_utils import log_event
 from ..knowledge.base import KnowledgeEntry
 from ..knowledge.local_store import make_entry_id
 from ..models import AuthoritativeTaskMemory, FileGroupingRegexPlan, FileRole, FileSamplingReview, FileSummary
 from ..prompt_cache import stable_dynamic_prompt
 from ..profiling.csv_utils import read_csv_auto
+from ..profiling.full_scan import (
+    FULL_TABLE_SCAN_VERSION,
+    csv_scan_read_options_from_metadata,
+    csv_scan_read_options_fingerprint,
+    scan_csv_time_column,
+)
 from ..profiling.relations import RelationHint, detect_relations
 from ..profiling.stats import infer_excel_sheet_layout
 from ..report_writer import append_constraint_memory_section, format_column_profile_inline, write_data_description
@@ -26,6 +43,436 @@ from ..utils.safe_json import dumps_json_safe, write_json_safe
 from .types import DataCognitionResult, RuntimeServices
 
 logger = logging.getLogger(__name__)
+
+SHARED_COGNITION_SCHEMA = "autorealize.shared_cognition_cache.v2"
+SHARED_QDI_ANSWER_LIMIT = 120
+SHARED_QDI_PROTOCOL_VERSION = "qdi-cache-contract-v1"
+FILE_COGNITION_SCOPE = (
+    "建立可供不同研发任务复用的通用文件认知。只描述当前文件实际包含的业务含义、字段、单位、"
+    "读取方法、数据质量和文件中明确记载的规则；不要指定本次研发目标、训练目标、评价指标或输出合同。"
+    "缺少证据的字段含义保留不确定性，任务相关解释由后续任务定义和 QDI 处理。"
+)
+_FULL_SCAN_REQUEST_MARKERS = (
+    "全表分块扫描",
+    "完整csv",
+    "完整 csv",
+    "全量扫描",
+    "full-table scan",
+    "full table scan",
+    "scan the entire csv",
+    "scan the whole csv",
+)
+_TEMPORAL_SCAN_MARKERS = (
+    "时序",
+    "时间序列",
+    "时间预测",
+    "按时间排序",
+    "按日期排序",
+    "按时间先后",
+    "按日期先后",
+    "时间范围",
+    "日期范围",
+    "time series",
+    "timeseries",
+    "temporal",
+    "forecast",
+    "forecasting",
+    "chronological",
+    "sort by time",
+    "sort by date",
+    "time range",
+    "date range",
+)
+
+
+def _scan_intent(task_text: str) -> tuple[bool, bool]:
+    text = str(task_text or "").casefold()
+    explicit_full_scan = any(marker.casefold() in text for marker in _FULL_SCAN_REQUEST_MARKERS)
+    temporal = any(marker.casefold() in text for marker in _TEMPORAL_SCAN_MARKERS)
+    if "预测" in text and any(marker in text for marker in ("时间", "日期", "小时", "天", "周", "月")):
+        temporal = True
+    return explicit_full_scan, temporal
+
+
+def _full_scan_targets(
+    file_summaries: list[FileSummary],
+    task_text: str,
+) -> list[tuple[FileSummary, str | None]]:
+    text = str(task_text or "").casefold()
+    explicit_full_scan, temporal = _scan_intent(task_text)
+    if not explicit_full_scan and not temporal:
+        return []
+
+    csv_files = [
+        fs for fs in file_summaries
+        if fs.role == FileRole.raw_data_table and Path(fs.path).suffix.lower() == ".csv"
+    ]
+    named_files = [
+        fs for fs in csv_files
+        if fs.path.casefold() in text or Path(fs.path).name.casefold() in text
+    ]
+    if named_files:
+        selected_files = named_files
+    elif temporal:
+        with_time_columns = [
+            fs for fs in csv_files
+            if any(
+                re.search(r"(?:time|timestamp|datetime|date|时间|日期|时刻)", str(column), flags=re.I)
+                for column in fs.columns
+            )
+        ]
+        selected_files = with_time_columns or csv_files[:1]
+    else:
+        selected_files = csv_files
+
+    targets: list[tuple[FileSummary, str | None]] = []
+    for fs in selected_files:
+        time_columns = [
+            str(column) for column in fs.columns
+            if re.search(r"(?:time|timestamp|datetime|date|时间|日期|时刻)", str(column), flags=re.I)
+        ]
+        explicit_columns = [column for column in time_columns if column.casefold() in text]
+        if explicit_columns:
+            column = explicit_columns[0]
+        elif time_columns:
+            column = sorted(
+                time_columns,
+                key=lambda value: (
+                    0 if re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", value.casefold())
+                    in {"sampletime", "timestamp", "datetime", "采样时间", "采样时刻"} else 1,
+                    value.casefold(),
+                ),
+            )[0]
+        else:
+            column = None
+        if column is not None or (named_files and fs in named_files) or (temporal and not time_columns):
+            targets.append((fs, column))
+    if (explicit_full_scan or temporal) and csv_files and not targets:
+        targets.append((csv_files[0], None))
+    return targets
+
+
+def _temporal_scan_requirement(task_text: str, scans: list[dict[str, Any]]) -> dict[str, Any]:
+    explicit_full_scan, temporal = _scan_intent(task_text)
+    required = explicit_full_scan or temporal
+    if not required:
+        return {
+            "schema_version": "autodecision.temporal_scan_requirement.v1",
+            "required": False,
+            "status": "not_required",
+            "intent": [],
+            "files": [],
+            "blocking_issues": [],
+        }
+
+    intent = []
+    if explicit_full_scan:
+        intent.append("explicit_full_table_scan")
+    if temporal:
+        intent.append("temporal_task")
+    blockers: list[str] = []
+    if not scans:
+        blockers.append("No eligible CSV source received a host full-table scan.")
+    for scan in scans:
+        path = str(scan.get("file") or "unknown source")
+        if scan.get("status") != "completed":
+            blockers.append(f"{path}: full-table scan did not complete.")
+            continue
+        rows = scan.get("rows_scanned")
+        valid = scan.get("valid_timestamp_rows")
+        invalid = scan.get("invalid_timestamp_rows")
+        if type(rows) is not int or type(valid) is not int or type(invalid) is not int:
+            blockers.append(f"{path}: full-table scan row counts are incomplete.")
+        elif rows != valid + invalid:
+            blockers.append(f"{path}: full-table scan row counts do not reconcile.")
+        if not str(scan.get("source_fingerprint") or "").strip():
+            blockers.append(f"{path}: scan is not bound to a current source fingerprint.")
+        if temporal and type(invalid) is int and invalid > 0:
+            blockers.append(f"{path}: {invalid} timestamp values could not be parsed.")
+        if temporal and type(valid) is int and valid == 0:
+            blockers.append(f"{path}: no valid timestamp values were found.")
+
+    return {
+        "schema_version": "autodecision.temporal_scan_requirement.v1",
+        "required": True,
+        "status": "passed" if not blockers else "blocked",
+        "intent": intent,
+        "files": [
+            {
+                "file": scan.get("file"),
+                "column": scan.get("column"),
+                "status": scan.get("status"),
+                "rows_scanned": scan.get("rows_scanned"),
+                "valid_timestamp_rows": scan.get("valid_timestamp_rows"),
+                "invalid_timestamp_rows": scan.get("invalid_timestamp_rows"),
+                "source_fingerprint": scan.get("source_fingerprint"),
+            }
+            for scan in scans
+        ],
+        "blocking_issues": list(dict.fromkeys(blockers)),
+    }
+
+
+def _requested_csv_read_kwargs(fs: FileSummary) -> dict[str, Any]:
+    return csv_scan_read_options_from_metadata(fs.source_metadata)
+
+
+def _scan_requested_csvs(
+    *,
+    data_root: Path,
+    file_summaries: list[FileSummary],
+    source_inventory: dict[str, dict[str, Any]],
+    task_text: str,
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for fs, column in _full_scan_targets(file_summaries, task_text):
+        metadata = fs.source_metadata or {}
+        source = source_inventory.get(fs.path, {})
+        fingerprint = str(source.get("fingerprint") or "")
+        preview = metadata.get("profile_sampling") if isinstance(metadata.get("profile_sampling"), dict) else {}
+        if column is None:
+            scan = {
+                "schema_version": "autorealize.csv_full_table_scan.v1",
+                "scanner_version": FULL_TABLE_SCAN_VERSION,
+                "status": "failed",
+                "file": fs.path,
+                "error": "required_time_column_not_found",
+            }
+        else:
+            cached = metadata.get("full_table_scan")
+            read_kwargs = _requested_csv_read_kwargs(fs)
+            read_options_fingerprint = csv_scan_read_options_fingerprint(read_kwargs)
+            if (
+                isinstance(cached, dict)
+                and cached.get("status") == "completed"
+                and cached.get("scanner_version") == FULL_TABLE_SCAN_VERSION
+                and cached.get("column") == column
+                and cached.get("source_fingerprint") == fingerprint
+                and cached.get("read_options_fingerprint") == read_options_fingerprint
+            ):
+                scan = dict(cached)
+                scan["reused_from_shared_cache"] = True
+                scan["elapsed_this_run_seconds"] = 0
+            else:
+                try:
+                    scan = scan_csv_time_column(
+                        data_root / fs.path,
+                        column=column,
+                        read_kwargs=read_kwargs,
+                    )
+                    scan.update(
+                        {
+                            "file": fs.path,
+                            "source_fingerprint": fingerprint,
+                            "source_size_bytes": source.get("size"),
+                            "source_mtime_ns": source.get("mtime_ns"),
+                            "reused_from_shared_cache": False,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    scan = {
+                        "schema_version": "autorealize.csv_full_table_scan.v1",
+                        "scanner_version": FULL_TABLE_SCAN_VERSION,
+                        "status": "failed",
+                        "scope": "all_csv_records_one_time_column",
+                        "file": fs.path,
+                        "column": column,
+                        "source_fingerprint": fingerprint,
+                        "source_size_bytes": source.get("size"),
+                        "source_mtime_ns": source.get("mtime_ns"),
+                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    }
+
+        scan["preview_scope"] = {
+            "kind": "field_profile_preview",
+            "rows_read": preview.get("rows_read"),
+            "configured_max_rows": preview.get("configured_max_rows"),
+            "sampled": bool(preview.get("sampled")),
+        }
+        metadata["full_table_scan"] = scan
+        metadata["source_fingerprint"] = fingerprint
+        if scan.get("status") == "completed":
+            columns = len(fs.columns)
+            exact_shape = [int(scan["rows_scanned"]), columns]
+            scan.setdefault("pre_scan_shape", metadata.get("shape"))
+            metadata["pre_scan_shape"] = metadata.get("shape")
+            metadata["shape"] = exact_shape
+            metadata["shape_estimated"] = False
+            metadata["shape_verification_basis"] = "csv_full_table_scan"
+            contract = metadata.get("csv_read_contract")
+            if isinstance(contract, dict):
+                contract.update(
+                    {
+                        "population_verified": True,
+                        "verification_scope": "full_row_population_and_time_column_scan",
+                        "reader_reported_shape": exact_shape,
+                        "verified_shape": exact_shape,
+                        "verified_row_count": exact_shape[0],
+                        "row_count_basis": "csv_full_table_scan",
+                        "estimated_shape_before_scan": scan.get("pre_scan_shape"),
+                        "full_table_scan": scan,
+                    }
+                )
+            fs.warnings = [
+                (
+                    f"字段统计仅基于前 {preview.get('rows_read')} 行预览；"
+                    "完整记录数与时间范围见 full_table_scan。"
+                    if "字段统计基于前 " in warning and "未全量扫描" in warning
+                    else "完整CSV分块扫描已覆盖此前行数估算；字段画像仍为预览范围。"
+                    if "行数或 shape 由轻量方式估算" in warning
+                    else warning
+                )
+                for warning in fs.warnings
+            ]
+            if str(fs.summary or "").startswith("表格行列:"):
+                fs.summary = (
+                    f"表格行列: {exact_shape[0]} x {exact_shape[1]}（记录数与时间范围已全表扫描验证；"
+                    f"字段画像读取前 {preview.get('rows_read', '未知')} 行）"
+                )
+        evidence.append(scan)
+    return evidence
+
+
+@contextmanager
+def _cache_write_lock(cache_dir: Path):
+    """Serialize short read/merge/replace transactions across Core processes."""
+    with (cache_dir / "cognition_cache.lock").open("a+b") as stream:
+        stream.seek(0, 2)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _qdi_answer_cache_key(answer: dict[str, Any]) -> str:
+    question = " ".join(str(answer.get("question") or "").split()).casefold()
+    fingerprints = answer.get("source_fingerprints")
+    if not isinstance(fingerprints, dict):
+        fingerprints = {}
+    task_scope = str(answer.get("source_task_scope_sha256") or "")
+    payload = json.dumps([question, fingerprints, task_scope], sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _task_scope_fingerprint(task_hint: Any) -> str:
+    normalized = " ".join(unicodedata.normalize("NFKC", str(task_hint or "")).split()).casefold()
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _source_inventory_fingerprint(inventory: dict[str, dict[str, Any]]) -> str:
+    fingerprints = {
+        path: item.get("fingerprint")
+        for path, item in sorted(inventory.items())
+        if isinstance(item, dict)
+    }
+    payload = json.dumps(fingerprints, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_source_paths(
+    values: Any,
+    inventory: dict[str, dict[str, Any]],
+    previous_inventory: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    previous_inventory = previous_inventory or {}
+    paths = []
+    for value in values:
+        path = str(value or "").replace("\\", "/").strip().removeprefix("./")
+        if (path in inventory or path in previous_inventory) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _annotate_prior_qdi_memory(
+    memory: dict[str, Any],
+    inventory: dict[str, dict[str, Any]],
+    *,
+    task_hint: str = "",
+    qdi_signature: str = "",
+) -> dict[str, Any]:
+    if not isinstance(memory, dict):
+        return {"answers": [], "source_delta": {}}
+    raw_answers = memory.get("answers")
+    if not isinstance(raw_answers, list):
+        raw_answers = []
+    current_task_scope = _task_scope_fingerprint(task_hint)
+    current_inventory_fingerprint = _source_inventory_fingerprint(inventory)
+    answers = []
+    for raw in raw_answers[-SHARED_QDI_ANSWER_LIMIT:]:
+        if not isinstance(raw, dict):
+            continue
+        answer = dict(raw)
+        task_scope = str(answer.get("source_task_scope_sha256") or "")
+        if not task_scope:
+            task_scope = _task_scope_fingerprint(answer.get("source_task_hint"))
+        answer["source_task_scope_sha256"] = task_scope
+        answer["task_scope_status"] = (
+            "unknown"
+            if not task_scope or not current_task_scope
+            else "same"
+            if task_scope == current_task_scope
+            else "different"
+        )
+        cached_inventory_fingerprint = str(answer.get("source_inventory_sha256") or "")
+        answer["source_inventory_status"] = (
+            "unknown"
+            if not cached_inventory_fingerprint
+            else "unchanged"
+            if cached_inventory_fingerprint == current_inventory_fingerprint
+            else "changed"
+        )
+        cached_qdi_signature = str(answer.get("qdi_signature") or "")
+        answer["qdi_contract_status"] = (
+            "unknown"
+            if not cached_qdi_signature or not qdi_signature
+            else "unchanged"
+            if cached_qdi_signature == qdi_signature
+            else "changed"
+        )
+        fingerprints = answer.get("source_fingerprints")
+        if not isinstance(fingerprints, dict) or not fingerprints:
+            answer["source_status"] = "unknown"
+            answer["changed_source_files"] = []
+        else:
+            changed = [
+                path for path, fingerprint in fingerprints.items()
+                if not isinstance(inventory.get(path), dict)
+                or inventory[path].get("fingerprint") != fingerprint
+            ]
+            answer["source_status"] = "changed" if changed else "unchanged"
+            answer["changed_source_files"] = changed[:20]
+        answers.append(answer)
+    return {**memory, "answers": answers}
+
+
+def _compact_source_delta(memory: dict[str, Any]) -> dict[str, list[str]]:
+    """Return a bounded, JSON-safe file delta from an older shared cache."""
+    raw = memory.get("source_delta") if isinstance(memory, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        key: [str(value)[:180] for value in (raw.get(key) or [])[:80]]
+        for key in ("unchanged_files", "new_files", "changed_files", "removed_files")
+        if isinstance(raw.get(key) or [], list)
+    }
 
 
 class DataCognitionModule:
@@ -67,7 +514,54 @@ class DataCognitionModule:
         log_event(logger, "module.data_cognition", "CREATED")
         log_event(logger, "module.data_cognition", "ACTIVATED", data_root=str(data_root))
         tree_text = self._write_directory_tree(data_root)
+        shared_cache_dir = self._shared_cache_dir()
+        shared_cache = self._load_shared_cache(shared_cache_dir)
+        cognition_signature = self._cognition_signature()
+        qdi_signature = self._qdi_signature()
+        previous_files = shared_cache.get("files", {}) if isinstance(shared_cache.get("files"), dict) else {}
+        previous_inventory = shared_cache.get("source_inventory", {})
+        if not isinstance(previous_inventory, dict):
+            previous_inventory = {}
+        source_inventory = self._source_inventory(data_root)
+        unchanged_files = {
+            path for path, item in source_inventory.items()
+            if isinstance(previous_inventory.get(path), dict)
+            and previous_inventory[path].get("fingerprint") == item.get("fingerprint")
+        }
+        new_files = sorted(set(source_inventory) - set(previous_inventory))
+        changed_files = sorted(set(source_inventory) & set(previous_inventory) - unchanged_files)
+        removed_files = sorted(set(previous_inventory) - set(source_inventory))
+        prior_question_memory = shared_cache.get("question_investigation", {})
+        if not isinstance(prior_question_memory, dict):
+            prior_question_memory = {}
+        prior_question_memory = _annotate_prior_qdi_memory(
+            prior_question_memory,
+            source_inventory,
+            task_hint=task_hint,
+            qdi_signature=qdi_signature,
+        )
+        prior_question_memory = {**prior_question_memory, "source_delta": {
+            "unchanged_files": sorted(unchanged_files), "new_files": new_files,
+            "changed_files": changed_files, "removed_files": removed_files,
+        }}
+        log_event(
+            logger,
+            "module.data_cognition.incremental",
+            "SCANNED",
+            files=len(source_inventory),
+            unchanged=len(unchanged_files),
+            changed=len(changed_files),
+            removed=len(removed_files),
+            prior_qdi_answers=len(prior_question_memory.get("answers", []) or []),
+        )
         selected_files, compact_image_dirs, sampled_patterns, filename_sample_groups = self._select_files_with_pattern_sampling(data_root)
+        selected_files, incremental_forced_files = self._include_incremental_sources(
+            data_root=data_root,
+            selected_files=selected_files,
+            new_files=new_files,
+            changed_files=changed_files,
+            cache_available=bool(shared_cache_dir and "source_inventory" in shared_cache),
+        )
         selected_files = sorted(selected_files, key=lambda file: rel(file, data_root))
         log_event(
             logger,
@@ -99,8 +593,37 @@ class DataCognitionModule:
         per_file_dir = self.report_dir / "file_cognition"
         per_file_dir.mkdir(parents=True, exist_ok=True)
         llm_cognition_paths = self._select_llm_cognition_paths(selected_files, data_root)
+        reused_paths: set[str] = set()
 
         def _one(file: Path) -> dict:
+            relative = rel(file, data_root)
+            cached = previous_files.get(relative) if relative in unchanged_files else None
+            if (isinstance(cached, dict) and cached.get("cognition_signature") == cognition_signature
+                    and isinstance(cached.get("summary"), dict)):
+                try:
+                    fs = FileSummary.model_validate(cached["summary"])
+                    if fs.path != relative:
+                        raise ValueError("Cached file path does not match source")
+                    fs.source_metadata = {
+                        **(fs.source_metadata or {}),
+                        "incremental_reuse": {
+                            "reused": True,
+                            "source_fingerprint": source_inventory[relative].get("fingerprint"),
+                            "source_mtime_ns": source_inventory[relative].get("mtime_ns"),
+                        },
+                    }
+                    self._write_per_file_cognition(per_file_dir, fs)
+                    reused_paths.add(relative)
+                    log_event(logger, "module.data_cognition.file", "REUSED", file=relative)
+                    return {
+                        "rpath": relative,
+                        "fs": fs,
+                        "columns": fs.columns,
+                        "is_requirement": fs.role == FileRole.task_requirement,
+                        "summary_text": self._read_authoritative_text(file) if fs.role == FileRole.task_requirement else "",
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    log_event(logger, "module.data_cognition.file", "REUSE_FAILED", file=relative, error=str(exc)[:180])
             result = legacy._cognize_one_file(
                 file=file,
                 data_root=data_root,
@@ -108,7 +631,7 @@ class DataCognitionModule:
                 config=self.config,
                 llm_client=self.services.llm_client,
                 prompt_mgr=self.services.prompt_mgr,
-                task_hint=task_hint,
+                task_hint=FILE_COGNITION_SCOPE if shared_cache_dir else task_hint,
                 allow_llm_cognition=rel(file, data_root) in llm_cognition_paths,
             )
             self._write_per_file_cognition(per_file_dir, result["fs"])
@@ -127,6 +650,53 @@ class DataCognitionModule:
             for file in selected_files:
                 self._accept_file_result(_one(file), file_summaries, table_columns, original_requirement_texts)
 
+        full_scan_evidence = _scan_requested_csvs(
+            data_root=data_root,
+            file_summaries=file_summaries,
+            source_inventory=source_inventory,
+            task_text="\n".join([task_hint, *original_requirement_texts]),
+        )
+        temporal_scan_requirement = _temporal_scan_requirement(
+            "\n".join([task_hint, *original_requirement_texts]),
+            full_scan_evidence,
+        )
+        write_json_safe(
+            self.report_dir / "temporal_scan_requirement.json",
+            temporal_scan_requirement,
+            indent=2,
+        )
+        if temporal_scan_requirement["status"] == "blocked":
+            log_event(
+                logger,
+                "module.data_cognition.temporal_scan_requirement",
+                "BLOCKED",
+                blockers=len(temporal_scan_requirement["blocking_issues"]),
+            )
+        elif temporal_scan_requirement["required"]:
+            log_event(
+                logger,
+                "module.data_cognition.temporal_scan_requirement",
+                "PASSED",
+                files=len(temporal_scan_requirement["files"]),
+            )
+        for scan in full_scan_evidence:
+            log_event(
+                logger,
+                "module.data_cognition.full_table_scan",
+                "COMPLETED" if scan.get("status") == "completed" else "FAILED",
+                file=scan.get("file"),
+                column=scan.get("column"),
+                rows_scanned=scan.get("rows_scanned"),
+                valid_timestamp_rows=scan.get("valid_timestamp_rows"),
+                invalid_timestamp_rows=scan.get("invalid_timestamp_rows"),
+                cache_reused=scan.get("reused_from_shared_cache", False),
+                error=scan.get("error"),
+            )
+        for fs in file_summaries:
+            self._write_per_file_cognition(per_file_dir, fs)
+
+        # Save only per-file knowledge, before relations and task stages mutate it.
+        reusable_summaries = [fs.model_copy(deep=True) for fs in file_summaries]
         for dir_rel, sample_files in compact_image_dirs.items():
             log_event(logger, "module.data_cognition.image_dir", "ACTIVATED", dir=dir_rel, samples=len(sample_files))
             vision_summary = legacy._infer_image_dir_purpose(
@@ -213,7 +783,14 @@ class DataCognitionModule:
             sampled_patterns=sampled_patterns,
             filename_sample_groups=filename_sample_groups,
         )
-        if self._should_run_question_investigator(file_summaries, constraint_memory, authoritative_memory):
+        knowledge_base["full_table_scans"] = full_scan_evidence
+        knowledge_base["temporal_scan_requirement"] = temporal_scan_requirement
+        if self._should_run_question_investigator(
+            file_summaries,
+            constraint_memory,
+            authoritative_memory,
+            full_scan_evidence=full_scan_evidence,
+        ):
             question_memory = run_question_investigator(
                 cfg=self.config,
                 llm_client=self.services.llm_client,
@@ -226,6 +803,8 @@ class DataCognitionModule:
                 constraint_memory=constraint_memory,
                 authoritative_memory=authoritative_memory,
                 knowledge_base=knowledge_base,
+                prior_question_memory=prior_question_memory,
+                shared_cache_dir=shared_cache_dir,
             )
         else:
             question_memory = {
@@ -240,8 +819,11 @@ class DataCognitionModule:
                 "unresolved_questions": [],
                 "context_routing_notes": [],
             }
-            write_json_safe(self.report_dir / "question_investigation_report.json", question_memory, indent=2)
             log_event(logger, "module.data_cognition.investigator", "SKIPPED", reason="on_demand_no_blocking_signal")
+        question_memory["precomputed_full_table_scans"] = full_scan_evidence
+        write_json_safe(self.report_dir / "question_investigation_report.json", question_memory, indent=2)
+        if prior_question_memory.get("answers"):
+            question_memory["prior_memory"] = prior_question_memory
         knowledge_base["question_investigation"] = question_memory
         agent_context_pack = self._build_agent_context_pack(
             task_hint=task_hint,
@@ -254,6 +836,8 @@ class DataCognitionModule:
             filename_sample_groups=filename_sample_groups,
             question_memory=question_memory,
         )
+        agent_context_pack["full_table_scans"] = full_scan_evidence
+        agent_context_pack["temporal_scan_requirement"] = temporal_scan_requirement
         write_json_safe(self.report_dir / "constraint_memory.json", constraint_memory, indent=2)
         write_json_safe(self.report_dir / "knowledge_base.json", knowledge_base, indent=2)
         write_json_safe(self.report_dir / "agent_context_pack.json", agent_context_pack, indent=2)
@@ -280,6 +864,24 @@ class DataCognitionModule:
             "question_investigation": question_memory,
             "knowledge_base": knowledge_base,
             "agent_context_pack": agent_context_pack,
+            "source_inventory": source_inventory,
+            "full_table_scans": full_scan_evidence,
+            "incremental": {
+                "enabled": bool(shared_cache_dir),
+                "unchanged_files": sorted(unchanged_files),
+                "reused_files": sorted(reused_paths),
+                "changed_files": changed_files,
+                "new_files": new_files,
+                "removed_files": removed_files,
+                "selected_files": [rel(p, data_root) for p in selected_files],
+                "not_selected_files": sorted(set(source_inventory) - {rel(p, data_root) for p in selected_files}),
+                "recognized_files": sorted({rel(p, data_root) for p in selected_files} - reused_paths),
+                "incremental_forced_files": incremental_forced_files,
+                "reused_file_count": len(reused_paths),
+                "changed_file_count": len(changed_files),
+                "prior_qdi_available": bool(prior_question_memory.get("answers")),
+                "cognition_signature": cognition_signature,
+            },
             "summary": {
                 "file_count": len(file_summaries),
                 "table_count": sum(1 for fs in file_summaries if fs.role == FileRole.raw_data_table),
@@ -296,6 +898,9 @@ class DataCognitionModule:
         log_event(logger, "module.data_cognition", "GENERATED_FILE", file="realize_report/data_description.md")
         log_event(logger, "module.data_cognition", "COMPLETED", files=len(file_summaries), relations=len(relation_hints))
         self.services.trajectory.log("data_cognition_module", "done", {"files": len(file_summaries), "relations": len(relation_hints)})
+        self._save_shared_cache(shared_cache_dir, source_inventory, reusable_summaries, question_memory,
+                                cognition_signature=cognition_signature, task_hint=task_hint,
+                                qdi_signature=qdi_signature)
         return DataCognitionResult(
             file_summaries=file_summaries,
             original_requirement_texts=original_requirement_texts,
@@ -308,6 +913,248 @@ class DataCognitionModule:
             agent_context_pack=agent_context_pack,
             data_description_path=data_description_path,
         )
+
+    def _shared_cache_dir(self) -> Path | None:
+        raw = str(os.environ.get("AUTOREALIZE_SHARED_CACHE_DIR") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _include_incremental_sources(
+        *,
+        data_root: Path,
+        selected_files: list[Path],
+        new_files: list[str] | set[str],
+        changed_files: list[str] | set[str],
+        cache_available: bool,
+    ) -> tuple[list[Path], list[str]]:
+        """Make sampling compatible with incremental correctness.
+
+        A first run may keep representative sampling. Once a shared inventory
+        exists, every new or changed file is recognized even if its filename
+        group would otherwise choose a different representative.
+        """
+        selected = list(selected_files)
+        selected_resolved = {path.resolve() for path in selected}
+        forced: list[str] = []
+        if not cache_available:
+            return selected, forced
+        root = data_root.resolve()
+        for relative in sorted(set(new_files) | set(changed_files)):
+            path = (data_root / relative).resolve()
+            if not path.is_file() or not path.is_relative_to(root):
+                continue
+            if path not in selected_resolved:
+                selected.append(path)
+                selected_resolved.add(path)
+                forced.append(str(relative).replace("\\", "/"))
+        return selected, forced
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _source_inventory(self, data_root: Path) -> dict[str, dict[str, Any]]:
+        inventory: dict[str, dict[str, Any]] = {}
+        for path in walk_files(data_root):
+            relative = rel(path, data_root)
+            stat = path.stat()
+            # Timestamps are audit metadata, not proof of unchanged content.
+            digest = self._hash_file(path)
+            after = path.stat()
+            if (stat.st_size, stat.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise ValueError(f"Source changed during inventory: {relative}")
+            inventory[relative] = {
+                "path": relative,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "mtime": stat.st_mtime,
+                "sha256": digest,
+                "fingerprint": hashlib.sha256(
+                    f"{relative}\0{stat.st_size}\0{digest}".encode()
+                ).hexdigest(),
+            }
+        return inventory
+
+    def _cognition_signature(self) -> str:
+        """Invalidate neutral file memory when its reading/model contract changes."""
+        prompt_root = Path(__file__).resolve().parents[1] / "prompts" / "system"
+        prompts = {}
+        for name in (
+            "cognition_probe_planner.md",
+            "cognition_summarizer.md",
+            "cognition_document_compactor.md",
+        ):
+            manager = self.services.prompt_mgr
+            prompts[name] = (manager.load(f"system/{name}") if manager and hasattr(manager, "load")
+                             else (prompt_root / name).read_text(encoding="utf-8-sig"))
+        value = {
+            "schema": SHARED_COGNITION_SCHEMA, "scope": FILE_COGNITION_SCOPE,
+            "data": asdict(self.config.data), "prompts": prompts,
+            "language": getattr(getattr(self.config, "prompt", None), "output_language", "zh"),
+            "llm": {
+                key: value
+                for key, value in asdict(self.config.llm).items()
+                if key != "api_key"
+            },
+            "vision": {
+                k: v for k, v in asdict(getattr(self.config, "vllm", None)).items()
+                if "key" not in k
+            } if getattr(self.config, "vllm", None) is not None else {},
+        }
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+    def _qdi_signature(self) -> str:
+        """Bind historical QDI conclusions to the prompts and action contract that produced them."""
+        prompt_root = Path(__file__).resolve().parents[1] / "prompts" / "system"
+        manager = self.services.prompt_mgr
+        prompt_names = (
+            "question_investigator_planner.md",
+            "question_investigator_answerer_v7.md",
+            "question_investigator_script_repair.md",
+        )
+        prompts = {
+            name: (
+                manager.load(f"system/{name}")
+                if manager and hasattr(manager, "load")
+                else (prompt_root / name).read_text(encoding="utf-8-sig")
+            )
+            for name in prompt_names
+        }
+        llm = {
+            key: value
+            for key, value in asdict(self.config.llm).items()
+            if key != "api_key"
+        }
+        value = {
+            "protocol_version": SHARED_QDI_PROTOCOL_VERSION,
+            "qdi_cache_layout": QDI_CACHE_LAYOUT,
+            "project_context_layout": QDI_PROJECT_CONTEXT_LAYOUT,
+            "action_schema": QDI_ACTION_SCHEMA_PROMPT,
+            "prompts": prompts,
+            "data": asdict(self.config.data),
+            "investigation": asdict(self.config.investigation),
+            "context": asdict(self.config.context),
+            "language": getattr(getattr(self.config, "prompt", None), "output_language", "zh"),
+            "llm": llm,
+        }
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+
+    def _load_shared_cache(self, cache_dir: Path | None) -> dict[str, Any]:
+        if cache_dir is None:
+            return {}
+        try:
+            value = json.loads((cache_dir / "cognition_cache.json").read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) and value.get("schema_version") == SHARED_COGNITION_SCHEMA else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_shared_cache(
+        self,
+        cache_dir: Path | None,
+        inventory: dict[str, dict[str, Any]],
+        file_summaries: list[FileSummary],
+        question_memory: dict[str, Any],
+        *,
+        cognition_signature: str,
+        task_hint: str,
+        qdi_signature: str = "",
+    ) -> None:
+        if cache_dir is None:
+            return
+        files = {}
+        for fs in file_summaries:
+            item = inventory.get(fs.path)
+            if item:
+                summary = fs.model_dump()
+                summary["source_metadata"].pop("incremental_reuse", None)
+                files[fs.path] = {"fingerprint": item.get("fingerprint"), "summary": summary,
+                                  "cognition_signature": cognition_signature}
+        temporary = None
+        try:
+            with _cache_write_lock(cache_dir):
+                previous = self._load_shared_cache(cache_dir)
+                previous_inventory = previous.get("source_inventory", {})
+                if not isinstance(previous_inventory, dict):
+                    previous_inventory = {}
+                # Retain valid summaries for files omitted by representative sampling.
+                previous_files = previous.get("files", {})
+                if not isinstance(previous_files, dict):
+                    previous_files = {}
+                retained = {path: entry for path, entry in previous_files.items()
+                            if path in inventory and isinstance(entry, dict)
+                            and entry.get("fingerprint") == inventory[path]["fingerprint"]}
+                answers = {}
+                previous_qdi = previous.get("question_investigation", {})
+                if not isinstance(previous_qdi, dict):
+                    previous_qdi = {}
+                history = previous_qdi.get("answers", [])
+                if not isinstance(history, list):
+                    history = []
+                for item in history:
+                    if isinstance(item, dict):
+                        answers[_qdi_answer_cache_key(item)] = item
+                question_records = question_memory.get("question_records", [])
+                if not isinstance(question_records, list):
+                    question_records = []
+                records_by_question = {
+                    str(record.get("question_id") or ""): record
+                    for record in question_records
+                    if isinstance(record, dict)
+                }
+                current_answers = question_memory.get("answers", [])
+                if not isinstance(current_answers, list):
+                    current_answers = []
+                source_inventory_digest = _source_inventory_fingerprint(inventory)
+                task_scope_digest = _task_scope_fingerprint(task_hint)
+                for answer in current_answers:
+                    if not isinstance(answer, dict) or not answer.get("answer"):
+                        continue
+                    record = records_by_question.get(str(answer.get("question_id") or ""), {})
+                    source_paths = _normalize_source_paths(
+                        record.get("used_files"), inventory, previous_inventory,
+                    )
+                    source_fingerprints = {}
+                    for path in source_paths:
+                        source = inventory.get(path) or previous_inventory.get(path)
+                        if isinstance(source, dict) and source.get("fingerprint"):
+                            source_fingerprints[path] = source["fingerprint"]
+                    item = {**answer, "source_task_hint": task_hint,
+                            "source_task_scope_sha256": task_scope_digest,
+                            "source_report": str(self.report_dir.resolve()),
+                            "source_inventory_sha256": source_inventory_digest,
+                            "source_fingerprints": source_fingerprints,
+                            "qdi_signature": qdi_signature,
+                            "stored_at": time.time()}
+                    key = _qdi_answer_cache_key(item)
+                    answers.pop(key, None)
+                    answers[key] = item
+                payload = {
+                    "schema_version": SHARED_COGNITION_SCHEMA,
+                    "source_inventory": inventory, "files": {**retained, **files},
+                    "question_investigation": {
+                        "answers": list(answers.values())[-SHARED_QDI_ANSWER_LIMIT:]
+                    },
+                }
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_dir,
+                                                 prefix="cognition-", suffix=".tmp", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    json.dump(payload, stream, ensure_ascii=False, indent=2, default=str)
+                temporary.replace(cache_dir / "cognition_cache.json")
+        except OSError as exc:
+            log_event(logger, "module.data_cognition.incremental", "CACHE_WRITE_FAILED", error=str(exc)[:200])
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _select_llm_cognition_paths(self, files: list[Path], data_root: Path) -> set[str]:
         mode = str(getattr(self.config.data, "llm_file_cognition_mode", "all") or "all").lower()
@@ -327,6 +1174,8 @@ class DataCognitionModule:
         file_summaries: list[FileSummary],
         constraint_memory: dict,
         authoritative_memory: dict,
+        *,
+        full_scan_evidence: list[dict[str, Any]] | None = None,
     ) -> bool:
         if not bool(getattr(self.config.investigation, "enabled", True)):
             return False
@@ -334,6 +1183,12 @@ class DataCognitionModule:
         if mode in {"disabled", "off", "false"}:
             return False
         if mode == "always":
+            return True
+
+        if any(
+            isinstance(scan, dict) and str(scan.get("status") or "").lower() != "completed"
+            for scan in (full_scan_evidence or [])
+        ):
             return True
 
         contract = (authoritative_memory or {}).get("submission_contract") if isinstance(authoritative_memory, dict) else {}
@@ -1145,6 +2000,12 @@ class DataCognitionModule:
                 "outranks README/official/spec/other requirement documents, and all documents outrank data profiles "
                 "or LLM inference. If sources conflict, keep the highest-priority source, preserve evidence, and record "
                 "the conflict in authority_conflicts or context_routing_notes. "
+                "Only incompatible positive requirements are authority conflicts. Compatible refinements, "
+                "a more specific user rule, or a value left unspecified by every source are not conflicts. "
+                "For example, no required output filename is an implementation assumption, not an execution blocker; "
+                "official unlabeled test submission and an internal labeled validation split are compatible. "
+                "Put genuine missing specification in unresolved_questions only when it is needed to execute; "
+                "never populate authority_conflicts just to repeat that all sources omit the same detail. "
                 "Also populate requirement_fact_matrix. Classify each important statement as current_rule, "
                 "current_answer, question, future_roadmap, or example, and status as current, resolved, superseded, "
                 "unresolved, or not_current. A question/problem statement such as 'data X is missing' must become "
@@ -1158,7 +2019,13 @@ class DataCognitionModule:
                 "requirements in supporting documents. Preserve exact numerical limits, formulas, units, both "
                 "sides of conflicting limits, and conditional or deferred applicability in the fact matrix. "
                 "Operational rules may be inapplicable to offline prediction while remaining documented limits; "
-                "do not omit them or turn them into a universal training blocker."
+                "do not omit them or turn them into a universal training blocker. For every authority_conflicts item, "
+                "also emit execution_disposition as blocking, non_blocking_with_limits, or unknown, plus "
+                "execution_limits as an array. Use non_blocking_with_limits only when an authoritative task hint "
+                "explicitly supplies a conservative handling boundary and the conflict does not change the task "
+                "target, evaluation, or output contract; copy that boundary faithfully. Never mark a conflict resolved "
+                "or select a winning source to make execution proceed. If the safe scope is not explicit, use blocking "
+                "when the task depends on the conflict, otherwise unknown; unknown must not be treated as permission."
                 )
             },
             dynamic={"sources": sources},
@@ -1170,7 +2037,8 @@ class DataCognitionModule:
             system_prompt=(
                 "You extract high-priority task contracts from original task documents and route conflicting document facts. "
                 "You must preserve evidence, distinguish current rules from questions/answers/future plans/examples, "
-                "and leave unknown fields empty instead of guessing."
+                "and leave unknown fields empty instead of guessing. For each authority conflict, classify whether the "
+                "current task can proceed under explicit task-hint limits; never resolve the source disagreement."
             ),
             user_prompt=dynamic,
             prompt_name="authoritative_task_memory",

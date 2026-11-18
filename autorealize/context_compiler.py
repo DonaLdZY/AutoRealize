@@ -10,6 +10,11 @@ from typing import Any
 
 from .utils.safe_json import json_safe, write_json_safe
 from .entity_alias import build_entity_alias_candidates, enrich_entity_alias_candidates_with_coverage
+from .profiling.full_scan import (
+    csv_scan_read_options_from_metadata,
+    csv_scan_read_options_fingerprint,
+    verified_full_scan_population,
+)
 
 
 @dataclass(frozen=True)
@@ -155,8 +160,13 @@ class ArtifactStore:
 
 def _select_artifact_json_path(payload: Any, json_path: str) -> tuple[Any, str]:
     path = str(json_path or "").strip()
-    if not path or path == "payload":
+    # JSONPath callers commonly use "$" for the document root. Treat it as
+    # the same root view as an empty path / "payload"; rejecting it caused a
+    # needless paid retry whenever a model used standard JSONPath notation.
+    if not path or path in {"$", "payload", "$.payload"}:
         return payload, ""
+    if path.startswith("$."):
+        path = path[2:]
     if path.startswith("payload."):
         path = path[len("payload.") :]
     elif path.startswith("payload["):
@@ -568,6 +578,7 @@ def compact_detail_table_card_for_prompt(card: dict[str, Any], *, field_limit: i
             "shape": card.get("shape"),
             "verified_row_count": card.get("verified_row_count"),
             "row_count_basis": card.get("row_count_basis"),
+            "full_table_scan": card.get("full_table_scan"),
             "worksheet_used_range_shape": card.get("worksheet_used_range_shape") if card.get("row_count_conflict") else None,
             "row_count_conflict": card.get("row_count_conflict"),
             "row_count_note": str(card.get("row_count_note", "") or "")[:300],
@@ -655,11 +666,25 @@ def reconcile_table_shape(
 
     profiles = [p for p in (column_profiles or table.get("column_profiles") or []) if isinstance(p, dict)]
     physical_shape = _shape_pair(table.get("shape") or table.get("shape_estimated"))
+    # The legacy .xls reader falls back to a bounded preview when workbook
+    # dimensions are unavailable. Those rows are not an Excel used range.
+    preview_only = is_worksheet and table.get("shape_estimated") is True
+    preview_shape = physical_shape if preview_only else None
+    if preview_only:
+        physical_shape = None
     profiled_shape = _shape_pair(table.get("shape_profiled"))
     sampled_shape = _shape_pair(table.get("shape_sampled"))
     profile_policy = str(table.get("profile_policy", "") or "").lower()
     sampling = table.get("profile_sampling") if isinstance(table.get("profile_sampling"), dict) else {}
     is_sampled = bool(sampling.get("sampled")) or "sample" in profile_policy
+    scan = table.get("full_table_scan") if isinstance(table.get("full_table_scan"), dict) else {}
+    source_fingerprint = str(table.get("source_fingerprint") or "")
+    read_kwargs = csv_scan_read_options_from_metadata(table)
+    scan_valid = verified_full_scan_population(
+        scan,
+        source_fingerprint=source_fingerprint,
+        read_options_fingerprint=csv_scan_read_options_fingerprint(read_kwargs),
+    )
 
     counts: list[int] = []
     for profile in profiles:
@@ -672,9 +697,13 @@ def reconcile_table_shape(
     profile_rows = Counter(counts).most_common(1)[0][0] if counts else None
 
     parsed_rows: int | None = None
-    basis = "worksheet_used_range" if is_worksheet else "reader_shape_unverified"
-    confidence = "medium"
-    if not is_sampled:
+    basis = "preview_only" if preview_only else "worksheet_used_range" if is_worksheet else "reader_shape_unverified"
+    confidence = "low" if preview_only else "medium"
+    if scan_valid:
+        parsed_rows = scan["rows_scanned"]
+        basis = "csv_full_table_scan"
+        confidence = "high"
+    elif not is_sampled:
         if profile_rows is not None:
             parsed_rows = profile_rows
             basis = "full_column_profile_row_count"
@@ -686,7 +715,7 @@ def reconcile_table_shape(
 
     reported_rows = physical_shape[0] if physical_shape else None
     column_count = (
-        (profiled_shape or sampled_shape or physical_shape or [0, 0])[1]
+        (profiled_shape or sampled_shape or physical_shape or preview_shape or [0, 0])[1]
         or len(table.get("columns") or [])
     )
     verified_shape = [parsed_rows, column_count] if parsed_rows is not None else (physical_shape or [])
@@ -704,6 +733,7 @@ def reconcile_table_shape(
         "reported_row_count": reported_rows,
         "worksheet_used_range_shape": physical_shape if is_worksheet else None,
         "reader_reported_shape": physical_shape if not is_worksheet else None,
+        "reader_preview_shape": preview_shape,
         "profiled_shape": profiled_shape,
         "sampled_shape": sampled_shape,
         "profile_is_sampled": is_sampled,
@@ -714,6 +744,16 @@ def reconcile_table_shape(
             f"Worksheet used range reports {physical_shape[0]} rows, while full parsing/profile facts report "
             f"{parsed_rows} data rows. Use verified_row_count for task population and keep used range only as a "
             "physical-layout diagnostic."
+        )
+    elif preview_only:
+        result["row_count_note"] = (
+            "Reader shape is a bounded preview, not worksheet dimensions or total population. "
+            "Use the full parse/profile count when available; preview length is not a count conflict."
+        )
+    elif scan_valid and is_sampled:
+        result["row_count_note"] = (
+            "Field profiles are sampled. Full CSV row count and the selected time-column range "
+            "were verified by a fingerprint-matched chunk scan."
         )
     elif is_sampled:
         result["row_count_note"] = (
@@ -731,7 +771,7 @@ def source_columns_exact(fs: Any) -> list[str]:
 
 
 def primary_key_candidates(fields: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
-    """Rank evidence-backed key candidates without asserting a business key."""
+    """Rank semantically plausible key/time candidates without guessing from uniqueness."""
 
     ranked: list[tuple[float, str, dict[str, Any]]] = []
     for field in fields or []:
@@ -739,6 +779,15 @@ def primary_key_candidates(fields: list[dict[str, Any]], *, limit: int = 5) -> l
             continue
         name = str(field.get("name", "") or "").strip()
         if not name:
+            continue
+        role = str(field.get("role", "") or "").strip().lower()
+        name_lower = name.lower()
+        key_name = any(
+            token in name_lower
+            for token in ("id", "编号", "代码", "单号", "key", "序号", "uuid", "serial")
+        )
+        time_name = any(token in name_lower for token in ("time", "date", "时间", "日期", "时刻"))
+        if role not in {"id_or_key", "time"} and not (key_name or time_name):
             continue
         try:
             rows = float(field.get("row_count") or 0)
@@ -752,9 +801,8 @@ def primary_key_candidates(fields: list[dict[str, Any]], *, limit: int = 5) -> l
         uniqueness = unique / non_null
         if completeness < 0.8 or uniqueness < 0.8:
             continue
-        role_bonus = 0.15 if str(field.get("role", "")) == "id_or_key" else 0.0
-        name_lower = name.lower()
-        name_bonus = 0.12 if any(token in name_lower for token in ["id", "编号", "代码", "单号", "key"]) else 0.0
+        role_bonus = 0.15 if role == "id_or_key" else 0.08 if role == "time" else 0.0
+        name_bonus = 0.12 if key_name else 0.08 if time_name else 0.0
         score = 0.48 * completeness + 0.40 * uniqueness + role_bonus + name_bonus
         ranked.append(
             (
@@ -1053,6 +1101,7 @@ def file_to_table_cards(
                         "recommended_read": sheet.get("recommended_read"),
                         "reading_risks": sheet.get("reading_risks"),
                         "fields": field_cards,
+                        "physical_columns_exact": [str(x) for x in (sheet.get("columns") or [])],
                         "primary_key_candidates": primary_key_candidates(field_cards),
                         "reading_notes": _reading_notes(path, meta, sheet_name=sheet_name, sheet=sheet),
                         "warnings": _warnings(fs, sheet),
@@ -1077,6 +1126,7 @@ def file_to_table_cards(
                 "verified_row_count": non_excel_shape.get("verified_row_count"),
                 "reported_row_count": non_excel_shape.get("reported_row_count"),
                 "row_count_basis": non_excel_shape.get("row_count_basis"),
+                "full_table_scan": meta.get("full_table_scan"),
                 "worksheet_used_range_shape": non_excel_shape.get("worksheet_used_range_shape"),
                 "reader_reported_shape": non_excel_shape.get("reader_reported_shape"),
                 "row_count_conflict": non_excel_shape.get("row_count_conflict"),

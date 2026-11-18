@@ -14,7 +14,7 @@ llm:
   # Sampling temperature / 生成温度
   temperature: 0.0
   # Minimum cap for every normal business LLM request / 所有正常业务 LLM 请求的输出 token 下限
-  minimum_output_tokens: 32768
+  minimum_output_tokens: 0
   # Normal output token cap / 普通文本输出上限
   max_tokens: 32768
   # Structured JSON output token cap / 结构化 JSON 输出上限
@@ -35,16 +35,18 @@ llm:
   enable_thinking: null
   # null=provider default; low|medium|high|xhigh|max / 思考强度
   reasoning_effort: null
-  # Disable thinking for schema-constrained calls / 结构化调用是否关闭思考
-  structured_disable_thinking: true
+  # Estimator margin after reserving output budget / 预留输出预算后的估算误差比例
+  context_headroom_ratio: 0.01
+  # Keep model reasoning enabled for JSON/schema-constrained calls / 结构化调用仍启用模型思考
+  structured_disable_thinking: false
   # Compact JSON schema before sending; local validation still uses the full schema / 发送前压缩 JSON schema，本地仍完整校验
   compact_structured_schema: true
   # Include a generated empty JSON example in structured prompts / 是否发送自动生成的空 JSON 示例
   structured_include_json_example: false
   # Follow DeepSeek JSON-mode guidance without affecting other providers / 仅对官方 DeepSeek 按文档附带紧凑 JSON 示例
   deepseek_json_mode_include_example: true
-  # Disable thinking on retry when reasoning exhausts the structured output budget / reasoning 耗尽输出预算时自动关闭 thinking 重试
-  structured_reasoning_fallback_on_length: true
+  # Preserve thinking on length retries; first expand the output budget / 长度重试保持 thinking，并先提高输出预算
+  structured_reasoning_fallback_on_length: false
   # Reasoning/completion ratio that triggers the fallback / 触发降级的 reasoning 占比
   structured_reasoning_fallback_ratio: 0.75
   # Retry every length-truncated structured response directly at this cap / 任意结构化输出截断后直接使用此上限重试
@@ -181,36 +183,40 @@ investigation:
   # Enable question-driven investigation / 是否启用问题驱动调查
   enabled: true
   # always|on_demand|disabled / 调查触发方式
-  trigger_mode: "always"
+  trigger_mode: "on_demand"
   # Maximum questions in one run / 单次最大问题数
-  max_questions: 20
-  # Maximum actions per question / 每个问题最大动作轮数
-  max_rounds_per_run: 10
+  max_questions: 6
+  # Investigation action slots per question; retrieval has separate quotas / 每题调查动作槽上限，取回另计
+  max_rounds_per_run: 6
   # Follow-up question depth / 子问题最大深度
   question_bfs_max_depth: 5
   # Child questions generated per question / 每个问题最大子问题数
-  max_followup_questions_per_question: 5
+  max_followup_questions_per_question: 3
   # Permit sandboxed read-only Python / 是否允许沙箱只读 Python
   allow_custom_readonly_python: true
   # Script actions per question; document retrieval is separate / 每题脚本次数，文档检索另计
-  max_scripts_per_question: 3
+  max_scripts_per_question: 2
+  # Local table-card context retrievals per question; separate retrieval quota / 每题本地上下文取回次数，单独计数
+  context_retrievals_per_question: 2
   # Script timeout seconds / 探查脚本超时秒数
   custom_python_timeout_seconds: 30.0
   # Script repair retries / 探查脚本修复次数
   custom_python_max_retries: 3
   # Retained stdout/stderr characters / 保留的脚本输出字符数
   custom_python_max_stdout_chars: 12000
-  # Retained structured result characters / 保留的结构化结果字符数
+  # Prompt/report preview only; complete result is kept in an artifact / 模型和报告预览预算，完整结果入 artifact
   max_result_chars: 20000
-  # Deterministic document retrieval actions per question / 每个问题最多文档取回动作数
-  document_retrievals_per_question: 4
+  # Explicit serialized JSON safety ceiling / 结构化 JSON 结果硬安全上限，超出明确失败
+  custom_python_max_result_bytes: 67108864
+  # Shared search/read document retrieval quota per question / 每题文档搜索和读取共用的独立额度
+  document_retrievals_per_question: 2
   # Full-text document chunk size / 全文切片字符数
   document_chunk_chars: 2200
   # Neighboring overlap between document chunks / 文档切片重叠字符数
   document_chunk_overlap_chars: 200
   # Search hits returned to QDI / 文档检索返回条数
   document_search_top_k: 5
-  # Maximum document text visible in one retrieval / 单次取回最大可见字符数
+  # Maximum document text returned per retrieval / 单次文档读取返回的原文字符上限
   document_retrieval_max_chars: 12000
   # Recent actions directly visible to the model / 模型默认直接看到的最近动作数
   recent_action_count: 3
@@ -218,12 +224,14 @@ investigation:
   recent_script_chars: 12000
   # Visible result per recent script action / 最近脚本动作可见结果字符数
   recent_result_chars: 8000
-  # Visible result per recent context/document retrieval / 最近上下文或文档取回可见字符数
+  # Prompt view of context/document retrieval; complete result stays in artifact / 取回结果提示词视图预算
   recent_retrieval_chars: 8000
-  # Bounded cumulative QDI working memory / QDI 累计工作记忆字符上限
+  # Prompt projection size; complete working memory stays in QDI artifacts / 工作记忆 prompt 视图字符预算，完整记忆保存在 artifact
   working_memory_max_chars: 12000
-  # Old QDI artifact reads per question; separate from script/repair budgets / 每题旧 QDI artifact 取回次数
+  # Separate artifact retrieval quota; does not consume investigation slots / 每题独立 artifact 取回额度
   artifact_retrievals_per_question: 2
+  # Host-owned cap on repeated retrievals; measurable checks/scripts and explicit continuations may follow
+  max_retrieval_actions_before_terminal: 1
   # Visible characters per old QDI artifact read / 单次旧 QDI artifact 取回字符数
   artifact_retrieval_max_chars: 8000
   # Rows available to legacy helper probes / 旧探查 helper 最大行数
@@ -234,6 +242,36 @@ investigation:
   adaptive_budgeting: true
   # Deterministic relation/layout verification questions added beside planner output / 自动追加的关系与读取验证题上限
   automatic_verification_question_limit: 4
+  # Compact host-owned action state protocol / 宿主持有完整轨迹、模型只接收紧凑状态帧
+  decision_state_protocol: "qdi-decision-state-v7"
+  # Prior evidence digests retained in each action prompt / 每轮保留的既往证据摘要卡数量
+  decision_digest_count: 4
+  # Latest evidence card prompt budget / 最近证据卡进入 prompt 的字符预算
+  decision_latest_evidence_chars: 6000
+  # Non-current question records shown to the action model / 当前问题之外的问题账本条数
+  decision_question_ledger_limit: 8
+  # Stable-prefix detailed table-card count / 稳定项目前缀详细表卡数量
+  project_table_card_limit: 20
+  # Fields per stable-prefix table card / 稳定项目前缀每表字段数
+  project_table_card_field_limit: 10
+  # Total stable-prefix table-card character budget / 稳定项目表卡总字符预算
+  project_table_cards_max_chars: 32000
+  # Table cards per source file / 单源文件稳定表卡数量
+  project_table_cards_per_source: 8
+  # Stable-prefix relation-card count / 稳定项目关系卡数量
+  project_relation_limit: 16
+  # Stable-prefix filename-group count / 稳定项目文件名组数量
+  project_filename_group_limit: 16
+  # Stable-prefix entity-alias candidate count / 稳定项目实体别名候选数量
+  project_entity_alias_limit: 16
+  # Stable-prefix field-glossary count / 稳定项目字段词典条目数量
+  project_field_glossary_limit: 40
+  # Historical QDI answer count / 稳定项目历史 QDI 答案数量
+  project_prior_answer_limit: 8
+  # QDI planner output cap / QDI Planner 输出上限
+  planner_max_output_tokens: 6144
+  # QDI action output cap / QDI Action 输出上限
+  action_max_output_tokens: 4096
 
 # Vision-model cognition / 视觉模型认知
 vllm:
@@ -340,10 +378,14 @@ context:
   cross_stage_memory_entry_chars: 12000
   cross_stage_memory_recent_entries: 4
   cross_stage_memory_max_compactions: 6
+  # Use an extra LLM to compact typed stage cards / 是否额外调用 LLM 压缩阶段卡；默认关闭
+  cross_stage_memory_use_llm_compactor: false
   # Plan exact artifact retrieval only at critical stages / 仅在关键阶段规划精确 artifact 取回
   cross_stage_retrieval_enabled: true
   cross_stage_retrieval_max_artifacts: 3
   cross_stage_retrieval_excerpt_chars: 6000
+  # Use an extra LLM retrieval planner / 是否额外调用 LLM 规划 artifact 取回；默认关闭
+  cross_stage_retrieval_use_llm_planner: false
   cross_stage_retrieval_stage_prefixes:
     - "description_protocol_"
     - "evaluation_contract_"

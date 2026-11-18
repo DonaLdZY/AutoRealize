@@ -135,17 +135,33 @@ def test_review_requires_all_coverage_dimensions_and_blocks_inconsistent_verdict
         ArtifactConsistencyAudit(passed=True, issues=[], coverage=broken)
     with pytest.raises(ValueError, match="coverage conflict"):
         ArtifactConsistencyAudit(passed=True, issues=[{"severity": "warning"}], coverage=broken)
+    uncertain = deepcopy(coverage)
+    uncertain["mirrored_artifacts"]["status"] = "warning"
+    with pytest.raises(ValueError, match="Insufficient coverage evidence"):
+        ArtifactConsistencyAudit(passed=True, issues=[], coverage=uncertain)
+    with pytest.raises(ValueError, match="actionable issues"):
+        ArtifactConsistencyAudit(passed=False, issues=[], coverage=coverage)
     with pytest.raises(ValueError, match="blocking issue"):
         ArtifactConsistencyAudit(passed=True, issues=[{"severity": "blocking"}], coverage=coverage)
 
 
-def test_optimized_production_reviewer_uses_full_output_budget(tmp_path):
+def test_review_normalizes_common_uncertain_dimension_statuses():
+    from autorealize.review_prompt import ReviewDimension
+
+    assert ReviewDimension(status="warning", evidence_refs=[], reasoning="not proven").status == "insufficient_evidence"
+    assert ReviewDimension(status="unknown", evidence_refs=[], reasoning="not proven").status == "insufficient_evidence"
+    assert ReviewDimension(status="confident", evidence_refs=[], reasoning="not resolved").status == "insufficient_evidence"
+    assert ReviewDimension(status="inconsistent_but_not_confirmed_by_numbers", evidence_refs=[], reasoning="not resolved").status == "insufficient_evidence"
+    assert ReviewDimension(status="pass", evidence_refs=["evidence"], reasoning="matches").status == "consistent"
+
+
+def test_optimized_production_reviewer_keeps_full_evidence_with_compact_result(tmp_path):
     from types import SimpleNamespace
     from autorealize.config import AutoRealizeConfig
     from autorealize.models import DescriptionProtocolBundle, EvaluationContractReview, ProblemParadigmReview, SampleSubmissionSpec
     from autorealize.modules.task_definition import TaskDefinitionModule
     from autorealize.modules.types import RuntimeServices
-    from autorealize.review_prompt import ArtifactConsistencyAudit
+    from autorealize.models import ArtifactConsistencyReview
     requests = []
     cfg = AutoRealizeConfig()
     cfg.prompt.lossless_review_prompts = True
@@ -157,9 +173,28 @@ def test_optimized_production_reviewer_uses_full_output_budget(tmp_path):
         protocol_bundle=DescriptionProtocolBundle(), evaluation_contract=EvaluationContractReview(),
         sample_spec=SampleSubmissionSpec(), submission_report={}, automl_context_pack={},
         main_task_protocol={}, downstream_context={}, deterministic_defects=[], round_idx=1)
-    assert requests[0]["model_cls"] is ArtifactConsistencyAudit
-    assert requests[0]["max_tokens"] == 32768
+    assert requests[0]["model_cls"] is ArtifactConsistencyReview
+    assert requests[0]["max_tokens"] == 12288
+    assert requests[0]["length_retry_max_tokens"] == 16384
+    assert "逐项完成 coverage" not in requests[0]["system_prompt"]
     assert decode(requests[0]["static_context_prompt"])["latest_request"]["description_markdown"] == "Every section remains visible"
+
+
+def test_artifact_review_pack_omits_duplicate_contracts_and_alias_candidates():
+    from autorealize.modules.task_definition import TaskDefinitionModule
+
+    packed = TaskDefinitionModule._artifact_consistency_review_pack({
+        "data_schema_contract": {"tables": []},
+        "source_coverage_ledger": {"entries": []},
+        "entity_alias_candidates": [{"large": "candidate payload"}],
+        "evaluation_contract": {"duplicated": True},
+        "execution_contract": {"duplicated": True},
+        "constraints": ["duplicated"],
+    })
+    assert packed == {
+        "data_schema_contract": {"tables": []},
+        "source_coverage_ledger": {"entries": []},
+    }
 
 
 @pytest.mark.parametrize("optimized", [False, True])
@@ -200,7 +235,8 @@ def test_evaluation_rollout_changes_only_validated_finalizer(tmp_path, optimized
             assert restored["latest_request"]["previous_contract"] == previous.model_dump()
             assert restored["stage_evidence"]["evaluation_evidence_pack"] == {"exact_columns": ["target", "prediction"]}
         else:
-            assert request["system_prompt"] == "Review instructions"
+            assert request["system_prompt"].startswith("Review instructions\n")
+            assert EVALUATION_REVIEW_INSTRUCTIONS in request["system_prompt"]
             assert "previous_contract" in request["dynamic_user_prompt"]
             assert "previous_contract" not in request["static_context_prompt"]
         if rounds == 1:

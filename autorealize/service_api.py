@@ -33,11 +33,21 @@ class StartAutoRealizeRequest(BaseModel):
     output_root: str
     run_name: str
     task_hint: str = ""
+    evaluation_contract: str = ""
     config_path: str = ""
     python_executable: str = "python"
     working_dir: str = DEFAULT_WORKDIR
     auto_generate_predict_split: bool = False
     env_overrides: dict[str, str] = Field(default_factory=dict)
+
+
+def _compose_task_hint(task_hint: str, evaluation_contract: str) -> str:
+    hint = str(task_hint or "").strip()
+    contract = str(evaluation_contract or "").strip()
+    if not contract:
+        return hint
+    heading = "# Explicit evaluation contract supplied with this task"
+    return f"{hint}\n\n{heading}\n{contract}" if hint else f"{heading}\n{contract}"
 
 
 class StopRequest(BaseModel):
@@ -373,7 +383,7 @@ def _run_job(job_id: str, req: StartAutoRealizeRequest) -> None:
         "--output-root",
         req.output_root,
         "--task",
-        req.task_hint,
+        _compose_task_hint(req.task_hint, req.evaluation_contract),
         "--run-name",
         req.run_name,
         "--config",

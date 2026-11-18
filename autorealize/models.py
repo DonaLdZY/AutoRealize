@@ -203,6 +203,13 @@ class DescriptionSectionDraft(BaseModel):
     open_issues: list[str] = Field(default_factory=list)
 
 
+class ConstraintsAndTipsDraft(BaseModel):
+    """Two nonduplicating reader sections from one shared-evidence request."""
+
+    constraints: DescriptionSectionDraft
+    tips: DescriptionSectionDraft
+
+
 class OverviewTaskDefinitionDraft(BaseModel):
     """Frozen overview and task-definition sections generated together."""
 
@@ -344,8 +351,8 @@ class ReadonlyPythonRequest(BaseModel):
 class InvestigationToolRequest(BaseModel):
     """One evidence-gathering request.
 
-    Current production flow only supports `custom_readonly_python`; other tool
-    names are legacy compatibility and are rejected by the executor.
+    The executor accepts `custom_readonly_python`, including engine-compiled
+    typed checks; legacy tool names are rejected by the executor.
     """
 
     request_id: str = ""
@@ -354,6 +361,14 @@ class InvestigationToolRequest(BaseModel):
     reason: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     custom_python: ReadonlyPythonRequest = Field(default_factory=ReadonlyPythonRequest)
+
+
+class QDIExtractiveAnswer(BaseModel):
+    """An exact authority quote, never an unverified computed conclusion."""
+
+    question: InvestigationQuestion
+    source_pointer: str
+    quote: str
 
 
 class QuestionInvestigationPlan(BaseModel):
@@ -365,6 +380,7 @@ class QuestionInvestigationPlan(BaseModel):
     recommended_max_questions: int = 0
     recommended_max_actions_per_question: int = 0
     questions: list[InvestigationQuestion] = Field(default_factory=list)
+    direct_answers: list[QDIExtractiveAnswer] = Field(default_factory=list)
     script_requests: list[ReadonlyPythonRequest] = Field(default_factory=list)
     # Compatibility field. Planners should leave this empty and use
     # `script_requests` for all investigations.
@@ -498,6 +514,35 @@ class QDIActionDigest(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class QDITableRead(BaseModel):
+    file: str = Field(min_length=1)
+    sheet: str | int = 0
+    header: int | None = Field(default=0, ge=0, le=100)
+    encoding: str = "utf-8-sig"
+    delimiter: str = Field(default=",", min_length=1, max_length=1)
+
+
+class QDIDeterministicCheck(BaseModel):
+    """Bounded checks compiled into the existing read-only sandbox."""
+
+    kind: Literal["table_profile", "key_integrity", "join_coverage", "time_range"]
+    left: QDITableRead
+    right: QDITableRead | None = None
+    columns: list[str] = Field(default_factory=list, max_length=12)
+    right_columns: list[str] = Field(default_factory=list, max_length=12)
+    row_limit: int = Field(default=50000, ge=1, le=200000)
+
+    @model_validator(mode="after")
+    def check_arguments(self):
+        if self.kind != "table_profile" and not self.columns:
+            raise ValueError("This check requires explicit columns")
+        if self.kind == "join_coverage" and (
+            self.right is None or len(self.columns) != len(self.right_columns)
+        ):
+            raise ValueError("join_coverage requires a right table and equal key arity")
+        return self
+
+
 class QuestionInvestigationAction(BaseModel):
     """Tool-call style action for the single-question QDI loop."""
 
@@ -514,6 +559,7 @@ class QuestionInvestigationAction(BaseModel):
     duplicate_of_question_id: str = ""
     refined_question: str = ""
     request_script: ReadonlyPythonRequest = Field(default_factory=ReadonlyPythonRequest)
+    request_checks: list[QDIDeterministicCheck] = Field(default_factory=list, max_length=4)
     request_context: ContextRetrievalRequest = Field(default_factory=ContextRetrievalRequest)
     search_document: DocumentSearchRequest = Field(default_factory=DocumentSearchRequest)
     read_document_chunks: DocumentChunkReadRequest = Field(default_factory=DocumentChunkReadRequest)
@@ -586,6 +632,22 @@ class EvaluationContractReview(BaseModel):
     metric_direction: str = ""  # minimize/maximize
     metric_formula: str = ""
     scalar_score_formula: str = ""
+    final_evaluation_metric: str = Field(
+        default="",
+        description="Metric reported only after global candidate selection on a reserved final holdout/test population.",
+    )
+    final_evaluation_direction: Literal["", "minimize", "maximize"] = Field(
+        default="",
+        description="Optimization direction for the one-time post-selection final holdout/test metric.",
+    )
+    final_evaluation_formula: str = Field(
+        default="",
+        description="Exact formula for the one-time post-selection final holdout/test evaluation; never a search reward.",
+    )
+    final_evaluation_protocol: str = Field(
+        default="",
+        description="Frozen final holdout/test population and one-time post-selection procedure. Leave empty when no separate final population exists.",
+    )
     prediction_unit: str = ""
     y_true_source: str = ""
     y_pred_source: str = ""
@@ -659,7 +721,7 @@ class AuthoritativeTaskMemory(BaseModel):
     submission_contract: SubmissionContract = Field(default_factory=SubmissionContract)
     evidence_items: list[AuthorityEvidenceItem] = Field(default_factory=list)
     source_files: list[str] = Field(default_factory=list)
-    authority_conflicts: list[dict[str, str]] = Field(default_factory=list)
+    authority_conflicts: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     context_routing_notes: list[str] = Field(default_factory=list)
     requirement_fact_matrix: list[RequirementFactItem] = Field(default_factory=list)

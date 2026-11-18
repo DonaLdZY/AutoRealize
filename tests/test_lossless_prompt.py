@@ -183,6 +183,38 @@ def test_authority_reads_original_docx_instead_of_promoting_llm_advice(tmp_path)
     assert "Generated summary" not in captured[0]
 
 
+def test_authority_conflicts_roundtrip_explicit_execution_limits(tmp_path):
+    from autorealize.models import AuthoritativeTaskMemory
+    from autorealize.modules.data_cognition import DataCognitionModule
+
+    conflict = {
+        "topic": "质量阈值",
+        "resolution_status": "unresolved_conflict_documented",
+        "execution_disposition": "non_blocking_with_limits",
+        "execution_limits": ["不推导质量阈值；缺少质量证据时返回 review_required。"],
+    }
+    captured = []
+
+    class Client:
+        def ask_structured(self, **kwargs):
+            captured.append(kwargs)
+            return AuthoritativeTaskMemory(authority_conflicts=[conflict])
+
+    module = object.__new__(DataCognitionModule)
+    module.services = type("Services", (), {"llm_client": Client()})()
+    memory = module._extract_authoritative_memory(
+        data_root=tmp_path,
+        task_hint="Predict the primary target; do not infer a quality threshold.",
+        file_summaries=[],
+    )
+
+    assert memory["authority_conflicts"] == [conflict]
+    prompt = captured[0]["static_context_prompt"]
+    assert "execution_disposition" in prompt
+    assert "execution_limits" in prompt
+    assert "unknown must not be treated as permission" in prompt
+
+
 def test_unreadable_requirement_summary_keeps_inference_provenance(tmp_path):
     from autorealize.models import AuthoritativeTaskMemory, FileSummary
     from autorealize.modules.data_cognition import DataCognitionModule

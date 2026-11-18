@@ -53,7 +53,7 @@ def test_large_output_is_bounded_by_context_without_shortening_prompt(tmp_path, 
               "messages": [{"role": "user", "content": "Complete original constraints"}]}
     client._chat_completion_with_network_retry(prompt_name="context-test", mode="text", create_kwargs=kwargs)
     assert captured[0]["messages"] == kwargs["messages"]
-    assert captured[0]["max_tokens"] == 278528 - 60000 - int(278528 * .18)
+    assert captured[0]["max_tokens"] == 278528 - 60000 - int(278528 * .01)
     monkeypatch.setattr(transport, "estimate_text_tokens", lambda _: 278000)
     with pytest.raises(ValueError, match="context budget"):
         client._chat_completion_with_network_retry(prompt_name="context-test", mode="text", create_kwargs=kwargs)

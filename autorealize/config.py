@@ -35,11 +35,12 @@ class LLMConfig:
     max_retries: int = 3
     # 温度，默认尽量稳定。
     temperature: float = 0.0
-    # 正常业务 LLM 调用的输出 token 下限。阶段级低值会在发送请求前抬高到该值。
-    minimum_output_tokens: int = 32768
+    # 兼容旧配置；不覆盖具体阶段明确指定的输出预算。
+    minimum_output_tokens: int = 0
     # 单次文本输出最大 token；模型仍只按实际生成量计费。
     max_tokens: int | None = 32768
     context_window_tokens: int = 0
+    context_headroom_ratio: float = 0.01
     # 结构化 JSON 输出默认最大 token。
     structured_max_tokens: int | None = 32768
     # 单次 LLM 请求超时时间（秒）。DeepSeek 偶尔会慢，设置超时可避免系统长时间看似卡死。
@@ -62,16 +63,16 @@ class LLMConfig:
     enable_thinking: bool | None = None
     # DeepSeek thinking effort，仅在 thinking 开启时有效。DeepSeek 会将 low/medium 映射到 high。
     reasoning_effort: str | None = None
-    # 结构化 JSON 输出时是否关闭 thinking。分类/探查规划等小任务关闭 thinking 更稳定也更快。
-    structured_disable_thinking: bool = True
+    # Keep thinking enabled for structured reasoning as well as free-form calls.
+    structured_disable_thinking: bool = False
     # 发送给模型前压缩 JSON schema；本地仍使用完整 Pydantic schema 校验。
     compact_structured_schema: bool = True
     # 是否为结构化调用额外发送空值 JSON 示例；默认关闭以减少固定前缀。
     structured_include_json_example: bool = False
     # DeepSeek 官方 JSON mode 按文档建议附带紧凑 JSON 示例；其他 provider 不受影响。
     deepseek_json_mode_include_example: bool = True
-    # 结构化输出因 reasoning 耗尽长度时，重试自动关闭 thinking。
-    structured_reasoning_fallback_on_length: bool = True
+    # Retrying a truncated structured response must preserve the requested thinking mode.
+    structured_reasoning_fallback_on_length: bool = False
     # reasoning token 占 completion 的比例达到该值时触发降级。
     structured_reasoning_fallback_ratio: float = 0.75
     # 任意结构化输出因长度截断时，下一轮直接使用的 token 上限。
@@ -239,11 +240,12 @@ class InvestigationConfig:
 
     # Enable LLM-led cross-file question investigation after initial data cognition.
     enabled: bool = True
-    # always = 每次都跑；on_demand = 只有读取/输出/评估/约束存在阻塞信号时跑；disabled = 跳过。
-    trigger_mode: str = "always"
+    # on_demand = only run when cognition exposes a blocking signal; always is
+    # still available for forensic/research runs; disabled skips QDI entirely.
+    trigger_mode: str = "on_demand"
     # Maximum blocking questions the investigator may pursue in one run.
-    max_questions: int = 5
-    # Maximum plan/observe rounds before the investigator must summarize.
+    max_questions: int = 6
+    # Per-question investigation slots including the terminal decision; retrieval uses separate quotas.
     max_rounds_per_run: int = 6
     # Follow-up question breadth-first search depth.
     question_bfs_max_depth: int = 3
@@ -252,31 +254,40 @@ class InvestigationConfig:
     # Allow the investigator to request sandboxed read-only Python scripts.
     allow_custom_readonly_python: bool = True
     # Script actions are budgeted separately from document/context retrieval.
-    max_scripts_per_question: int = 3
+    max_scripts_per_question: int = 2
+    # Local deterministic context-card retrieval actions per question.
+    context_retrievals_per_question: int = 2
     # Per custom Python subprocess timeout.
     custom_python_timeout_seconds: float = 30.0
     # LLM-proposed read-only Python script repair attempts after execution/static validation fails.
     custom_python_max_retries: int = 3
     # Maximum stdout/stderr characters retained from custom Python.
     custom_python_max_stdout_chars: int = 12000
-    # Maximum JSON result characters retained from any investigation script.
+    # Prompt/report preview budget; complete script results are stored in artifacts.
     max_result_chars: int = 20000
+    # Serialized JSON safety ceiling. Oversized results fail explicitly, never succeed with missing items.
+    custom_python_max_result_bytes: int = 67108864
     # Maximum deterministic full-text retrieval actions per question.
-    document_retrievals_per_question: int = 4
+    document_retrievals_per_question: int = 2
     # Full-text document chunking and retrieval limits.
     document_chunk_chars: int = 2200
     document_chunk_overlap_chars: int = 200
     document_search_top_k: int = 5
     document_retrieval_max_chars: int = 12000
-    # Recent actions stay directly visible; older actions collapse to the compact ledger.
+    # Legacy live-window knobs are retained for report compatibility. The v4
+    # decision-state protocol sends one latest evidence card plus digest cards.
     recent_action_count: int = 3
     recent_script_chars: int = 12000
     recent_result_chars: int = 8000
     recent_retrieval_chars: int = 8000
-    # LLM-authored evidence-linked memory is merged without an extra summarization call.
+    # Prompt-view budget only; full memory is merged losslessly without a summarization call.
     working_memory_max_chars: int = 12000
-    # Old QDI artifacts can be read in bounded excerpts without consuming script/repair budgets.
+    # Old QDI artifacts can be read in bounded excerpts without consuming investigation-action/script budgets.
     artifact_retrievals_per_question: int = 2
+    # Retrievals use an independent quota. The host caps ordinary retrieval
+    # rounds; explicit artifact/document continuations and measurable checks or
+    # scripts remain available when justified by the observed gap.
+    max_retrieval_actions_before_terminal: int = 1
     artifact_retrieval_max_chars: int = 8000
     # Legacy internal helper row limit. The investigator execution surface is
     # script-only, but these helpers remain available for tests/debugging.
@@ -285,8 +296,35 @@ class InvestigationConfig:
     max_sample_rows: int = 20
     # Let the initial QDI planner reduce question/action budgets when evidence is already sufficient.
     adaptive_budgeting: bool = True
+    # Repeated identical investigation requests force a terminal interpretation round.
+    max_repeated_actions: int = 2
     # Deterministic high-impact relation/layout checks that may be added beside planner questions.
     automatic_verification_question_limit: int = 4
+    # Versioned QDI action protocol. Full history remains in artifacts; only
+    # the compact decision state is sent on every action turn.
+    decision_state_protocol: str = "qdi-decision-state-v7"
+    # Number of prior evidence digest cards kept in the action state frame.
+    decision_digest_count: int = 4
+    # Maximum serialized characters for the latest evidence card in the prompt.
+    decision_latest_evidence_chars: int = 6000
+    # Maximum number of non-current question records shown to the action model.
+    decision_question_ledger_limit: int = 8
+    # QDI project-prefix projection. The complete context is kept in a local
+    # qdi_project_context_full artifact; these limits control only the stable
+    # provider-cache prefix.
+    project_table_card_limit: int = 20
+    project_table_card_field_limit: int = 10
+    project_table_cards_max_chars: int = 32000
+    project_table_cards_per_source: int = 8
+    project_relation_limit: int = 16
+    project_filename_group_limit: int = 16
+    project_entity_alias_limit: int = 16
+    project_field_glossary_limit: int = 40
+    project_prior_answer_limit: int = 8
+    # Output caps for the two QDI planning/decision nodes. These are caps, not
+    # forced output lengths; normal stop responses remain shorter.
+    planner_max_output_tokens: int = 6144
+    action_max_output_tokens: int = 4096
 
 
 @dataclass
@@ -421,10 +459,17 @@ class ContextConfig:
     cross_stage_memory_entry_chars: int = 12000
     cross_stage_memory_recent_entries: int = 4
     cross_stage_memory_max_compactions: int = 6
+    # Deterministic compaction keeps typed stage cards and artifact pointers
+    # without spending an extra LLM call. Enable the LLM compactor only for
+    # forensic comparisons or tasks that explicitly need semantic merging.
+    cross_stage_memory_use_llm_compactor: bool = False
     # After compaction, allow a small retrieval-planning call to recover exact old evidence.
     cross_stage_retrieval_enabled: bool = True
     cross_stage_retrieval_max_artifacts: int = 3
     cross_stage_retrieval_excerpt_chars: int = 6000
+    # Use an extra LLM to decide whether to read old artifacts. The default
+    # host router only follows explicit artifact references in current inputs.
+    cross_stage_retrieval_use_llm_planner: bool = False
     # Prefix-matched stages allowed to invoke the retrieval planner. This keeps
     # retrieval semantic and demand-driven without adding an LLM call everywhere.
     cross_stage_retrieval_stage_prefixes: tuple[str, ...] = (
@@ -580,14 +625,18 @@ class AutoRealizeConfig:
 
 _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "lossless_review_prompts": "最终产物审查和评估定稿使用可逐值还原的去重快照；完整约束保留，反馈置于末尾。普通评估审查保留原编排。",
+    "context_window_tokens": "模型上下文窗口 token 数；0 表示不在本地声明窗口大小，不能视为无限窗口。",
+    "context_headroom_ratio": "估算输入预算中为 tokenizer 差异预留的比例；模型输入与输出合计仍不超过上下文窗口。",
+    "resume_task_definition": "从已有认知产物恢复任务定义阶段；不重新生成已存在的数据认知结果。",
+    "review_gate_policy": "评审门禁策略：strict 严格阻断，continue_on_exhaustion 允许语义评审耗尽后带警告继续；确定性硬错误仍阻断。",
     "base_url": "DeepSeek/OpenAI 兼容 API 地址。",
     "model_name": "文本大模型名称。",
     "api_key": "LLM API key，默认从 DEEPSEEK_API_KEY 读取。",
     "max_retries": "LLM 调用或结构化 JSON 解析失败后的最大重试次数。",
     "temperature": "LLM 温度，越低越稳定。",
-    "minimum_output_tokens": "正常业务 LLM 调用的输出 token 下限；所有阶段级低值都会在请求前抬高到该值。",
-    "max_tokens": "普通文本 LLM 输出 token 上限；默认 32768。",
-    "structured_max_tokens": "结构化 JSON 输出 token 上限；默认 32768。",
+    "minimum_output_tokens": "旧配置兼容字段；明确的阶段级输出上限优先，不会自动抬高。",
+    "max_tokens": "普通文本 LLM 输出 token 上限；默认 32768。它限制上限，不代表每次都会生成这么多。",
+    "structured_max_tokens": "结构化 JSON 输出 token 上限；默认 32768。它限制上限，不代表每次都会生成这么多。",
     "request_timeout_seconds": "单次 LLM API 请求超时时间（秒）。",
     "stream_responses": "流式接收完整响应后再校验 JSON，减少长推理请求的代理空闲超时；保留最终 token 用量。",
     "max_concurrent_requests": "同一进程内 LLM API 最大并发请求数。",
@@ -597,11 +646,11 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "trace_cache_hits": "缓存命中时是否仍写入 llm_traces.jsonl。",
     "enable_thinking": "DeepSeek thinking 开关；None 表示使用服务端默认。",
     "reasoning_effort": "DeepSeek thinking effort，可选 high/max。",
-    "structured_disable_thinking": "结构化 JSON 输出时是否关闭 thinking，以提升稳定性与速度。",
+    "structured_disable_thinking": "结构化 JSON 输出时是否关闭 thinking；默认保持开启。",
     "compact_structured_schema": "是否压缩发送给模型的 JSON schema；本地仍按完整 schema 校验。",
     "structured_include_json_example": "结构化调用是否发送 JSON 示例；关闭可减少固定输入 token。",
     "deepseek_json_mode_include_example": "官方 DeepSeek JSON mode 是否附带紧凑 JSON 示例，以降低空响应和格式漂移风险。",
-    "structured_reasoning_fallback_on_length": "结构化输出因 reasoning 耗尽长度时，是否自动关闭 thinking 后重试。",
+    "structured_reasoning_fallback_on_length": "兼容选项；开启后会在长度失败重试时关闭 thinking，默认关闭。",
     "structured_reasoning_fallback_ratio": "reasoning token 占 completion 的比例达到多少时触发 thinking 降级。",
     "structured_length_retry_max_tokens": "任意结构化 JSON 因长度截断时，下一轮直接使用的输出 token 上限。",
     "constraint_memory_max_tokens": "约束与实体别名联合抽取的最大输出 token。",
@@ -669,16 +718,18 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "generated_predict_horizon_days": "时序 predict_split 截取末尾窗口天数。",
     "generated_sample_submission_max_rows": "无官方样例且无预测集时，生成 sample_submission 的最大样例行数。",
     "max_questions": "Question-Driven Investigator 每轮最多追问的关键跨文件问题数量。",
-    "trigger_mode": "Question-Driven Investigator 触发策略：always/on_demand/disabled；默认 always。",
-    "max_rounds_per_run": "Question-Driven Investigator 最多执行多少轮计划-观察循环。",
+    "trigger_mode": "Question-Driven Investigator 触发策略：on_demand/always/disabled；默认 on_demand，只在认知暴露阻塞信号时运行。",
+    "max_rounds_per_run": "每题调查动作槽上限，含最终回答/放弃；四类取回使用独立额度，不占此槽。",
     "question_bfs_max_depth": "Question-Driven Investigator 子问题广度优先搜索的最大深度。",
     "max_followup_questions_per_question": "每个调查问题最多生成的直接子问题数量。",
     "allow_custom_readonly_python": "是否允许 Question-Driven Investigator 请求沙盒只读 Python 脚本探查。",
     "custom_python_timeout_seconds": "自定义只读 Python 子进程超时时间（秒）。",
     "max_scripts_per_question": "每个 QDI 问题最多执行的只读 Python 调查脚本数；不含文档检索动作。",
+    "context_retrievals_per_question": "每个 QDI 问题允许的本地 table-card 上下文取回动作数；使用独立配额，不占调查动作槽。",
     "custom_python_max_retries": "Question-Driven Investigator 只读 Python 脚本失败后的最大修复重试次数。",
     "custom_python_max_stdout_chars": "自定义只读 Python stdout/stderr 最大保留字符数。",
-    "document_retrievals_per_question": "每个 QDI 问题允许的本地全文文档检索/取回动作数。",
+    "custom_python_max_result_bytes": "结构化 JSON 结果硬安全上限（字节）；超出明确失败，不能截掉尾部后报告成功。",
+    "document_retrievals_per_question": "每题 search_document/read_document_chunks 共用的独立取回额度；不占调查动作槽。",
     "document_chunk_chars": "PDF、DOCX、文本等全文文档的本地切片目标字符数。",
     "document_chunk_overlap_chars": "相邻文档切片之间的重叠字符数。",
     "document_search_top_k": "QDI 单次全文文档检索最多返回的匹配切片数。",
@@ -687,21 +738,38 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "recent_script_chars": "QDI 最近动作窗口中单个脚本源码直接可见的最大字符数，超出部分保存为 artifact。",
     "recent_result_chars": "QDI 最近动作窗口中单个脚本结果直接可见的最大字符数，超出部分保存为 artifact。",
     "recent_retrieval_chars": "QDI 最近动作窗口中单次上下文、文档或 artifact 取回结果的最大可见字符数。",
-    "working_memory_max_chars": "QDI 单问题累计工作记忆卡的字符预算；更新随现有 action 返回，不新增总结调用。",
-    "artifact_retrievals_per_question": "每个 QDI 问题最多分段读取旧 QDI artifact 的动作次数；不占脚本或 repair 次数。",
+    "working_memory_max_chars": "QDI 累计工作记忆进入单次 prompt 的视图字符预算；完整记忆另存 artifact，不丢弃事实。",
+    "artifact_retrievals_per_question": "每个 QDI 问题最多分段读取旧 QDI artifact 的动作次数；使用独立配额，不占调查动作槽、脚本或 repair 次数。",
+    "max_retrieval_actions_before_terminal": "取回动作默认最多连续一轮；只有 artifact 片段明确还有后续内容时才允许继续取回。",
     "artifact_retrieval_max_chars": "QDI 单次分段读取旧 artifact 时返回的最大字符数。",
     "document_cognition_chunk_chars": "第一阶段长文档逐块认知时每块目标字符数。",
     "document_cognition_chunk_overlap_chars": "第一阶段长文档相邻认知块的重叠字符数。",
     "document_cognition_memory_items_per_section": "滚动文档重点记忆每类最多保留的事实条数。",
     "document_cognition_memory_max_chars": "第一阶段长文档滚动重点记忆进入下一块时的总字符预算。",
     "document_cognition_chunk_max_tokens": "每次文档切片重点提取调用的最大输出 token。",
-    "max_result_chars": "调查脚本结果注入 LLM/报告前的最大字符数。",
+    "max_result_chars": "调查脚本结果的 LLM/报告预览字符预算；完整结构化结果另存 artifact，硬上限见 custom_python_max_result_bytes。",
     "evaluation_contract_max_rounds": "评估合同 LLM 审查/返修最大轮数。",
     "evaluation_reflection_max_rounds": "评估章节反思最大轮数。",
     "tool_sample_rows": "旧版内部调查辅助函数读取表格时最多采样行数；当前 LLM 调查入口只接受只读 Python 脚本。",
     "max_sample_rows": "调查工具返回样例行/键的最大数量。",
     "adaptive_budgeting": "是否允许 QDI Planner 在证据充分时缩小问题数和每题动作预算。",
+    "max_repeated_actions": "QDI 同一问题连续重复同一取证请求的次数阈值，达到后下一轮只允许回答或明确放弃；0 表示关闭。",
     "automatic_verification_question_limit": "程序自动追加的高影响关系、人口和读取合同验证题上限。",
+    "decision_state_protocol": "QDI Action 动态状态协议版本；完整历史保存在 artifact，模型只接收紧凑可行动状态。",
+    "decision_digest_count": "QDI Action 每轮保留的既往证据摘要卡数量。",
+    "decision_latest_evidence_chars": "QDI Action 最近一次证据结果进入 prompt 的最大字符数；完整结果保存在 artifact。",
+    "decision_question_ledger_limit": "QDI Action 除当前问题外最多展示的问题账本条数。",
+    "project_table_card_limit": "QDI 稳定项目前缀最多展示的详细表卡数量；完整表卡仍在本地 artifact。",
+    "project_table_card_field_limit": "QDI 稳定项目前缀每张表卡最多展示的字段数量。",
+    "project_table_cards_max_chars": "QDI 稳定项目表卡总字符预算；超出部分通过 request_context 或 artifact 取回。",
+    "project_table_cards_per_source": "QDI 稳定项目前缀同一来源文件最多展示的表卡数量。",
+    "project_relation_limit": "QDI 稳定项目前缀最多展示的关系卡数量。",
+    "project_filename_group_limit": "QDI 稳定项目前缀最多展示的文件名组数量。",
+    "project_entity_alias_limit": "QDI 稳定项目前缀最多展示的实体别名候选数量。",
+    "project_field_glossary_limit": "QDI 稳定项目前缀最多展示的字段词典条目数量。",
+    "project_prior_answer_limit": "QDI 每次最多展示的历史问题答案数量；按最近答案顺序截取。",
+    "planner_max_output_tokens": "QDI 初始问题规划结构化输出上限；只限制输出，不改变输入证据。",
+    "action_max_output_tokens": "QDI 每轮动作决策结构化输出上限；只限制输出，不改变输入证据。",
     "max_images_per_dir": "每个图片目录最多发送给视觉模型的图片数量。",
     "fail_silently": "视觉模型失败时是否降级为仅使用图片元数据而不中断任务。",
     "table_card_file_limit": "本地详细 TableCard 最多覆盖的源文件数量。",
@@ -726,9 +794,11 @@ _CONFIG_DESCRIPTIONS: dict[str, str] = {
     "cross_stage_memory_entry_chars": "每个近期阶段结果常驻 prompt 的最大字符数。",
     "cross_stage_memory_recent_entries": "压缩时仍完整保留在近期窗口的阶段结果数量。",
     "cross_stage_memory_max_compactions": "单次任务允许执行的跨阶段 LLM 压缩次数上限。",
+    "cross_stage_memory_use_llm_compactor": "是否使用额外 LLM 压缩跨阶段记忆；默认关闭，优先使用确定性 artifact/阶段卡压缩。",
     "cross_stage_retrieval_enabled": "压缩后是否允许关键阶段规划按 artifact_id 取回精确旧证据。",
     "cross_stage_retrieval_max_artifacts": "单个关键阶段最多取回的跨阶段 artifact 数量。",
     "cross_stage_retrieval_excerpt_chars": "单个跨阶段 artifact 取回的最大可见字符数。",
+    "cross_stage_retrieval_use_llm_planner": "是否使用额外 LLM 规划跨阶段 artifact 取回；默认关闭，优先按当前输入中的明确 artifact 引用取回。",
     "cross_stage_retrieval_stage_prefixes": "允许调用跨阶段取回规划器的关键阶段名称前缀。",
     "level": "AutoRealize 根日志级别：DEBUG/INFO/WARNING/ERROR。",
     "raw_event_log": "是否打印未经压缩的结构化事件字段。",

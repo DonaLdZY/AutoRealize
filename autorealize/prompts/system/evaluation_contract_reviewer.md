@@ -13,6 +13,7 @@
 唯一比较口径：
 - ranking_scope 默认 task_effectiveness。仅当用户明确授权以软件合同检查验收模型且真实业务效果不可评估时，使用 software_contract_checks。此时检查内部的业务成本/服务字典序仍须验证，但不得混入候选的软件检查评分；tie_break_rules 只写候选分数并列规则，实例内部求解目标放入检查定义。
 - score_representation 必须为 scalar。primary_metric 是唯一最终排序数值的名称；metric_direction 只能是 minimize/maximize；metric_formula 必须给出一个可执行、有限数值的精确公式及所有变量定义。禁止只给字典序层级、向量、元组、Pareto 集、多个主指标或“先比较 A，再比较 B”的文字。scalar_score_formula 通常留空，填写则与 metric_formula 相同。中间分量可以有多个，但最终返回值只能有一个。
+- primary_metric、metric_direction、metric_formula 和 validation_protocol 定义候选搜索指标，只能在开发/搜索验证人口上计算并参与候选选择；不得把最终留出集指标写作 primary_metric 或搜索公式。若存在独立最终 holdout/test，必须填写 final_evaluation_metric、final_evaluation_direction、final_evaluation_formula、final_evaluation_protocol，明确只在全局候选冻结后评估选定方案一次；这些字段绝不能影响搜索评分、候选排序、权重或参数。若没有独立最终人口，四个 final_evaluation_* 字段均留空，并明确最终评估不可用或不适用。
 - 定义 prediction_unit、y_true_source、y_pred_source、computation_scope、aggregation_rule 和 validation_protocol。使用精确物理文件、Sheet、列名；派生变量说明来源和变换，不冒充源列。
 - 冻结资格、split 方法、预测时点/跨度、随机过程、指标和排名约束。所有候选与融合复用评估器；合同改变后必须重评才可比较。实际记录 evaluation_id、评估器版本、数据与 split 指纹。
 - 写出多步切分代码时必须逐步核算每个返回值的行数和归属，不能只复述最终比例。train_test_split 的第一个返回值是保留部分、第二个是 test_size 部分；先分出 20% holdout，再从余下 80% 分出 25% development，最终才是 60/20/20。变量命名、第二步输入、stratify 标签索引、种子及最终行数必须一致；不得把余下 20% 再切成 development/holdout。此例解释运算语义，不覆盖其它任务明确规定的切分。

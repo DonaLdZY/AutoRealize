@@ -9,7 +9,7 @@ import time
 import urllib.error
 from copy import deepcopy
 from pathlib import Path
-from threading import Lock, BoundedSemaphore, Event, Timer
+from threading import Lock, BoundedSemaphore, Event, Timer, local
 from types import SimpleNamespace
 from typing import Any, TypeVar
 from urllib.parse import urlparse
@@ -176,15 +176,27 @@ def _prompt_stage(prompt_name: str) -> str:
     name = (prompt_name or "").strip().lower()
     if name.startswith("question_investigator") or name.startswith("qdi"):
         return "qdi"
-    if name.startswith("cognition") or name.startswith("file_") or name.startswith("llm_file"):
+    if name.startswith(("cognition", "file_", "llm_file", "document_cognition")):
         return "data_cognition"
     if name.startswith("problem_paradigm"):
         return "problem_paradigm"
     if name.startswith("description_protocol"):
         return "description_protocol"
+    if name.startswith("artifact_consistency_reviewer"):
+        return "artifact_consistency_review"
+    if name.startswith(("artifact_consistency_patcher", "artifact_consistency_batch")):
+        return "artifact_consistency_repair"
+    if name.startswith(("source_field_alias", "source_alias")):
+        return "source_field_resolution"
+    if name.startswith(("downstream_context", "knowledge_semantic")):
+        return "context_resolution"
+    if name.startswith(("open_question", "section_fact", "derived_contract")):
+        return "contract_repair"
+    if name.startswith("task_classifier"):
+        return "task_classification"
     if name.startswith("description_"):
         return "description_sections"
-    if name.startswith("evaluation_contract") or name.startswith("eval_"):
+    if name.startswith(("evaluation_contract", "evaluation_section", "eval_")):
         return "evaluation_contract"
     if name.startswith("sample_submission"):
         return "sample_submission"
@@ -224,8 +236,17 @@ def _provider_prompt_cache_key(
     config: AutoRealizeConfig,
     base_url: str,
     stable_prefix: str,
+    cache_scope: str | None = None,
 ) -> str | None:
-    """Build a routing key only when a reusable stable prefix is present."""
+    """Build a stable provider-cache routing namespace.
+
+    ``stable_prefix`` is intentionally only a presence/diagnostic input.  It
+    must not be hashed into the routing key: project data changes should
+    invalidate the provider's exact prefix naturally, while keeping the same
+    namespace lets the provider reuse a warm cache partition across questions
+    and rounds.  Callers can use ``cache_scope`` to isolate incompatible
+    protocols or workflows.
+    """
     prefix = str(stable_prefix or "").strip()
     if not prefix:
         return None
@@ -234,8 +255,24 @@ def _provider_prompt_cache_key(
         return None
     if mode != "enabled" and (mode != "auto" or not _is_official_openai_base_url(base_url)):
         return None
-    digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:32]
+    requested_scope = str(cache_scope or "").strip()
+    scope = json.dumps(
+        {
+            "base_url": str(base_url or "").rstrip("/").lower(),
+            "model": str(getattr(config.llm, "model_name", "") or ""),
+            "cache_scope": requested_scope or "autorealize:default",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
     return f"autorealize:{digest}"
+
+
+def _prompt_cache_prefix_fingerprint(prefix: str) -> str:
+    """Return a non-sensitive fingerprint for cache diagnostics."""
+    return hashlib.sha256(str(prefix or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _example_from_schema(schema: dict, *, definitions: dict[str, Any] | None = None) -> Any:
@@ -307,10 +344,12 @@ def _effective_output_max_tokens(
     *,
     config: Any,
 ) -> int | None:
-    """Apply the configured floor to normal business LLM requests."""
+    """Respect the caller's stage budget, including legacy task configurations."""
     requested_tokens = _normal_max_tokens(requested)
-    minimum_tokens = _normal_max_tokens(getattr(config, "minimum_output_tokens", 32768))
-    effective = max(int(requested_tokens or 0), int(minimum_tokens or 0))
+    if requested_tokens is not None:
+        return requested_tokens
+    minimum_tokens = _normal_max_tokens(getattr(config, "minimum_output_tokens", 0))
+    effective = int(minimum_tokens or 0)
     return effective or None
 
 
@@ -474,7 +513,85 @@ def _escape_control_chars_in_json_strings(text: str) -> str:
     return "".join(out)
 
 
-def _loads_json_object(text: str) -> dict[str, Any]:
+def _repair_premature_object_close(raw: str) -> dict[str, Any]:
+    """Remove exactly one premature root `}` before trailing object members.
+
+    Do not discard trailing fields, merge multiple objects, repair strings/code,
+    or accept duplicate keys. The caller still validates the complete schema.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Ambiguous duplicate JSON key in repair candidate")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+    prefix, end = decoder.raw_decode(raw)
+    if (not isinstance(prefix, dict) or end == 0 or raw[end - 1] != "}"
+            or not raw[end:].lstrip().startswith(",")):
+        raise ValueError("Not a single premature JSON object closure")
+    # A full strict parse after this single-character deletion is mandatory.
+    repaired = json.loads(raw[:end - 1] + raw[end:], object_pairs_hook=unique_object)
+    if not isinstance(repaired, dict):
+        raise ValueError("Repair did not produce an object")
+    logger.warning("Repaired one premature root JSON closing brace; field values unchanged")
+    return repaired
+
+
+def _repair_missing_json_closers(raw: str) -> str | None:
+    """Close only structurally open JSON containers without changing values."""
+    stack: list[str] = []
+    insertions: list[tuple[int, str]] = []
+    in_string = False
+    escaped = False
+    matching_open = {"]": "[", "}": "{"}
+
+    for index, char in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            expected = matching_open[char]
+            if stack and stack[-1] == expected:
+                stack.pop()
+                continue
+            if expected not in stack:
+                return None
+            missing: list[str] = []
+            while stack and stack[-1] != expected:
+                missing.append("]" if stack.pop() == "[" else "}")
+            if not stack:
+                return None
+            stack.pop()
+            insertions.append((index, "".join(missing)))
+
+    if in_string or escaped:
+        return None
+    suffix = "".join("]" if opener == "[" else "}" for opener in reversed(stack))
+    if not insertions and not suffix:
+        return None
+
+    pieces: list[str] = []
+    previous = 0
+    for index, closers in insertions:
+        pieces.extend((raw[previous:index], closers))
+        previous = index
+    pieces.extend((raw[previous:], suffix))
+    return "".join(pieces)
+
+
+def _loads_json_object(text: str, *, repair_missing_closers: bool = False) -> dict[str, Any]:
     raw = _extract_json_object(text)
     try:
         obj = json.loads(raw)
@@ -484,7 +601,27 @@ def _loads_json_object(text: str) -> dict[str, Any]:
         try:
             obj = json.loads(raw, strict=False)
         except json.JSONDecodeError:
-            obj = json.loads(_escape_control_chars_in_json_strings(raw))
+            escaped = _escape_control_chars_in_json_strings(raw)
+            try:
+                obj = json.loads(escaped)
+            except json.JSONDecodeError as original_error:
+                if repair_missing_closers:
+                    candidate = _repair_missing_json_closers(escaped)
+                    if candidate is not None:
+                        try:
+                            obj = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            logger.warning(
+                                "Closed structurally incomplete JSON containers; field values unchanged"
+                            )
+                            if isinstance(obj, dict):
+                                return obj
+                try:
+                    obj = _repair_premature_object_close(escaped)
+                except (ValueError, TypeError):
+                    raise original_error
     if not isinstance(obj, dict):
         raise ValueError("Structured LLM response is not a JSON object")
     return obj
@@ -593,9 +730,12 @@ def _next_structured_length_retry_max_tokens(
     *,
     current_max_tokens: int | None,
     config: Any,
+    retry_max_tokens: int | None = None,
 ) -> int | None:
     retry_max = _normal_max_tokens(
-        getattr(config, "structured_length_retry_max_tokens", 32768)
+        retry_max_tokens
+        if retry_max_tokens is not None
+        else getattr(config, "structured_length_retry_max_tokens", 32768)
     ) or 32768
     return max(int(current_max_tokens or 0), retry_max)
 
@@ -797,10 +937,12 @@ class LLMClient:
         self._cache_lock = Lock()
         self._trace_lock = Lock()
         self._usage_lock = Lock()
+        self._usage_local = local()
         self._usage_summary: dict[str, Any] = {
             "calls": 0,
             "seconds": 0.0,
             "cache_hits_local": 0,
+            "estimated_prompt_tokens_local_cache_hits": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "reasoning_tokens": 0,
@@ -876,7 +1018,10 @@ class LLMClient:
             raise RuntimeError(f"LLM health check failed: {exc}") from exc
         log_event(logger, "llm.client", "HEALTH_CHECK_COMPLETED")
 
-    def _cache_key(self, *, prompt_name: str, system_prompt: str, user_prompt: str, schema: str = "") -> str:
+    def _cache_key(
+        self, *, prompt_name: str, system_prompt: str, user_prompt: str,
+        schema: str = "", cache_epoch: str = "", output_max_tokens: int | None = None,
+    ) -> str:
         payload = json.dumps(
             {
                 "base_url": self.base_url,
@@ -886,10 +1031,12 @@ class LLMClient:
                 "reasoning_effort": self.config.llm.reasoning_effort,
                 "structured_disable_thinking": self.config.llm.structured_disable_thinking,
                 "prompt_name": prompt_name,
+                "cache_epoch": cache_epoch,
                 "control_prompt": _control_prompt_labels(self.config),
                 "system": system_prompt,
                 "user": user_prompt,
                 "schema": schema,
+                "output_max_tokens": output_max_tokens,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -940,6 +1087,8 @@ class LLMClient:
         row = {
             "ts": time.time(),
             "prompt_name": prompt_name,
+            "stage_id": _prompt_stage(prompt_name),
+            "stage_id_source": "inferred_from_prompt_name",
             "mode": mode,
             "source": "local_cache",
             "model": self.config.llm.model_name,
@@ -952,12 +1101,17 @@ class LLMClient:
             "cache_write_tokens": 0,
             "provider_cache_write_tokens_known": False,
             "estimated_prompt_tokens": estimated_prompt_tokens,
+            "estimated_prompt_tokens_avoided": estimated_prompt_tokens,
             "prompt_parts": part_rows,
         }
         with self._usage_lock:
             self._usage_summary["cache_hits_local"] = int(self._usage_summary.get("cache_hits_local", 0)) + 1
             self._usage_summary["estimated_prompt_tokens"] = (
                 int(self._usage_summary.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
+            )
+            self._usage_summary["estimated_prompt_tokens_local_cache_hits"] = (
+                int(self._usage_summary.get("estimated_prompt_tokens_local_cache_hits", 0))
+                + estimated_prompt_tokens
             )
             self._accumulate_prompt_parts_locked(prompt_name=prompt_name, part_rows=part_rows)
             by_prompt = self._usage_summary.setdefault("by_prompt", {})
@@ -966,6 +1120,7 @@ class LLMClient:
                 {
                     "calls": 0,
                     "cache_hits_local": 0,
+                    "estimated_prompt_tokens_local_cache_hits": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "reasoning_tokens": 0,
@@ -982,7 +1137,13 @@ class LLMClient:
                     "by_part": {},
                 },
             )
+            item.setdefault("stage_id", _prompt_stage(prompt_name))
+            item.setdefault("stage_id_source", "inferred_from_prompt_name")
             item["cache_hits_local"] = int(item.get("cache_hits_local", 0)) + 1
+            item["estimated_prompt_tokens_local_cache_hits"] = (
+                int(item.get("estimated_prompt_tokens_local_cache_hits", 0))
+                + estimated_prompt_tokens
+            )
             item["estimated_prompt_tokens"] = int(item.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
             self._accumulate_prompt_parts_for_prompt_locked(item, part_rows)
             self._append_usage_row_locked(row)
@@ -1038,6 +1199,8 @@ class LLMClient:
         row = {
             "ts": time.time(),
             "prompt_name": prompt_name,
+            "stage_id": _prompt_stage(prompt_name),
+            "stage_id_source": "inferred_from_prompt_name",
             "mode": mode,
             "source": source,
             "model": model_name or self.config.llm.model_name,
@@ -1062,12 +1225,19 @@ class LLMClient:
             "prompt_usage_available": prompt_usage_available,
             "estimated_prompt_tokens": estimated_prompt_tokens,
             "prompt_parts": part_rows,
+            "prompt_cache_namespace": str(
+                getattr(self._usage_local, "prompt_cache_namespace", "") or ""
+            ),
+            "prompt_cache_prefix_fingerprint": str(
+                getattr(self._usage_local, "prompt_cache_prefix_fingerprint", "") or ""
+            ),
             "raw_usage": usage,
         }
         if network_attempt is not None:
             row["network_attempt"] = network_attempt
         if error_type is not None:
             row["error_type"] = error_type
+        self._usage_local.last_provider_row = row
         with self._usage_lock:
             self._usage_summary["calls"] = int(self._usage_summary.get("calls", 0)) + 1
             self._usage_summary["seconds"] = round(float(self._usage_summary.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
@@ -1133,6 +1303,8 @@ class LLMClient:
                     "by_part": {},
                 },
             )
+            item.setdefault("stage_id", _prompt_stage(prompt_name))
+            item.setdefault("stage_id_source", "inferred_from_prompt_name")
             item["calls"] = int(item.get("calls", 0)) + 1
             item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
             if not usage_available:
@@ -1190,6 +1362,16 @@ class LLMClient:
             cache_tokens_known=cache_tokens_known,
         )
         return row
+
+    @property
+    def last_provider_usage_row(self) -> dict[str, Any] | None:
+        row = getattr(self._usage_local, "last_provider_row", None)
+        return row if isinstance(row, dict) else None
+
+    @property
+    def last_call_metadata(self) -> dict[str, Any] | None:
+        row = getattr(self._usage_local, "last_call_metadata", None)
+        return dict(row) if isinstance(row, dict) else None
 
     def _accumulate_prompt_parts_locked(self, *, prompt_name: str, part_rows: list[dict[str, Any]]) -> None:
         by_part = self._usage_summary.setdefault("by_prompt_part", {})
@@ -1374,8 +1556,13 @@ class LLMClient:
                     {
                         "prompt_name": name,
                         "stage": _prompt_stage(str(name)),
+                        "stage_id": _prompt_stage(str(name)),
+                        "stage_id_source": "inferred_from_prompt_name",
                         "calls": int(item.get("calls", 0) or 0),
                         "local_cache_hits": int(item.get("cache_hits_local", 0) or 0),
+                        "estimated_prompt_tokens_local_cache_hits": int(
+                            item.get("estimated_prompt_tokens_local_cache_hits", 0) or 0
+                        ),
                         "seconds": round(float(item.get("seconds", 0.0) or 0.0), 4),
                         "input_tokens": int(item.get("prompt_tokens", 0) or 0),
                         "cache_hit_tokens": int(item.get("prompt_cache_hit_tokens", 0) or 0),
@@ -1405,6 +1592,7 @@ class LLMClient:
                     "stage": stage,
                     "calls": 0,
                     "local_cache_hits": 0,
+                    "estimated_prompt_tokens_local_cache_hits": 0,
                     "seconds": 0.0,
                     "input_tokens": 0,
                     "cache_hit_tokens": 0,
@@ -1418,6 +1606,10 @@ class LLMClient:
             )
             item["calls"] = int(item.get("calls", 0)) + int(row.get("calls", 0) or 0)
             item["local_cache_hits"] = int(item.get("local_cache_hits", 0)) + int(row.get("local_cache_hits", 0) or 0)
+            item["estimated_prompt_tokens_local_cache_hits"] = (
+                int(item.get("estimated_prompt_tokens_local_cache_hits", 0))
+                + int(row.get("estimated_prompt_tokens_local_cache_hits", 0) or 0)
+            )
             item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(row.get("seconds", 0.0) or 0.0), 4)
             for key in [
                 "input_tokens",
@@ -1451,6 +1643,9 @@ class LLMClient:
             "input_tokens": int(summary.get("prompt_tokens", 0) or 0),
             "provider_usage_missing_calls": int(summary.get("provider_usage_missing_calls", 0) or 0),
             "estimated_prompt_tokens": int(summary.get("estimated_prompt_tokens", 0) or 0),
+            "estimated_prompt_tokens_local_cache_hits": int(
+                summary.get("estimated_prompt_tokens_local_cache_hits", 0) or 0
+            ),
             "cache_hit_tokens": int(summary.get("prompt_cache_hit_tokens", 0) or 0),
             "cache_miss_tokens": int(summary.get("prompt_cache_miss_tokens", 0) or 0),
             "cache_write_tokens": int(summary.get("cache_write_tokens", 0) or 0),
@@ -1495,6 +1690,10 @@ class LLMClient:
                 "serviceunavailable",
                 "gateway",
                 "httpstatus",
+                # httpx raises RemoteProtocolError when a streaming gateway
+                # closes an incomplete chunked response. This is a
+                # transport failure and the request is safe to retry.
+                "remoteprotocol",
             ]
         ):
             return True
@@ -1520,6 +1719,8 @@ class LLMClient:
                 "too many requests",
                 "gateway",
                 "server disconnected",
+                "peer closed connection",
+                "incomplete chunked read",
                 "remote protocol error",
                 "getaddrinfo",
                 "11001",
@@ -1595,7 +1796,11 @@ class LLMClient:
                 {key: active_kwargs[key] for key in ("messages", "tools", "response_format") if key in active_kwargs},
                 ensure_ascii=False, default=str,
             ))
-            remaining = window - input_tokens - int(window * 0.18)
+            headroom_ratio = min(
+                0.5,
+                max(0.01, float(getattr(self.config.llm, "context_headroom_ratio", 0.01) or 0.01)),
+            )
+            remaining = window - input_tokens - max(2048, int(window * headroom_ratio))
             if remaining < min(int(active_kwargs.get("max_tokens") or 32768), 32768):
                 raise ValueError(f"Complete request exceeds context budget: input={input_tokens}, window={window}")
             active_kwargs["max_tokens"] = min(int(active_kwargs.get("max_tokens") or 32768), remaining)
@@ -1739,7 +1944,16 @@ class LLMClient:
                 {"name": "user_prompt", "role": "user", "content": user_prompt},
             ]
 
-        cache_key = self._cache_key(prompt_name=prompt_name, system_prompt=system_prompt, user_prompt=base_user)
+        text_max_tokens = _effective_output_max_tokens(
+            self.config.llm.max_tokens,
+            config=self.config.llm,
+        )
+        cache_key = self._cache_key(
+            prompt_name=prompt_name,
+            system_prompt=system_prompt,
+            user_prompt=base_user,
+            output_max_tokens=text_max_tokens,
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             logger.info("[LLM] text cache hit: prompt=%s", prompt_name)
@@ -1759,10 +1973,6 @@ class LLMClient:
         logger.info("[LLM] generating text: prompt=%s model=%s", prompt_name, self.config.llm.model_name)
         log_event(logger, "llm.client", "REQUEST_STARTED", prompt=prompt_name, mode="text", model=self.config.llm.model_name)
         t0 = time.perf_counter()
-        text_max_tokens = _effective_output_max_tokens(
-            self.config.llm.max_tokens,
-            config=self.config.llm,
-        )
         create_kwargs = {
             "model": self.config.llm.model_name,
             "temperature": self.config.llm.temperature,
@@ -1772,10 +1982,14 @@ class LLMClient:
         }
         if text_max_tokens is not None:
             create_kwargs["max_tokens"] = text_max_tokens
+        provider_cache_scope = f"text:{prompt_name}:v1"
+        self._usage_local.prompt_cache_namespace = provider_cache_scope
+        self._usage_local.prompt_cache_prefix_fingerprint = _prompt_cache_prefix_fingerprint(static_user_prompt)
         provider_cache_key = _provider_prompt_cache_key(
             config=self.config,
             base_url=self.base_url,
             stable_prefix=static_user_prompt,
+            cache_scope=provider_cache_scope,
         )
         if provider_cache_key:
             create_kwargs["prompt_cache_key"] = provider_cache_key
@@ -1837,16 +2051,31 @@ class LLMClient:
         max_tokens: int | None = None,
         static_context_prompt: str = "",
         dynamic_user_prompt: str | None = None,
+        stable_context_segments: list[dict[str, str]] | None = None,
+        schema_prompt: str | None = None,
+        length_retry_max_tokens: int | None = None,
     ) -> T:
         labels = _control_prompt_labels(self.config)
+        self._usage_local.last_call_metadata = {
+            "prompt_name": prompt_name,
+            "source": "provider_pending",
+            "provider_usage_available": False,
+            "parsed_ok": False,
+        }
         schema = model_cls.model_json_schema()
         compact_schema = bool(getattr(self.config.llm, "compact_structured_schema", True))
-        include_json_example = bool(getattr(self.config.llm, "structured_include_json_example", False)) or bool(
+        include_json_example = not bool(str(schema_prompt or "").strip()) and (
+            bool(getattr(self.config.llm, "structured_include_json_example", False)) or bool(
             _is_deepseek_model(self.config.llm.model_name)
             and _is_official_deepseek_base_url(self.base_url)
             and getattr(self.config.llm, "deepseek_json_mode_include_example", True)
+            )
         )
-        schema_text = _schema_text_for_prompt(schema, compact=compact_schema)
+        schema_text = (
+            str(schema_prompt).strip()
+            if str(schema_prompt or "").strip()
+            else _schema_text_for_prompt(schema, compact=compact_schema)
+        )
         schema_example = (
             json.dumps(_example_from_schema(schema), ensure_ascii=False, separators=(",", ":"))
             if include_json_example
@@ -1854,9 +2083,8 @@ class LLMClient:
         )
         json_rules_prefix = labels["json_prefix"]
         json_rules_suffix = labels["json_suffix"]
-        # Keep the schema and JSON rules as a stable prefix, then put run-specific
-        # payload in the final user message. This mirrors Claude Code/Codex-style
-        # prompt-cache hygiene while still preserving a deterministic local cache key.
+        # Keep task instructions and output protocol ahead of project-specific context.
+        # Providers cache exact prefixes, so variable context must come later.
         static_parts = [json_rules_prefix]
         if schema_example:
             static_parts.append(f"{labels['json_example']}:\n{schema_example}")
@@ -1865,11 +2093,45 @@ class LLMClient:
         static_user = "\n\n".join(static_parts)
         if fewshot:
             static_user = f"{labels['fewshot']}:\n{fewshot}\n\n{static_user}"
-        stable_context_user = ""
-        if static_context_prompt:
-            stable_context_user = f"{labels['stable_context']}:\n{static_context_prompt}"
+        stable_context_messages: list[tuple[str, str]] = []
+        for segment in stable_context_segments or []:
+            if not isinstance(segment, dict):
+                continue
+            name = str(segment.get("name") or "stable_context").strip() or "stable_context"
+            content = str(segment.get("content") or "")
+            if content.strip():
+                stable_context_messages.append((name, f"{labels['stable_context']} ({name}):\n{content}"))
+        if not stable_context_messages and static_context_prompt:
+            # The task ledger is immutable across agents. Put it before the
+            # changing agent/schema so providers can reuse the exact project
+            # prefix. Stage-specific evidence and latest instructions stay last.
+            shared_task_prefix = '"autorealize.shared_task_context.v1"' in static_context_prompt
+            name = "shared_prefix" if shared_task_prefix else "stable_context"
+            stable_context_messages.append((
+                name, f"{labels['stable_context']}:\n{static_context_prompt}",
+            ))
+        stable_context_user = "\n\n".join(content for _, content in stable_context_messages)
+        leading_context_messages = [
+            item for item in stable_context_messages if item[0] in {"project", "shared_prefix"}
+        ]
+        trailing_context_messages = [
+            item for item in stable_context_messages if item not in leading_context_messages
+        ]
         dynamic_user = f"{labels['dynamic_input']}:\n{dynamic_user_prompt if dynamic_user_prompt is not None else user_prompt}"
-        base_user = "\n\n".join(x for x in [static_user, stable_context_user, dynamic_user] if x.strip())
+        agent_instructions = f"{labels['agent_title']}\n{system_prompt}"
+        project_prefix_first = bool(leading_context_messages)
+        base_user_parts = (
+            [
+                "\n\n".join(content for _, content in leading_context_messages),
+                agent_instructions,
+                static_user,
+                "\n\n".join(content for _, content in trailing_context_messages),
+                dynamic_user,
+            ]
+            if project_prefix_first
+            else [static_user, stable_context_user, dynamic_user]
+        )
+        base_user = "\n\n".join(x for x in base_user_parts if x.strip())
         requested_output_max_tokens = (
             _normal_max_tokens(max_tokens)
             or _normal_max_tokens(getattr(self.config.llm, "structured_max_tokens", None))
@@ -1886,6 +2148,8 @@ class LLMClient:
             system_prompt=system_prompt,
             user_prompt=base_user,
             schema=schema_text,
+            cache_epoch=("structured-prefix-v6-project-prefix" if project_prefix_first else "structured-prefix-v2"),
+            output_max_tokens=active_output_max_tokens,
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -1908,15 +2172,17 @@ class LLMClient:
                         }
                     )
                 ]
-                if stable_context_user:
-                    cache_prompt_parts.append(
-                        {"name": "stable_context", "role": "user", "content": stable_context_user}
+                if project_prefix_first:
+                    cache_prompt_parts.extend(
+                        {"name": name, "role": "user", "content": content}
+                        for name, content in leading_context_messages
                     )
+                if stable_context_user:
                     cache_prompt_parts.append(
                         {
                             "name": "system_prompt",
                             "role": "user",
-                            "content": f"{labels['agent_title']}\n{system_prompt}",
+                            "content": agent_instructions,
                         }
                     )
                 if fewshot:
@@ -1927,6 +2193,16 @@ class LLMClient:
                 if schema_example:
                     cache_prompt_parts.append({"name": "json_example", "role": "user", "content": schema_example})
                 cache_prompt_parts.append({"name": "json_schema", "role": "user", "content": schema_text})
+                if stable_context_user and not project_prefix_first:
+                    cache_prompt_parts.extend(
+                        {"name": name, "role": "user", "content": content}
+                        for name, content in stable_context_messages
+                    )
+                elif project_prefix_first:
+                    cache_prompt_parts.extend(
+                        {"name": name, "role": "user", "content": content}
+                        for name, content in trailing_context_messages
+                    )
                 cache_prompt_parts.append({"name": "dynamic_payload", "role": "user", "content": dynamic_user})
                 self._log_local_cache_usage(
                     prompt_name=prompt_name,
@@ -1952,6 +2228,12 @@ class LLMClient:
                             parsed_ok=True,
                         )
                     )
+                self._usage_local.last_call_metadata = {
+                    "prompt_name": prompt_name,
+                    "source": "local_response_cache",
+                    "provider_usage_available": False,
+                    "parsed_ok": True,
+                }
                 return parsed
             except Exception:
                 pass
@@ -1978,28 +2260,35 @@ class LLMClient:
             )
             t0 = time.perf_counter()
             if stable_context_user:
-                messages = [
-                    {"role": "system", "content": labels["cache_system"]},
-                    {"role": "user", "content": stable_context_user},
-                    {
-                        "role": "user",
-                        "content": f"{labels['agent_title']}\n{system_prompt}",
-                    },
-                    {"role": "user", "content": static_user},
-                ]
+                messages = [{"role": "system", "content": labels["cache_system"]}]
+                if project_prefix_first:
+                    messages.extend(
+                        {"role": "user", "content": content}
+                        for _, content in leading_context_messages
+                    )
+                    messages.extend([
+                        {"role": "user", "content": agent_instructions},
+                        {"role": "user", "content": static_user},
+                    ])
+                else:
+                    messages.extend([
+                        {"role": "user", "content": agent_instructions},
+                        {"role": "user", "content": static_user},
+                        *[{"role": "user", "content": content} for _, content in stable_context_messages],
+                    ])
                 prompt_parts = [
                     {
                         "name": "cache_friendly_system",
                         "role": "system",
                         "content": labels["cache_system"],
                     },
-                    {"name": "stable_context", "role": "user", "content": stable_context_user},
-                    {
-                        "name": "system_prompt",
-                        "role": "user",
-                        "content": f"{labels['agent_title']}\n{system_prompt}",
-                    },
                 ]
+                if project_prefix_first:
+                    prompt_parts.extend(
+                        {"name": name, "role": "user", "content": content}
+                        for name, content in leading_context_messages
+                    )
+                prompt_parts.append({"name": "system_prompt", "role": "user", "content": agent_instructions})
             else:
                 messages = [
                     {"role": "system", "content": system_prompt},
@@ -2016,6 +2305,20 @@ class LLMClient:
             if schema_example:
                 prompt_parts.append({"name": "json_example", "role": "user", "content": schema_example})
             prompt_parts.append({"name": "json_schema", "role": "user", "content": schema_text})
+            if stable_context_user and not project_prefix_first:
+                prompt_parts.extend(
+                    {"name": name, "role": "user", "content": content}
+                    for name, content in stable_context_messages
+                )
+            elif project_prefix_first:
+                messages.extend(
+                    {"role": "user", "content": content}
+                    for _, content in trailing_context_messages
+                )
+                prompt_parts.extend(
+                    {"name": name, "role": "user", "content": content}
+                    for name, content in trailing_context_messages
+                )
             messages.append({"role": "user", "content": dynamic_user})
             prompt_parts.append({"name": "dynamic_payload", "role": "user", "content": dynamic_user})
             if last_error and self.config.llm.enforce_json_retry:
@@ -2041,10 +2344,27 @@ class LLMClient:
             }
             if attempt_output_max_tokens is not None:
                 create_kwargs["max_tokens"] = attempt_output_max_tokens
+            provider_cache_scope = (
+                "structured:project-prefix:v7"
+                if project_prefix_first
+                else f"structured:{prompt_name}:v6"
+            )
+            provider_stable_prefix = (
+                f"{labels['cache_system']}\n\n{stable_context_messages[0][1]}"
+                if project_prefix_first
+                else f"{labels['cache_system']}\n\n{agent_instructions}\n\n{static_user}\n\n{stable_context_user}"
+                if stable_context_user
+                else static_user
+            )
+            self._usage_local.prompt_cache_namespace = provider_cache_scope
+            self._usage_local.prompt_cache_prefix_fingerprint = _prompt_cache_prefix_fingerprint(
+                provider_stable_prefix
+            )
             provider_cache_key = _provider_prompt_cache_key(
                 config=self.config,
                 base_url=self.base_url,
-                stable_prefix=static_context_prompt,
+                stable_prefix=provider_stable_prefix,
+                cache_scope=provider_cache_scope,
             )
             if provider_cache_key:
                 create_kwargs["prompt_cache_key"] = provider_cache_key
@@ -2064,7 +2384,10 @@ class LLMClient:
             text = choice.message.content or ""
             finish_reason = str(getattr(choice, "finish_reason", "") or "")
             try:
-                json_obj = _loads_json_object(text)
+                json_obj = _loads_json_object(
+                    text,
+                    repair_missing_closers=finish_reason != "length",
+                )
                 parsed, repair_note = _validate_with_string_coercion(model_cls, json_obj)
                 dt = time.perf_counter() - t0
                 logger.info("[LLM] structured output completed: prompt=%s attempt=%s | %.2fs", prompt_name, attempt, dt)
@@ -2079,6 +2402,13 @@ class LLMClient:
                     parsed_ok=True,
                     prompt_parts=prompt_parts,
                 )
+                self._usage_local.last_call_metadata = {
+                    "prompt_name": prompt_name,
+                    "source": "provider",
+                    "provider_usage_available": bool(usage_row.get("usage_available")),
+                    "parsed_ok": True,
+                    "finish_reason": finish_reason,
+                }
                 log_event(
                     logger,
                     "llm.client",
@@ -2171,6 +2501,7 @@ class LLMClient:
                     next_max_tokens = _next_structured_length_retry_max_tokens(
                         current_max_tokens=active_output_max_tokens,
                         config=self.config.llm,
+                        retry_max_tokens=length_retry_max_tokens,
                     )
                     if next_max_tokens is not None and next_max_tokens != active_output_max_tokens:
                         previous_max_tokens = active_output_max_tokens
@@ -2187,6 +2518,9 @@ class LLMClient:
                             previous_max_tokens=previous_max_tokens,
                             next_max_tokens=active_output_max_tokens,
                         )
+                    elif not reasoning_fallback:
+                        will_retry = False
+                        last_error = f"{last_error}; retry_stopped=no_higher_output_budget"
                 self._log_trace(
                     LLMTrace(
                         prompt_name=prompt_name,
@@ -2218,4 +2552,6 @@ class LLMClient:
                     cache_write_tokens=usage_row.get("cache_write_tokens", 0),
                     error=last_error[:180],
                 )
+                if not will_retry:
+                    break
         raise RuntimeError(f"LLM structured output failed: {last_error}")

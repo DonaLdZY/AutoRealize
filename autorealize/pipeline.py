@@ -181,10 +181,10 @@ def _extract_constraint_memory(
     # 规则先验：先从字段和摘要里抓明显约束线索。
     hints: list[dict] = []
     keyword_groups = {
-        "运价/费率约束": ["运价", "费率", "单价", "成本", "合同", "price", "rate", "cost"],
-        "容量约束": ["体积", "重量", "装载", "容量", "载重", "volume", "weight", "capacity"],
-        "时序/日分配约束": ["每日", "日期", "时间", "day", "date", "time"],
-        "地址/区间约束": ["发货", "收货", "地址", "起点", "终点", "区间", "origin", "destination"],
+        "价格/费用线索": ["运价", "费率", "单价", "成本", "合同", "price", "rate", "cost"],
+        "容量/重量线索": ["体积", "重量", "装载", "容量", "载重", "volume", "weight", "capacity"],
+        "日期/时间线索": ["每日", "日期", "时间", "day", "date", "time"],
+        "地址/路线线索": ["发货", "收货", "地址", "起点", "终点", "区间", "origin", "destination"],
     }
     for fs in file_summaries:
         text = f"{fs.path} {fs.summary} {' '.join(fs.columns[:80])}".lower()
@@ -193,10 +193,10 @@ def _extract_constraint_memory(
                 hints.append(
                     {
                         "name": cname,
-                        "description": f"从 `{fs.path}` 检测到与“{cname}”相关信息。",
+                        "description": f"`{fs.path}` 出现与“{cname}”相关的关键词，需结合原文确认含义，尚未形成约束。",
                         "evidence": [fs.path, fs.summary[:160]],
                         "related_fields": [c for c in fs.columns if any(k.lower() in str(c).lower() for k in kws)][:12],
-                        "priority": "high" if "约束" in cname or "容量" in cname else "medium",
+                        "priority": "medium",
                         "strength": "unknown",
                         "status": "unresolved",
                         "status_reason": "Keyword observation only; no business constraint has been confirmed.",
@@ -2783,7 +2783,7 @@ def _cognize_one_file(
                     )
                     fs.source_metadata["excel_sheet_profiles"] = excel_profiles
                     fs.source_metadata["excel_sheet_groups"] = excel_sheet_groups_from_profiles(excel_profiles)
-                if sample_rows is not None:
+                if fs.source_metadata["profile_sampling"].get("sampled"):
                     fs.warnings.append(f"字段统计基于前 {min(sample_rows, len(df_stats))} 行采样，未全量扫描。")
                 fs.column_profiles = [
                     {
@@ -2884,7 +2884,14 @@ def _cognize_one_file(
                     if not fs.summary:
                         fs.summary = parsed.text_summary[:600]
             except Exception as llm_exc:  # noqa: BLE001
-                log_event(logger, "agent.file_cognition", "FAILED", file=rpath, error=str(llm_exc)[:180])
+                log_event(
+                    logger,
+                    "agent.file_cognition",
+                    "FAILED",
+                    file=rpath,
+                    error=str(llm_exc)[:180],
+                    retryable=True,
+                )
                 raise RuntimeError(f"LLM file cognition failed for {rpath}: {llm_exc}") from llm_exc
             log_event(logger, "agent.file_cognition", "COMPLETED", file=rpath)
         elif parsed.kind in {"table", "document", "structured_document", "archive"}:
@@ -2905,7 +2912,15 @@ def _cognize_one_file(
         }
     except Exception as exc:  # noqa: BLE001
         dt = time.perf_counter() - t0
-        log_event(logger, "stage.P1", "READ_FAILED", file=rpath, seconds=f"{dt:.2f}", error=str(exc)[:180])
+        log_event(
+            logger,
+            "stage.P1",
+            "READ_FAILED",
+            file=rpath,
+            seconds=f"{dt:.2f}",
+            error=str(exc)[:180],
+            retryable=True,
+        )
         return {
             "rpath": rpath,
             "fs": FileSummary(
@@ -3329,10 +3344,20 @@ def _enforce_existing_file_references(desc: str, data_root: Path) -> str:
     pattern = re.compile(r"`([^`]+\.(?:csv|xlsx|xls|json|parquet|txt|md))`", flags=re.I)
     lines = desc.splitlines()
     new_lines: list[str] = []
+    current_section = ""
     for line in lines:
+        heading = re.match(r"^##\s+(.*)$", line.strip())
+        if heading:
+            current_section = heading.group(1)
+        if _is_output_artifact_section(current_section):
+            new_lines.append(line)
+            continue
         bad = False
         for m in pattern.finditer(line):
-            if not _file_reference_matches(m.group(1), existing_paths, existing_names):
+            reference = m.group(1)
+            if _is_generated_artifact_reference(reference, line_context=line):
+                continue
+            if not _file_reference_matches(reference, existing_paths, existing_names):
                 bad = True
                 break
         if bad:
@@ -3346,8 +3371,19 @@ def _find_missing_file_references(desc: str, data_root: Path) -> list[str]:
     existing_paths, existing_names = _file_reference_inventory(data_root)
     pattern = re.compile(r"`([^`]+\.(?:csv|xlsx|xls|json|parquet|txt|md))`", flags=re.I)
     missing: list[str] = []
-    for m in pattern.finditer(desc):
-        if not _file_reference_matches(m.group(1), existing_paths, existing_names):
+    current_section = ""
+    for line in str(desc or "").splitlines():
+        heading = re.match(r"^##\s+(.*)$", line.strip())
+        if heading:
+            current_section = heading.group(1)
+        if _is_output_artifact_section(current_section):
+            continue
+        for m in pattern.finditer(line):
+            reference = m.group(1)
+            if _is_generated_artifact_reference(reference, line_context=line):
+                continue
+            if _file_reference_matches(reference, existing_paths, existing_names):
+                continue
             missing.append(Path(m.group(1).replace("\\", "/")).name)
     uniq: list[str] = []
     seen = set()
@@ -3356,6 +3392,45 @@ def _find_missing_file_references(desc: str, data_root: Path) -> list[str]:
             seen.add(x)
             uniq.append(x)
     return uniq
+
+
+def _is_generated_artifact_reference(reference: str, *, line_context: str = "") -> bool:
+    """Recognize package-relative outputs without treating them as input files."""
+    normalized = str(reference or "").strip().replace("\\", "/").casefold()
+    if not normalized:
+        return False
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    known_package_files = {
+        "selected_config.json",
+        "split_manifest.json",
+        "model_path.txt",
+        "solution_manifest.json",
+        "delivery_contract.json",
+        "inference_contract.json",
+        "requirements.txt",
+        "environment.yml",
+        "metadata.json",
+    }
+    if not parts or Path(parts[-1]).name not in known_package_files:
+        return False
+    package_rooted = any(
+        part in {"artifact", "artifacts", "model_artifacts", "artifact_dir"}
+        for part in parts[:-1]
+    )
+    package_root_named_in_context = bool(re.search(
+        r"\b(?:artifact_dir|artifact\s+directory|artifact\s+root|package\s+artifact(?:\s+directory)?)\b",
+        str(line_context or ""),
+        flags=re.I,
+    ))
+    return package_rooted or package_root_named_in_context
+
+
+def _is_output_artifact_section(title: str) -> bool:
+    normalized = re.sub(r"^\d+\.\s*", "", str(title or "").strip()).casefold()
+    return any(
+        marker in normalized
+        for marker in ("输出或提交格式", "提交格式", "output protocol", "submission format")
+    )
 
 
 def _file_reference_inventory(data_root: Path) -> tuple[set[str], set[str]]:

@@ -12,7 +12,9 @@ from .scalar_score import scalar_score_shape_defects
 
 _INACTIVE_STATUSES = {"superseded", "not_current", "resolved"}
 _EVALUATION_FIELDS = (
-    "ranking_scope", "primary_metric", "metric_direction", "metric_formula", "scalar_score_formula", "prediction_unit",
+    "ranking_scope", "primary_metric", "metric_direction", "metric_formula", "scalar_score_formula",
+    "final_evaluation_metric", "final_evaluation_direction", "final_evaluation_formula",
+    "final_evaluation_protocol", "prediction_unit",
     "y_true_source", "y_pred_source", "computation_scope", "aggregation_rule",
     "validation_protocol", "submission_checks", "leakage_guards",
     "invalid_solution_rules", "tie_break_rules", "assumptions",
@@ -32,6 +34,143 @@ def _strings(values: Any) -> list[str]:
 
 def _mapping(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _authority_conflict_status(item: dict[str, Any]) -> str:
+    return str(item.get("status") or item.get("resolution_status") or "").strip().lower()
+
+
+def _authority_conflict_is_inactive(item: dict[str, Any]) -> bool:
+    status = _authority_conflict_status(item)
+    return status in _INACTIVE_STATUSES or status.startswith(("resolved_", "superseded_", "not_current_"))
+
+
+def _positions_only_record_shared_absence(item: dict[str, Any]) -> bool:
+    """An absence in every source is a specification gap, not a disagreement.
+
+    This narrow check does not infer a missing value or waive other executable
+    contract checks. A positive claim on either side remains a real conflict.
+    """
+    positions = item.get("positions")
+    if not isinstance(positions, list) or len(positions) < 2:
+        return False
+    absence = re.compile(
+        r"^(?:未(?:显式|明确)?(?:规定|给出|指定|定义)|"
+        r"没有(?:显式|明确)?(?:规定|给出|指定|定义)|"
+        r"(?:not\s+(?:explicitly\s+)?(?:specified|defined|provided))\b|"
+        r"(?:does\s+not\s+(?:explicitly\s+)?(?:specify|define|provide))\b)",
+        re.IGNORECASE,
+    )
+    for position in positions:
+        if not isinstance(position, str):
+            return False
+        text = re.sub(r"^[^:：\n]{1,120}[:：]\s*", "", position.strip(), count=1)
+        # A later explicit contradiction cannot be hidden behind an absence.
+        if not absence.match(text) or re.search(r"(?:但|然而|however\b|but\b)", text, re.IGNORECASE):
+            return False
+    return True
+
+
+def _has_explicit_task_hint_authority(item: dict[str, Any]) -> bool:
+    highest_priority = str(item.get("highest_priority") or "").strip().casefold()
+    if highest_priority not in {"task_hint", "user_hint", "authoritative task hint"}:
+        return False
+    sources = {source.casefold() for source in _strings(item.get("sources"))}
+    return "task_hint" in sources or "user_hint" in sources
+
+
+def _authority_conflict_assessment(item: dict[str, Any]) -> dict[str, Any]:
+    """Keep source disagreements visible; only explicit safe scopes can pass handoff."""
+    status = _authority_conflict_status(item)
+    severity = str(item.get("severity") or "").strip().lower()
+    resolution = re.sub(r"\s+", " ", str(item.get("resolution") or "")).strip().lower()
+    blocking_flag = str(item.get("blocks_execution") or "").strip().lower()
+    execution_disposition = str(item.get("execution_disposition") or "").strip().lower()
+    execution_limits = _strings(item.get("execution_limits"))
+    topic = str(item.get("topic") or "").strip().lower()
+    description = str(item.get("description") or item.get("message") or "").strip().lower()
+    conflict_text = f"{topic} {description}"
+
+    if _authority_conflict_is_inactive(item):
+        disposition = "inactive"
+        reason = "Conflict is resolved or no longer current."
+    elif severity == "blocking" or blocking_flag in {"true", "yes", "1"} or execution_disposition == "blocking":
+        disposition = "blocking"
+        reason = "Conflict is explicitly marked as blocking."
+    elif _positions_only_record_shared_absence(item):
+        disposition = "shared_unspecified"
+        reason = (
+            "All recorded positions describe an unspecified value, not incompatible rules. "
+            "The omission stays visible; required execution fields are validated separately."
+        )
+    else:
+        preserves_disagreement = any(marker in resolution for marker in (
+            "保留冲突", "保留双方观点", "分别保留", "retain the conflict",
+            "preserve both views", "keep both positions",
+        ))
+        defines_safe_boundary = any(marker in resolution for marker in (
+            "不推导", "不得混用", "不判定为硬约束", "非因果", "不作因果",
+            "不宣称因果", "do not infer", "must not mix", "not causal",
+            "not a causal claim", "without causal claims",
+        ))
+        changes_core_contract = any(marker in conflict_text for marker in (
+            "目标定义", "目标字段", "标签定义", "标签字段", "预测目标", "评价指标",
+            "评估指标", "评价口径", "评估口径", "切分规则", "提交格式", "输出定义",
+            "target", "label", "evaluation metric", "evaluation protocol",
+            "validation split", "output contract", "primary metric",
+        ))
+        explicit_safe_scope = (
+            execution_disposition == "non_blocking_with_limits"
+            and bool(execution_limits)
+        )
+        task_hint_safe_scope = explicit_safe_scope and _has_explicit_task_hint_authority(item)
+        legacy_safe_scope = preserves_disagreement and defines_safe_boundary
+        # Every non-inactive conflict is still active. Unknown status labels
+        # must not silently turn a conflict into a non-blocking item.
+        if (task_hint_safe_scope or explicit_safe_scope or legacy_safe_scope) and (
+            not changes_core_contract or task_hint_safe_scope
+        ):
+            disposition = "retained_non_blocking"
+            reason = (
+                "Source disagreement remains unresolved and visible; its recorded resolution defines "
+                "a conservative use boundary without changing the target, evaluation, or output contract."
+            )
+        else:
+            disposition = "blocking"
+            reason = "Active conflict lacks a sufficient, non-core safe-use boundary."
+
+    return {
+        "conflict_id": str(item.get("conflict_id") or ""),
+        "topic": str(item.get("topic") or ""),
+        "status": status or "unknown",
+        "disposition": disposition,
+        "reason": reason,
+        "resolution": str(item.get("resolution") or ""),
+        "execution_limits": execution_limits,
+    }
+
+
+def artifact_consistency_warning_only(review: Any) -> bool:
+    data = review.model_dump() if hasattr(review, "model_dump") else _mapping(review)
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    return bool(issues) and all(
+        str(_mapping(issue).get("severity") or "").strip().lower() == "warning"
+        for issue in issues
+    )
+
+
+def artifact_consistency_gate_passes(review: Any) -> bool:
+    data = review.model_dump() if hasattr(review, "model_dump") else _mapping(review)
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    severities = [
+        str(_mapping(issue).get("severity") or "").strip().lower()
+        for issue in issues
+    ]
+    if any(severity not in {"warning", "blocking"} for severity in severities):
+        return False
+    if any(severity == "blocking" for severity in severities):
+        return False
+    return bool(issues) or data.get("passed") is True
 
 
 def build_constraint_ledger(bundle: dict, context: dict) -> list[dict[str, Any]]:
@@ -127,13 +266,28 @@ def build_execution_contract(
     questions = _strings(questions)
     conflicts = [
         item for item in (authority.get("authority_conflicts") or [])
-        if not isinstance(item, dict) or item.get("status") not in _INACTIVE_STATUSES
+        if not isinstance(item, dict) or not _authority_conflict_is_inactive(item)
+    ]
+    conflict_assessments = [
+        _authority_conflict_assessment(item)
+        for item in conflicts if isinstance(item, dict)
     ]
     assumptions = _strings(evaluation.get("assumptions"))
     blockers = []
+    agent_context_pack = _mapping(context.get("agent_context_pack"))
+    temporal_scan_requirement = _mapping(
+        context.get("temporal_scan_requirement")
+        or agent_context_pack.get("temporal_scan_requirement")
+    )
+    if temporal_scan_requirement.get("required") is True and temporal_scan_requirement.get("status") != "passed":
+        scan_blockers = _strings(temporal_scan_requirement.get("blocking_issues"))
+        blockers.extend(
+            f"Required temporal data scan: {reason}"
+            for reason in (scan_blockers or ["host full-table scan has not passed"])
+        )
     if "artifact_consistency_review" in context:
         review = _mapping(context["artifact_consistency_review"])
-        if review.get("passed") is not True:
+        if not artifact_consistency_gate_passes(review):
             blockers.append("Final artifact consistency review has not passed.")
         blockers.extend(
             f"Final artifact consistency: {issue.get('message') or issue.get('category') or 'blocking issue'}"
@@ -146,6 +300,14 @@ def build_execution_contract(
     for name in ("primary_metric", "metric_formula", "validation_protocol"):
         if not str(evaluation.get(name) or "").strip():
             blockers.append(f"Missing evaluation field: {name}.")
+    final_evaluation_fields = (
+        "final_evaluation_metric", "final_evaluation_direction", "final_evaluation_formula",
+        "final_evaluation_protocol",
+    )
+    if any(str(evaluation.get(name) or "").strip() for name in final_evaluation_fields):
+        for name in final_evaluation_fields:
+            if not str(evaluation.get(name) or "").strip():
+                blockers.append(f"Incomplete final evaluation contract: {name}.")
     if evaluation.get("metric_direction") not in {"minimize", "maximize"}:
         blockers.append("Metric direction must be minimize or maximize.")
     blockers.extend(scalar_score_shape_defects(evaluation))
@@ -155,9 +317,10 @@ def build_execution_contract(
     )
     blockers.extend(
         f"Unresolved authority conflict: {json.dumps(item, ensure_ascii=False, sort_keys=True)}"
-        for item in conflicts if isinstance(item, dict) and (
-            item.get("status") == "unresolved" or item.get("severity") == "blocking"
+        for item, assessment in zip(
+            (item for item in conflicts if isinstance(item, dict)), conflict_assessments
         )
+        if assessment["disposition"] == "blocking"
     )
     evaluation_snapshot = {key: evaluation.get(key) for key in _EVALUATION_FIELDS}
     evaluation_id = "evaluation:" + _fingerprint(evaluation_snapshot)
@@ -173,6 +336,9 @@ def build_execution_contract(
             + _strings(_mapping(context.get("problem_paradigm_review")).get("required_method_families"))
         ),
         "evaluation_id": evaluation_id,
+        "temporal_scan_requirement": (
+            temporal_scan_requirement if temporal_scan_requirement.get("required") is True else None
+        ),
         "output": {key: output.get(key) for key in (
             "output_kind", "output_filename", "columns", "row_unit", "format_rules",
             "sample_submission_required", "authoritative_submission_contract",
@@ -204,6 +370,7 @@ def build_execution_contract(
         "Keep software-contract validation distinct from executed decision quality and future operational validation. Missing inputs never establish a measured feasible decision or business benefit.",
     ] if is_static_optimization else [
         "Freeze one evaluator, eligible population, validation split, and metric direction before scoring search nodes.",
+        "Rank candidates only by the frozen development/search population and metric in the evaluation contract; final_evaluation_* fields are post-selection only and never search rewards.",
         "Compare a node only with scores from the same evaluation_id and realized split fingerprint; a changed evaluator requires reevaluation.",
         "Check hard constraints before ranking; failed, infeasible, non-finite, or unevaluated nodes cannot become a best feasible result.",
         "Ensemble only compatible outputs aligned by exact evaluation unit and out-of-fold or held-out predictions; train blend weights without test labels.",
@@ -252,12 +419,15 @@ def build_execution_contract(
             "Unknown strength means unclassified evidence, not permission to relax a matching hard or soft constraint. A current_candidate paraphrase cannot downgrade a current rule.",
             "Exact whitespace-normalized duplicate descriptions share one entry with additional source records. Other paraphrases retain their wording and provenance; do not infer that they supersede existing rules.",
             "Only explicit evidence-backed supersession can retire a rule. Incompatible current hard constraints require an authority resolution before execution; never resolve them by taking the last entry.",
+            "An unresolved source conflict may remain non-blocking only when its execution_disposition is non_blocking_with_limits with explicit execution_limits, or legacy resolution text explicitly preserves both sides and states a conservative boundary. A conflict touching a core target, evaluation, or output field additionally requires the record to identify task_hint/user_hint as highest_priority and include that source in sources. Such a conflict stays unresolved and visible; it cannot redefine the target, evaluation, or output contract.",
         ],
         "assumptions": assumptions,
         "open_questions": questions,
         "resolved_question_history": question_history,
         "authority_conflicts": conflicts,
+        "authority_conflict_assessments": conflict_assessments,
         "blocking_issues": blockers,
+        "temporal_scan_requirement": temporal_scan_requirement,
         "reproducibility_requirements": reproducibility_requirements,
         "candidate_comparison_rules": candidate_comparison_rules,
         "report_requirements": report_requirements,

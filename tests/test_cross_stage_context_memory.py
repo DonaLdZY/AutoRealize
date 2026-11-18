@@ -49,6 +49,8 @@ def test_cross_stage_memory_compacts_and_retrieves_exact_artifact(tmp_path) -> N
     cfg.context.cross_stage_memory_trigger_chars = 4000
     cfg.context.cross_stage_memory_entry_chars = 3000
     cfg.context.cross_stage_memory_recent_entries = 1
+    cfg.context.cross_stage_memory_use_llm_compactor = True
+    cfg.context.cross_stage_retrieval_use_llm_planner = True
     cfg.context.cross_stage_retrieval_stage_prefixes = ("critical_",)
     llm = _MemoryLLM()
     ledger = CrossStageContextLedger(
@@ -100,6 +102,74 @@ def test_cross_stage_memory_compacts_and_retrieves_exact_artifact(tmp_path) -> N
     )
     assert llm.retrievals == 1
     assert (tmp_path / "cross_stage_context.json").is_file()
+
+
+def test_cross_stage_memory_uses_deterministic_compaction_by_default(tmp_path) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.prompt.prompt_token_budget = 2000
+    cfg.context.cross_stage_stable_context_chars = 4000
+    cfg.context.cross_stage_memory_trigger_chars = 4000
+    cfg.context.cross_stage_memory_entry_chars = 3000
+    cfg.context.cross_stage_memory_recent_entries = 1
+    llm = _MemoryLLM()
+    ledger = CrossStageContextLedger(
+        config=cfg,
+        llm_client=llm,
+        prompt_mgr=_PromptManager(),
+        report_dir=tmp_path,
+        stable_context={"task_hint": "predict"},
+    )
+    first = ledger.add("stage_1", {"fact": "A" * 5000}, authority="verified")
+    ledger.add("stage_2", {"fact": "B" * 5000})
+    ledger.add("stage_3", {"fact": "C" * 5000})
+    ledger.prompt_parts(
+        stage="next_stage",
+        stage_evidence={"value": 1},
+        latest_request={"instruction": "continue"},
+    )
+    assert llm.compactions == 0
+    assert ledger.compaction_history[0]["source"] == "deterministic"
+    assert first["artifact_id"] in ledger.summary.evidence_artifact_ids
+    assert any("stage_1" in item for item in ledger.summary.stage_summaries)
+
+    assert llm.retrievals == 0
+
+
+def test_cross_stage_retrieval_follows_explicit_artifact_reference_without_llm(tmp_path) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.context.cross_stage_retrieval_stage_prefixes = ()
+    llm = _MemoryLLM()
+    ledger = CrossStageContextLedger(
+        config=cfg,
+        llm_client=llm,
+        prompt_mgr=_PromptManager(),
+        report_dir=tmp_path,
+        stable_context={"task_hint": "predict"},
+    )
+    ref = ledger.artifact_store.put(
+        "cross_stage_memory",
+        "evaluation_contract",
+        {"metric": "MAE", "scope": "development rows"},
+    )
+    ledger.artifact_catalog.append({
+        "artifact_id": ref["artifact_id"],
+        "stage": "evaluation_contract",
+        "authority": "verified",
+        "visible_excerpt": "evaluation contract",
+        "original_chars": ref["original_chars"],
+    })
+    ledger.compaction_count = 1
+
+    recovered = ledger._retrieve_if_needed(
+        "evaluation_contract_finalizer",
+        {"evaluation_contract": {"source_artifact": {"artifact_id": ref["artifact_id"]}}},
+        {"instruction": "finalize"},
+    )
+
+    assert llm.retrievals == 0
+    assert recovered[0]["artifact_id"] == ref["artifact_id"]
+    assert "MAE" in recovered[0]["excerpt"]
+    assert ledger.retrieval_history[-1]["planner"] == "deterministic_explicit_refs"
 
 
 def test_complete_current_snapshot_skips_paid_memory_calls_and_preserves_full_evidence(tmp_path):

@@ -11,6 +11,7 @@ from autorealize.context_compiler import (
     build_qdi_table_card_details,
     compact_table_cards_for_prompt,
     context_telemetry,
+    primary_key_candidates,
     reconcile_table_shape,
 )
 from autorealize.entity_alias import build_entity_alias_candidates
@@ -219,6 +220,42 @@ def test_table_card_details_include_excel_read_strategy(tmp_path: Path) -> None:
     assert any("headerless" in note.lower() for note in card["reading_notes"])
 
 
+def test_context_retrieval_exposes_scoped_full_profile_for_later_artifact_read(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    cfg = AutoRealizeConfig()
+    cfg.context.table_card_field_limit = 1
+    columns = [f"field_{i}" for i in range(5)]
+    profiles = [{"name": column, "row_count": 10, "non_null_count": 9, "unique_count": i + 1}
+                for i, column in enumerate(columns)]
+    fs = FileSummary(
+        path="book.xlsx", role=FileRole.raw_data_table, summary="All source fields",
+        columns=columns, column_profiles=profiles,
+        source_metadata={"excel_sheet_profiles": [{
+            "sheet_name": "data", "shape": [10, 5], "columns": columns,
+            "column_profiles": profiles, "layout_kind": "standard_table",
+        }]},
+    )
+    details = build_qdi_table_card_details(file_summaries=[fs], artifact_store=store, cfg=cfg)
+    request = type("Req", (), {
+        "table_ids": ["book.xlsx::data"], "input_files": [], "focus_sheets": [],
+        "focus_columns": ["field_4"], "query": "field_4 details", "reason": "test",
+    })()
+    retrieved = _retrieve_qdi_context_excerpt(
+        context={"table_cards": []}, table_card_details=details,
+        question_record={"question": "What is field_4?"}, request=request, max_cards=1,
+    )
+    card = retrieved[0]
+    assert card["fields"][0]["name"] == "field_0"  # table card remains its bounded source shape
+    full_ref = next(ref for ref in card["artifact_refs"] if ref["artifact_type"] == "excel_sheet_profile_full")
+    denied = store.read_excerpt(full_ref["artifact_id"], json_path="columns", max_chars=1000)
+    allowed = store.read_excerpt(
+        full_ref["artifact_id"], json_path="columns", max_chars=1000,
+        allowed_type_prefixes=("qdi_", "file_profile_full", "excel_sheet_profile_full"),
+    )
+    assert denied["error"] == "artifact_type_not_allowed"
+    assert json.loads(allowed["excerpt"]) == columns
+
+
 def test_reconcile_table_shape_prefers_full_profile_over_excel_used_range() -> None:
     facts = reconcile_table_shape(
         {"shape": [20_381, 4]},
@@ -244,6 +281,21 @@ def test_population_verification_does_not_count_unprofiled_rows_as_missing() -> 
     assert fact["missing_count"] == 10
     assert fact["statistics_scope"] == "sample"
     assert fact["profile_row_count"] == 20000
+
+
+def test_legacy_excel_preview_does_not_create_a_false_population_conflict():
+    facts = reconcile_table_shape({"shape": [10, 11], "shape_estimated": True,
+        "shape_profiled": [8036, 11]}, [{"name": "label", "row_count": 8036}])
+    assert facts["verified_row_count"] == 8036
+    assert facts["verified_shape"] == [8036, 11]
+    assert facts["reader_preview_shape"] == [10, 11]
+    assert not facts.get("row_count_conflict")
+    assert "worksheet_used_range_shape" not in facts
+    assert "reported_row_count" not in facts
+    partial = reconcile_table_shape({"shape": [10, 11], "shape_estimated": True})
+    assert partial["row_count_basis"] == "preview_only"
+    assert not partial.get("verified_shape")
+    assert not partial.get("verified_row_count")
 
 
 def test_sampled_csv_shape_is_not_a_verified_worksheet_population():
@@ -296,6 +348,36 @@ def test_population_verification_is_driven_by_generic_profile_evidence() -> None
     assert queue[0]["table_id"] == "users.csv"
     assert queue[0]["population_sensitive_fields"][0]["missing_count"] == 7
     assert "order" not in queue[0]["question"].lower()
+
+
+def test_primary_key_candidates_require_key_or_time_semantics() -> None:
+    candidates = primary_key_candidates(
+        [
+            {
+                "name": "SampleTime",
+                "role": "time",
+                "row_count": 1000,
+                "non_null_count": 1000,
+                "unique_count": 1000,
+            },
+            {
+                "name": "user_id",
+                "role": "id_or_key",
+                "row_count": 1000,
+                "non_null_count": 1000,
+                "unique_count": 995,
+            },
+            {
+                "name": "负压酸水罐1液位调节阀",
+                "role": "other",
+                "row_count": 1000,
+                "non_null_count": 1000,
+                "unique_count": 995,
+            },
+        ]
+    )
+
+    assert {item["field"] for item in candidates} == {"SampleTime", "user_id"}
 
 
 def test_auto_verification_questions_are_diverse_and_budgeted() -> None:
@@ -434,6 +516,27 @@ def test_entity_alias_candidates_feed_qdi_validation_questions(tmp_path: Path) -
     assert questions[0].priority == "high"
     assert "join coverage" in questions[0].question
     assert "成本/合同" not in questions[0].question
+
+
+def test_measurement_alias_candidates_do_not_request_entity_key_coverage() -> None:
+    context = {
+        "entity_alias_candidates": [{
+            "concept_id": "al_concentration_measurement",
+            "label": "Al concentration result and device outlet concentration",
+            "reason": "Both describe aluminum concentration at different process points.",
+            "candidate_fields": [
+                {"source_file": "lab.xls", "field": "result", "value_kind": "numeric"},
+                {"source_file": "device.csv", "field": "outlet_concentration", "value_kind": "numeric"},
+            ],
+            "source_collections": ["lab.xls", "device.csv"],
+            "evidence_status": "semantic_candidate",
+            "task_relevance": "high",
+        }]
+    }
+    questions = _entity_alias_verification_questions(context)
+    assert len(questions) == 1
+    assert questions[0].category == "field_semantics"
+    assert "不得用唯一值精确交集" in questions[0].question
 
 
 def test_entity_alias_candidates_require_llm_proposal_and_exact_schema() -> None:
@@ -894,3 +997,42 @@ def test_table_manifest_can_omit_cards_but_context_retrieval_still_finds_details
 
     assert retrieved
     assert retrieved[0]["table_id"] == "book.xlsx::sheet_5"
+
+
+def test_context_retrieval_falls_back_to_stable_table_cards() -> None:
+    card = {
+        "table_id": "process.csv",
+        "source_file": "process.csv",
+        "shape": [12, 2],
+        "fields": [{"name": "steam_flow"}, {"name": "al_n"}],
+    }
+    request = type("Req", (), {
+        "table_ids": ["process.csv"], "input_files": [], "focus_sheets": [],
+        "focus_columns": ["al_n"], "query": "target field", "reason": "test",
+    })()
+
+    retrieved = _retrieve_qdi_context_excerpt(
+        context={"table_cards": [card]},
+        table_card_details={},
+        question_record={"question": "Which field is the target?"},
+        request=request,
+        max_cards=1,
+    )
+
+    assert len(retrieved) == 1
+    assert retrieved[0]["table_id"] == "process.csv"
+    assert [field["name"] for field in retrieved[0]["fields"]] == ["al_n", "steam_flow"]
+
+
+def test_artifact_jsonpath_root_aliases_are_supported(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = store.put("qdi_payload_full", "root-test", {"payload": {"value": 7}})
+
+    root = store.read_excerpt(ref["artifact_id"], json_path="$", max_chars=1000)
+    payload_root = store.read_excerpt(ref["artifact_id"], json_path="$.payload", max_chars=1000)
+    invalid = store.read_excerpt(ref["artifact_id"], json_path="$.missing", max_chars=1000)
+
+    assert root["status"] == payload_root["status"] == "completed"
+    assert json.loads(root["excerpt"]) == {"payload": {"value": 7}}
+    assert json.loads(payload_root["excerpt"]) == {"payload": {"value": 7}}
+    assert invalid["status"] == "not_found"

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import ast
+import hashlib
 from copy import deepcopy
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any
 
 import pandas as pd
@@ -29,23 +31,97 @@ from .models import (
     QuestionInvestigationReport,
     ReadonlyPythonRequest,
 )
-from .prompt_cache import json_block, join_blocks, stable_dynamic_prompt
+from .prompt_cache import dynamic_json_block, json_block, join_blocks, stable_dynamic_prompt
+from .qdi_efficiency import (
+    QDIEvidenceCache, QDINodeResultCache, compile_checks, compact_live_window, extractive_answer,
+    is_compiled_check, question_context, repeated_action_count, request_signature, scoped_timeline,
+)
 from .profiling.csv_utils import infer_csv_dialect, read_csv_auto
+from .profiling.full_scan import (
+    FULL_TABLE_SCAN_VERSION,
+    csv_scan_read_options_from_metadata,
+    csv_scan_read_options_fingerprint,
+    verified_full_scan_population,
+)
 from .profiling.stats import read_table
 from .utils.filesystem import rel
 from .utils.safe_json import write_json_safe
 
 logger = logging.getLogger(__name__)
 
+QDI_CACHE_LAYOUT = "project-evidence-question-route-dynamic-v10"
+QDI_PROJECT_CONTEXT_LAYOUT = "autorealize.qdi_project_context.v10"
+QDI_RETRIEVAL_ACTIONS = {
+    "request_context",
+    "search_document",
+    "read_document_chunks",
+    "read_qdi_artifact_excerpt",
+}
 
-def reconcile_question_memory(memory: dict) -> dict:
+# The local Pydantic model remains the authority for validation.  This compact
+# field guide replaces the much larger generated JSON Schema in the Action
+# prompt; it is intentionally versioned with the QDI cache layout.
+QDI_ACTION_SCHEMA_PROMPT = r"""
+Compact QDI Action JSON protocol. Output one object with required string
+`action`; choose only:
+answer | give_up | request_checks | request_script | request_context |
+search_document | read_document_chunks | read_qdi_artifact_excerpt |
+refine_current_question | mark_duplicate | add_followup_questions.
+
+Common optional fields: question_id, answer, confidence, used_files[],
+evidence[], downstream_notes[], remaining_uncertainty, unresolved_reason,
+what_was_tried[], duplicate_of_question_id, refined_question, notes.
+
+Nested request shapes:
+- request_checks: {"request_checks":[{"kind":"table_profile|key_integrity|join_coverage|time_range","left":{"file":"...","sheet":0,"header":0,"encoding":"utf-8-sig","delimiter":","},"right":{...},"columns":["..."],"right_columns":["..."],"row_limit":50000}]}
+- request_script: {"request_script":{"question_id":"...","goal":"...","reason_builtins_insufficient":"...","input_files":[],"focus_sheets":[],"focus_columns":[],"expected_output":"...","python_code":"def analyze(input_dir: str, scratch_dir: str) -> dict: ..."}}
+- request_context: {"request_context":{"table_ids":[],"input_files":[],"focus_sheets":[],"focus_columns":[],"query":"...","reason":"..."}}
+- search_document: {"search_document":{"query":"...","document_ids":[],"source_files":[],"top_k":5,"reason":"..."}}
+- read_document_chunks: {"read_document_chunks":{"chunk_ids":[],"neighbor_count":1,"reason":"..."}}
+- read_qdi_artifact_excerpt: {"read_qdi_artifact_excerpt":{"artifact_id":"...","offset":0,"max_chars":8000,"json_path":"","reason":"..."}}
+- working_memory_update: {"confirmed_facts":[],"temporary_conclusions":[],"evidence_refs":[],"open_gaps":[],"invalidated_hypotheses":[],"recommended_next_focus":"","resolutions":[{"field":"open_gaps|confirmed_facts|temporary_conclusions","text":"...","evidence_refs":[],"reason":"..."}]}
+- action_digest_updates: [{"sequence":0,"action":"...","what_was_done":"...","key_outputs":[],"temporary_conclusion":"","remaining_gap":"","evidence_refs":[]}]
+- followup_questions: [{"question":"...","reason":"...","why_not_duplicate":"...","candidate_files":[]}]
+
+For `give_up`, `unresolved_reason` must be non-empty. Use only fields needed
+for the selected action; omitted fields are empty defaults.
+""".strip()
+
+
+def reconcile_question_memory(
+    memory: dict,
+    *,
+    verified_full_scans: dict[str, dict[str, Any]] | None = None,
+) -> dict:
     """Keep answered questions with explicit residual uncertainty open in handoffs."""
     result = deepcopy(memory)
+    scan_reconciliation_changed = _reconcile_completed_full_scan_gaps(
+        result,
+        verified_full_scans or {},
+    )
     latest = {answer.get("question_id"): answer for answer in result.get("answers", [])
               if isinstance(answer, dict) and answer.get("question_id")}
     residual = {qid: str(answer.get("remaining_uncertainty") or "").strip()
                 for qid, answer in latest.items() if str(answer.get("remaining_uncertainty") or "").strip()}
     if not residual:
+        if scan_reconciliation_changed:
+            if result.get("summary"):
+                result["summary"] = (
+                    f"已记录 {len(latest)} 个问题的回答，其中 0 个仍有明确不确定性；"
+                    f"保留 {len(result.get('unresolved_questions') or [])} 项未解决事项。"
+                    "回答原文与取证历史保持不变。"
+                )
+            progress = result.get("progress")
+            if isinstance(progress, dict):
+                unresolved_records = {
+                    record.get("question_id")
+                    for record in result.get("question_records", [])
+                    if isinstance(record, dict)
+                    and record.get("status") in {"unresolved", "answered_with_uncertainty"}
+                }
+                progress["answered_questions"] = len(latest)
+                progress["resolved_questions"] = len(latest)
+                progress["unresolved_questions"] = len(unresolved_records)
         return result
     unresolved = list(result.get("unresolved_questions") or [])
     for qid, uncertainty in residual.items():
@@ -74,6 +150,228 @@ def reconcile_question_memory(memory: dict) -> dict:
     return result
 
 
+def _host_verified_full_scan_files(file_summaries: list[Any]) -> dict[str, dict[str, Any]]:
+    """Return only current, host-generated full-scan evidence bound to its source."""
+    verified: dict[str, dict[str, Any]] = {}
+    for summary in file_summaries:
+        path = str(getattr(summary, "path", "") or "").replace("\\", "/").removeprefix("./")
+        metadata = getattr(summary, "source_metadata", None)
+        if not path or not isinstance(metadata, dict):
+            continue
+        scan = metadata.get("full_table_scan")
+        fingerprint = str(metadata.get("source_fingerprint") or "")
+        if (
+            not isinstance(scan, dict)
+            or str(scan.get("file") or "").replace("\\", "/").removeprefix("./") != path
+            or scan.get("scanner_version") != FULL_TABLE_SCAN_VERSION
+            or not fingerprint
+            or scan.get("source_fingerprint") != fingerprint
+        ):
+            continue
+        read_options_fingerprint = csv_scan_read_options_fingerprint(
+            csv_scan_read_options_from_metadata(metadata)
+        )
+        if scan.get("read_options_fingerprint") != read_options_fingerprint:
+            continue
+        if not verified_full_scan_population(
+            scan,
+            source_fingerprint=fingerprint,
+            read_options_fingerprint=read_options_fingerprint,
+        ):
+            continue
+        verified[path] = {
+            "source_fingerprint": fingerprint,
+            "read_options_fingerprint": read_options_fingerprint,
+            "scanner_version": FULL_TABLE_SCAN_VERSION,
+            "column": str(scan.get("column") or ""),
+            "rows_scanned": scan["rows_scanned"],
+            "valid_timestamp_rows": scan["valid_timestamp_rows"],
+            "invalid_timestamp_rows": scan["invalid_timestamp_rows"],
+            "minimum_timestamp": scan.get("minimum_timestamp"),
+            "maximum_timestamp": scan.get("maximum_timestamp"),
+        }
+    return verified
+
+
+def _remove_verified_full_scan_claim(
+    text: Any,
+    scan_files: dict[str, dict[str, Any]],
+    referenced_sources: Any = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    value = str(text or "").strip()
+    if not value or not scan_files:
+        return value, []
+    normalized_references = {
+        str(item).replace("\\", "/").strip().removeprefix("./")
+        for item in referenced_sources
+        if str(item).strip()
+    } if isinstance(referenced_sources, (list, tuple, set)) else set()
+    referenced_matches = normalized_references & scan_files.keys()
+    file_reference_pattern = re.compile(
+        r"`([^`\r\n]+\.(?:csv|xlsx?|xls|jsonl?|parquet|tsv|txt|md|docx?|pdf))`|"
+        r"([^\s`'\"，,；;。()（）]+\.(?:csv|xlsx?|xls|jsonl?|parquet|tsv|txt|md|docx?|pdf))(?=$|[^\w.-])",
+        flags=re.I,
+    )
+    prefix_match = re.match(r"^(\[[^\]]+\]\s*Remaining uncertainty:\s*)", value)
+    prefix = prefix_match.group(1) if prefix_match else ""
+    body = value[len(prefix):] if prefix else value
+    clauses = re.split(r"(?<=[；;。])\s*", body)
+    kept: list[str] = []
+    resolved: list[dict[str, Any]] = []
+    for clause in clauses:
+        clause_text = clause.strip()
+        explicit_matches = [
+            source for source in scan_files
+            if source in clause_text or Path(source).name in clause_text
+        ]
+        file_mentions = [
+            (match.group(1) or match.group(2) or "").replace("\\", "/").strip()
+            for match in file_reference_pattern.finditer(clause_text)
+        ]
+        unknown_file_mention = any(
+            not any(
+                source.casefold() in mention.casefold()
+                or Path(source).name.casefold() in mention.casefold()
+                for source in scan_files
+            )
+            for mention in file_mentions
+        )
+        if unknown_file_mention:
+            matched_sources = set()
+        elif explicit_matches:
+            matched_sources = set(explicit_matches)
+        elif file_mentions:
+            matched_sources = set()
+        else:
+            matched_sources = referenced_matches if len(referenced_matches) == 1 else set()
+        stale_scan_claim = (
+            len(matched_sources) == 1
+            and any(marker in clause_text for marker in ("全表", "完整扫描", "全量扫描"))
+            and any(marker in clause_text for marker in ("未实测", "尚未实测", "尚未完成", "未完成", "仅前", "非全表"))
+            and any(marker in clause_text for marker in ("时间范围", "总行数", "记录数", "时间列"))
+        )
+        if stale_scan_claim:
+            matched_file = next(iter(matched_sources))
+            resolved.append({
+                "claim": clause_text,
+                "source_file": matched_file,
+                "evidence": "completed_full_scan_with_row_count_and_time_range",
+            })
+        elif clause_text:
+            kept.append(clause_text)
+
+    remaining = "；".join(kept).strip()
+    remaining = re.sub(r"^[；;。]\s*|[；;。]\s*$", "", remaining).strip()
+    return f"{prefix}{remaining}" if remaining and prefix else remaining, resolved
+
+
+def _reconcile_completed_full_scan_gaps(
+    memory: dict[str, Any],
+    scan_files: dict[str, dict[str, Any]],
+) -> bool:
+    scans = scan_files
+    if not scans:
+        return False
+    changed = False
+    audit = list(memory.get("evidence_reconciliations") or [])
+    known = {
+        (str(item.get("claim") or ""), str(item.get("source_file") or ""))
+        for item in audit if isinstance(item, dict)
+    }
+
+    def reconcile_text(text: Any, referenced_sources: Any = None) -> str:
+        nonlocal changed
+        remaining, resolved = _remove_verified_full_scan_claim(text, scans, referenced_sources)
+        changed = changed or remaining != str(text or "").strip()
+        for item in resolved:
+            key = (item["claim"], item["source_file"])
+            if key not in known:
+                audit.append({**item, **scans[item["source_file"]]})
+                known.add(key)
+        return remaining
+
+    for answer in memory.get("answers", []) or []:
+        if not isinstance(answer, dict):
+            continue
+        current = answer.get("remaining_uncertainty")
+        remaining = reconcile_text(current, answer.get("used_files"))
+        if remaining != str(current or "").strip():
+            answer.setdefault("historical_remaining_uncertainty", str(current or ""))
+            answer["remaining_uncertainty"] = remaining
+    for record in memory.get("question_records", []) or []:
+        if not isinstance(record, dict):
+            continue
+        current = record.get("unresolved_reason")
+        remaining = reconcile_text(current, record.get("used_files"))
+        if remaining != str(current or "").strip():
+            record.setdefault("historical_unresolved_reason", str(current or ""))
+            record["unresolved_reason"] = remaining
+            if not remaining and record.get("status") == "answered_with_uncertainty":
+                record["status"] = "resolved"
+    answer_sources = {
+        str(answer.get("question_id") or ""): answer.get("used_files")
+        for answer in memory.get("answers", []) or []
+        if isinstance(answer, dict)
+    }
+    record_sources = {
+        str(record.get("question_id") or ""): record.get("used_files")
+        for record in memory.get("question_records", []) or []
+        if isinstance(record, dict)
+    }
+    reconciled_questions = []
+    for question in memory.get("unresolved_questions", []) or []:
+        match = re.match(r"^\[([^\]]+)\]", str(question))
+        question_id = match.group(1) if match else ""
+        remaining = reconcile_text(
+            question,
+            record_sources.get(question_id) or answer_sources.get(question_id),
+        )
+        if remaining:
+            reconciled_questions.append(remaining)
+    new_questions = list(dict.fromkeys(reconciled_questions))
+    changed = changed or new_questions != list(memory.get("unresolved_questions") or [])
+    memory["unresolved_questions"] = new_questions
+    if audit:
+        memory["evidence_reconciliations"] = audit
+    return changed
+
+
+def _prior_qdi_answers_for_prompt(
+    memory: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    raw_answers = memory.get("answers") if isinstance(memory.get("answers"), list) else []
+    bounded_limit = max(0, int(limit))
+    selected = raw_answers[-bounded_limit:] if bounded_limit else []
+    result = []
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+        changed_files = item.get("changed_source_files")
+        if not isinstance(changed_files, list):
+            changed_files = []
+        result.append({
+            "question_id": str(item.get("question_id") or ""),
+            "question": str(item.get("question") or "")[:900],
+            "answer": str(item.get("answer") or "")[:1400],
+            "evidence": [str(value)[:300] for value in evidence[:6]],
+            "confidence": str(item.get("confidence") or "medium"),
+            "remaining_uncertainty": str(item.get("remaining_uncertainty") or "")[:500],
+            "source_status": str(item.get("source_status") or "unknown"),
+            "source_inventory_status": str(item.get("source_inventory_status") or "unknown"),
+            "qdi_contract_status": str(item.get("qdi_contract_status") or "unknown"),
+            "changed_source_files": [str(value)[:180] for value in changed_files[:12]],
+            "task_scope_status": str(item.get("task_scope_status") or "unknown"),
+            "source_task_hint": (
+                str(item.get("source_task_hint") or "")[:240]
+                if item.get("task_scope_status") != "same"
+                else ""
+            ),
+        })
+    return result
+
+
 BUILTIN_TOOL_NAMES = {"custom_readonly_python"}
 QDI_EVIDENCE_ACTIONS = {
     "request_context",
@@ -81,6 +379,7 @@ QDI_EVIDENCE_ACTIONS = {
     "read_document_chunks",
     "read_qdi_artifact_excerpt",
     "request_script",
+    "request_checks",
 }
 
 
@@ -97,6 +396,8 @@ def run_question_investigator(
     constraint_memory: dict,
     authoritative_memory: dict,
     knowledge_base: dict,
+    prior_question_memory: dict | None = None,
+    shared_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run LLM-led cross-file investigation and persist a structured report."""
     report_path = report_dir / "question_investigation_report.json"
@@ -117,6 +418,8 @@ def run_question_investigator(
             constraint_memory=constraint_memory,
             authoritative_memory=authoritative_memory,
             knowledge_base=knowledge_base,
+            prior_question_memory=prior_question_memory or {},
+            shared_cache_dir=shared_cache_dir,
             report_dir=report_dir,
         )
     except Exception as exc:  # noqa: BLE001
@@ -150,11 +453,13 @@ def _run_question_investigator_inner(
     constraint_memory: dict,
     authoritative_memory: dict,
     knowledge_base: dict,
+    prior_question_memory: dict | None = None,
+    shared_cache_dir: Path | None = None,
     report_dir: Path | None = None,
 ) -> dict[str, Any]:
     log_event(logger, "module.data_cognition.investigator", "ACTIVATED")
     planner_prompt = prompt_mgr.load("system/question_investigator_planner.md")
-    answerer_prompt = prompt_mgr.load("system/question_investigator_answerer.md")
+    answerer_prompt = prompt_mgr.load("system/question_investigator_answerer_v7.md")
     artifact_store = ArtifactStore(
         (report_dir or data_root) / "context_artifacts",
         default_visible_limit=int(getattr(cfg.context, "artifact_visible_excerpt_chars", 1200)),
@@ -177,8 +482,56 @@ def _run_question_investigator_inner(
         artifact_store=artifact_store,
     )
     context["document_manifest"] = document_index.manifest_for_prompt()
+    previous = prior_question_memory if isinstance(prior_question_memory, dict) else {}
+    try:
+        prior_answer_limit = max(0, int(getattr(cfg.context, "project_prior_answer_limit", 8)))
+    except (TypeError, ValueError):
+        prior_answer_limit = 8
+    previous_answers = _prior_qdi_answers_for_prompt(previous, prior_answer_limit)
+    raw_source_delta = previous.get("source_delta")
+    if not isinstance(raw_source_delta, dict):
+        raw_source_delta = {}
+    context["prior_qdi_memory"] = {
+        "available": bool(previous_answers),
+        "answers": previous_answers,
+        "source_delta": {
+            "unchanged_files": [str(x)[:180] for x in (raw_source_delta.get("unchanged_files") or [])[:80]],
+            "new_files": [str(x)[:180] for x in (raw_source_delta.get("new_files") or [])[:80]],
+            "changed_files": [str(x)[:180] for x in (raw_source_delta.get("changed_files") or [])[:80]],
+            "removed_files": [str(x)[:180] for x in (raw_source_delta.get("removed_files") or [])[:80]],
+        },
+        "reuse_policy": (
+            "Prior answers are hypotheses, not current task facts. Unchanged source files establish only that "
+            "the cited inputs are unchanged. When task_scope_status is different or unknown, do not inherit "
+            "task-specific conclusions; recheck any conclusion needed for this task against its current contract "
+            "and evidence. Answers with source_status=changed or unknown must also be rechecked. If "
+            "source_inventory_status=changed, compare the question with the new/changed/removed file delta; a "
+            "whole-project conclusion may be stale even when its cited files are unchanged. Reuse only when the "
+            "delta is clearly irrelevant to that question; if relevance is uncertain, recheck it. Answers with "
+            "qdi_contract_status=changed or unknown were produced under a different or unrecorded QDI protocol "
+            "and cannot suppress a current question until their evidence is rechecked. The current question "
+            "still runs through QDI."
+        ),
+    }
     context["context_policy"]["full_document_text_local"] = True
     context["context_policy"]["document_retrieval_actions"] = ["search_document", "read_document_chunks"]
+    verified_full_scans = _host_verified_full_scan_files(file_summaries)
+    # Keep the stable project facts in a deterministic artifact.  Run-specific
+    # task wording and prior-question deltas stay in the dynamic request; if
+    # they were embedded here, a new question would invalidate the provider
+    # prefix and destroy cross-run cache reuse.
+    full_project_context_ref = artifact_store.put(
+        "qdi_project_context_full",
+        "project",
+        context,
+        visible_excerpt=(
+            "完整 QDI 项目上下文；稳定前缀只展示可复用项目卡。需要未展示的精确字段时按 json_path 分段取回。"
+        ),
+        visible_limit=320,
+    )
+    context["_qdi_full_project_context_artifact"] = _artifact_ref_index_for_prompt(
+        full_project_context_ref
+    )
     tools = CrossFileInvestigationTools(
         cfg=cfg,
         data_root=data_root,
@@ -186,11 +539,27 @@ def _run_question_investigator_inner(
         knowledge_base=knowledge_base,
         artifact_store=artifact_store,
     )
+    evidence_cache = QDIEvidenceCache(data_root, shared_cache_dir=shared_cache_dir)
+    node_cache = QDINodeResultCache(shared_cache_dir=shared_cache_dir)
+    cost_controls = {"planner_calls": 0, "action_calls": 0, "direct_answers": 0,
+                     "repetition_terminations": 0, "evidence_cache_hits": 0,
+                     "evidence_cache_local_hits": 0, "evidence_cache_shared_hits": 0,
+                     "questions_skipped_by_authoritative_hint": 0,
+                     "action_static_chars_before_projection": 0, "action_static_chars_sent": 0,
+                     "action_project_context_chars_sent": 0,
+                     "action_question_context_chars_sent": 0,
+                     "action_dynamic_chars_sent": 0,
+                     "planner_project_context_chars_sent": 0,
+                     "planner_question_context_chars_sent": 0,
+                     "qdi_cache_layout": QDI_CACHE_LAYOUT}
 
     all_questions: dict[str, InvestigationQuestion] = {}
     question_records: dict[str, dict[str, Any]] = {}
     queue: list[str] = []
     all_requests: list[InvestigationToolRequest] = []
+    # Counts requested script/check actions, including a rejected check batch.
+    # all_requests remains the list of actually compiled/executed requests.
+    script_actions_total = 0
     all_results: list[InvestigationStepResult] = []
     answers: list[InvestigationAnswer] = []
     unresolved_questions: list[str] = []
@@ -199,7 +568,9 @@ def _run_question_investigator_inner(
     action_digest_cards: list[dict[str, Any]] = []
     action_timeline: list[dict[str, Any]] = []
     working_memory_cards: dict[str, dict[str, Any]] = {}
-    qdi_artifact_ids: set[str] = set()
+    qdi_artifact_ids: set[str] = {
+        str(full_project_context_ref.get("artifact_id") or "")
+    } - {""}
 
     max_total_questions = max(1, int(getattr(cfg.investigation, "max_questions", 5)))
     max_actions_per_question = max(1, int(getattr(cfg.investigation, "max_rounds_per_run", 3)))
@@ -224,6 +595,15 @@ def _run_question_investigator_inner(
     ) -> None:
         if live_report_path is None:
             return
+        cost_controls["evidence_cache_hits"] = evidence_cache.hits
+        cost_controls["evidence_cache_local_hits"] = evidence_cache.local_hits
+        cost_controls["evidence_cache_shared_hits"] = evidence_cache.shared_hits
+        cost_controls.update(node_cache.stats())
+        cost_controls["cache_metrics"] = _qdi_cache_metrics(
+            llm_client=llm_client,
+            node_cache=node_cache,
+            evidence_cache=evidence_cache,
+        )
         live_report = QuestionInvestigationReport(
             enabled=True,
             summary=summary,
@@ -232,11 +612,11 @@ def _run_question_investigator_inner(
             tool_requests=all_requests,
             step_results=all_results,
             answers=answers,
-            unresolved_questions=list(dict.fromkeys(unresolved_questions))[:80],
-            context_routing_notes=list(dict.fromkeys(routing_notes))[:80],
-            question_records=_question_records_for_prompt(question_records),
-            action_history=action_history[:200],
-            action_digest_cards=action_digest_cards[:200],
+            unresolved_questions=list(dict.fromkeys(unresolved_questions)),
+            context_routing_notes=list(dict.fromkeys(routing_notes)),
+            question_records=list(question_records.values()),
+            action_history=action_history,
+            action_digest_cards=action_digest_cards,
             working_memory_cards=list(working_memory_cards.values()),
             progress={
                 "phase": phase,
@@ -251,36 +631,102 @@ def _run_question_investigator_inner(
                 ),
                 "actions": len(action_history),
                 "script_attempts": len(all_results),
+                "cost_controls": dict(cost_controls),
             },
         )
-        _write_report(live_report_path, reconcile_question_memory(live_report.model_dump()))
+        _write_report(
+            live_report_path,
+            reconcile_question_memory(
+                live_report.model_dump(),
+                verified_full_scans=verified_full_scans,
+            ),
+        )
 
     persist_live_report(
         phase="planning",
         summary="QDI 正在根据数据认知结果规划需要进一步核实的问题。",
     )
 
-    stable, dynamic = stable_dynamic_prompt(
-        stable=context,
-        dynamic={
+    planner_project_context = _qdi_project_cache_context(context, cfg)
+    planner_question_context = _qdi_question_cache_context(context, {})
+    planner_segments, planner_stable_context = _qdi_stable_context_segments(
+        planner_project_context,
+        planner_question_context,
+    )
+    stable = "\n\n".join(segment["content"] for segment in planner_segments)
+    planner_dynamic_payload = {
+            "task_hint": _qdi_bounded_text(context.get("task_hint"), 2400),
             "instruction": (
                 "生成本次问题驱动研究的初始问题队列。只提出真正阻塞任务定义、数据读取、文件关联、输出、评估或硬约束落地的问题；"
                 "不要在 planner 阶段请求脚本。把 files 中的 CSV、表格型 JSON、Excel sheet 都按 table/file card 理解；"
                 "file_cognition 只是短导航，权威事实看 authoritative_memory，硬约束和业务规则看 constraint_memory。"
             ),
             "max_questions": max_total_questions,
-            "previous_question_records": [],
-        },
-        stable_title="Stable QDI compact context",
-        dynamic_title="Dynamic initial QDI planning request",
+            "previous_question_records": [
+                {
+                    "question_id": str(item.get("question_id") or ""),
+                    "question": str(item.get("question") or "")[:800],
+                    "status": "historical_answer",
+                    "short_answer": str(item.get("answer") or "")[:1000],
+                    "confidence": str(item.get("confidence") or "medium"),
+                    "source_status": str(item.get("source_status") or "unknown"),
+                    "source_inventory_status": str(item.get("source_inventory_status") or "unknown"),
+                    "qdi_contract_status": str(item.get("qdi_contract_status") or "unknown"),
+                    "task_scope_status": str(item.get("task_scope_status") or "unknown"),
+                    "source_task_hint": str(item.get("source_task_hint") or "")[:240],
+                    "changed_source_files": [str(x)[:180] for x in (item.get("changed_source_files") or [])[:8]],
+                }
+                for item in previous_answers[:30]
+            ],
+            "prior_source_delta": context["prior_qdi_memory"]["source_delta"],
+            "prior_qdi_reuse_policy": context["prior_qdi_memory"]["reuse_policy"],
+            "full_project_context_artifact": context.get("_qdi_full_project_context_artifact", {}),
+    }
+    dynamic = dynamic_json_block(
+        "Dynamic initial QDI planning request",
+        planner_dynamic_payload,
+        planner_stable_context,
     )
-    plan = llm_client.ask_structured(
+    cost_controls["planner_project_context_chars_sent"] = len(planner_segments[0]["content"])
+    cost_controls["planner_question_context_chars_sent"] = len(planner_segments[1]["content"])
+    cost_controls["project_context_projection"] = {
+        "full_context_chars": len(json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)),
+        "stable_project_prefix_chars": len(planner_segments[0]["content"]),
+        "stable_route_segment_chars": len(planner_segments[1]["content"]),
+        "project_prefix_reduction_ratio": round(
+            1
+            - len(planner_segments[0]["content"])
+            / max(1, len(json.dumps(context, ensure_ascii=False, sort_keys=True, default=str))),
+            6,
+        ),
+        "table_index_count": len(planner_project_context.get("table_index") or []),
+        "table_card_count": len(planner_project_context.get("table_cards") or []),
+        "coverage_attention_count": len(
+            (planner_project_context.get("source_coverage_ledger") or {}).get("entries") or []
+        ),
+        "full_project_context_artifact": planner_project_context.get(
+            "full_project_context_artifact", {}
+        ),
+    }
+    cost_controls["planner_calls"] += 1
+    plan = _qdi_structured_call(
+        node_cache=node_cache,
+        cost_controls=cost_controls,
+        llm_client=llm_client,
         model_cls=QuestionInvestigationPlan,
         system_prompt=planner_prompt,
         user_prompt=dynamic,
         prompt_name="question_investigator_initial_questions",
-        static_context_prompt=stable,
+        # Keep the compatibility field limited to the reusable project prefix.
+        # The complete planner routing context is carried by the explicit
+        # stable_context_segments argument below.
+        static_context_prompt=planner_segments[0]["content"],
         dynamic_user_prompt=dynamic,
+        stable_context_segments=planner_segments,
+        max_tokens=max(
+            1024,
+            int(getattr(cfg.investigation, "planner_max_output_tokens", 8192)),
+        ),
     )
     if bool(getattr(cfg.investigation, "adaptive_budgeting", True)):
         if int(plan.recommended_max_questions or 0) > 0:
@@ -303,6 +749,13 @@ def _run_question_investigator_inner(
         ),
     )
     for q in automatic_questions:
+        fixed_reason = _question_fixed_by_task_hint(q, task_hint)
+        if fixed_reason:
+            cost_controls["questions_skipped_by_authoritative_hint"] += 1
+            routing_notes.append(
+                f"[{q.question_id or 'auto'}] skipped: task_hint already fixes this rule ({fixed_reason})."
+            )
+            continue
         qid = _add_question_record(
             question=q,
             all_questions=all_questions,
@@ -326,6 +779,13 @@ def _run_question_investigator_inner(
 
     planner_questions = [] if plan.ready_to_answer else (plan.questions or [])
     for q in planner_questions[: max(0, max_total_questions - len(question_records))]:
+        fixed_reason = _question_fixed_by_task_hint(q, task_hint)
+        if fixed_reason:
+            cost_controls["questions_skipped_by_authoritative_hint"] += 1
+            routing_notes.append(
+                f"[{q.question_id or 'planner'}] skipped: task_hint already fixes this rule ({fixed_reason})."
+            )
+            continue
         qid = _add_question_record(
             question=q,
             all_questions=all_questions,
@@ -371,8 +831,42 @@ def _run_question_investigator_inner(
         summary=f"QDI 已规划 {len(question_records)} 个调查问题，准备逐项核实。",
     )
 
-    seen_request_keys: set[str] = set()
-    answerer_stable_prefix = _qdi_answerer_stable_prefix(context)
+    # Extractive answers never override deterministic verification questions.
+    for proposal in plan.direct_answers:
+        qid = _add_question_record(
+            question=proposal.question, all_questions=all_questions,
+            question_records=question_records, queue=queue, parent_question_id="",
+            depth=0, max_total_questions=max_total_questions,
+        )
+        if not qid:
+            qid = _find_duplicate_question(question_records, proposal.question.question)
+        if not qid or qid.startswith("auto_"):
+            continue
+        quote = extractive_answer(context, proposal)
+        if quote is None:
+            routing_notes.append(f"[{qid}] Planner citation failed exact-source validation; normal investigation retained.")
+            continue
+        if question_records[qid]["status"] == "resolved":
+            continue
+        evidence = ["stable_context:" + proposal.source_pointer]
+        answers.append(InvestigationAnswer(
+            question_id=qid, question=question_records[qid]["question"], answer=quote,
+            evidence=evidence, confidence="medium",
+            downstream_notes=["Exact authority quote selected by planner; no new empirical verification was performed."],
+        ))
+        question_records[qid].update(status="resolved", short_answer=quote, confidence="medium")
+        entry = {"sequence": len(action_history) + 1, "question_id": qid,
+                 "action": "planner_direct_answer", "status": "answered",
+                 "answer": quote, "evidence": evidence}
+        action_history.append(entry)
+        action_timeline.append(entry)
+        cost_controls["direct_answers"] += 1
+
+    completed_question_artifacts: dict[str, dict] = {}
+    full_context_chars = len(stable_dynamic_prompt(stable=context)[0])
+    answerer_project_context = _qdi_project_cache_context(context, cfg)
+    answerer_project_segments, _ = _qdi_stable_context_segments(answerer_project_context, None)
+    answerer_stable_prefix = answerer_project_segments[0]["content"]
     while queue:
         qid = queue.pop(0)
         record = question_records.get(qid)
@@ -401,13 +895,38 @@ def _run_question_investigator_inner(
         context_retrievals_for_question = 0
         document_retrievals_for_question = 0
         artifact_retrievals_for_question = 0
+        retrieval_actions_since_terminal = 0
+        investigation_actions_used = 0
         question_action_ledger: list[dict[str, Any]] = []
         question_live_actions: list[dict[str, Any]] = []
         working_memory = _empty_working_memory_card(qid)
         working_memory_cards[qid] = working_memory
         initial_question = _immutable_question_card(record)
+        answerer_context = question_context(context, initial_question)
+        question_stable_context = _qdi_question_cache_context(context, initial_question, answerer_context)
+        qdi_stable_segments, qdi_stable_context = _qdi_stable_context_segments(
+            answerer_project_context,
+            question_stable_context,
+        )
+        answerer_stable_prefix = qdi_stable_segments[0]["content"]
+        question_stable_prefix = qdi_stable_segments[1]["content"]
 
-        for action_round in range(1, max_actions_per_question + 1):
+        max_context_retrievals = max(
+            0, int(getattr(cfg.investigation, "context_retrievals_per_question", 2))
+        )
+        max_document_retrievals = max(
+            0, int(getattr(cfg.investigation, "document_retrievals_per_question", 4))
+        )
+        max_artifact_retrievals = max(
+            0, int(getattr(cfg.investigation, "artifact_retrievals_per_question", 2))
+        )
+        max_retrieval_actions_before_terminal = max(
+            1, int(getattr(cfg.investigation, "max_retrieval_actions_before_terminal", 1))
+        )
+        max_decision_calls = max_actions_per_question + max_context_retrievals + max_document_retrievals + max_artifact_retrievals
+        for decision_call_index in range(1, max_decision_calls + 1):
+            action_round = investigation_actions_used + 1
+            remaining_investigation_actions = max(0, max_actions_per_question - investigation_actions_used)
             available_actions = _available_qdi_actions(
                 question_records=question_records,
                 current_record=record,
@@ -415,15 +934,12 @@ def _run_question_investigator_inner(
                 context_retrievals_for_question=context_retrievals_for_question,
                 document_retrievals_for_question=document_retrievals_for_question,
                 has_documents=bool(document_index.documents),
-                max_document_retrievals=max(
-                    0, int(getattr(cfg.investigation, "document_retrievals_per_question", 4))
-                ),
+                max_context_retrievals=max_context_retrievals,
+                max_document_retrievals=max_document_retrievals,
                 has_qdi_artifacts=bool(qdi_artifact_ids),
                 artifact_retrievals_for_question=artifact_retrievals_for_question,
-                max_artifact_retrievals=max(
-                    0, int(getattr(cfg.investigation, "artifact_retrievals_per_question", 2))
-                ),
-                total_scripts=len(all_requests),
+                max_artifact_retrievals=max_artifact_retrievals,
+                total_scripts=script_actions_total,
                 max_scripts_per_question=max_scripts_per_question,
                 max_scripts_total=max_scripts_total,
                 max_total_questions=max_total_questions,
@@ -431,11 +947,42 @@ def _run_question_investigator_inner(
                 max_followups_per_question=max_followups_per_question,
                 allow_custom_readonly_python=bool(getattr(cfg.investigation, "allow_custom_readonly_python", True)),
             )
-            if action_round >= max_actions_per_question:
+            retrieval_continuation_actions = _qdi_retrieval_continuation_actions(
+                question_live_actions,
+                document_retrievals_for_question=document_retrievals_for_question,
+                max_document_retrievals=max_document_retrievals,
+                artifact_retrievals_for_question=artifact_retrievals_for_question,
+                max_artifact_retrievals=max_artifact_retrievals,
+            )
+            if (
+                context_retrievals_for_question
+                and max_retrieval_actions_before_terminal <= 1
+            ):
+                available_actions = [
+                    action for action in available_actions if action != "request_context"
+                ]
+            available_actions = _apply_qdi_retrieval_action_policy(
+                available_actions,
+                retrieval_actions_since_terminal=retrieval_actions_since_terminal,
+                max_retrieval_actions_before_terminal=max_retrieval_actions_before_terminal,
+                continuation_actions=retrieval_continuation_actions,
+            )
+            if remaining_investigation_actions <= 1:
                 available_actions = _terminal_qdi_actions(available_actions)
+                available_actions = _apply_qdi_retrieval_action_policy(
+                    available_actions,
+                    retrieval_actions_since_terminal=retrieval_actions_since_terminal,
+                    max_retrieval_actions_before_terminal=max_retrieval_actions_before_terminal,
+                    continuation_actions=retrieval_continuation_actions,
+                )
+            repetition_limit = max(0, int(getattr(cfg.investigation, "max_repeated_actions", 2)))
+            repetition_exhausted = bool(repetition_limit and repeated_action_count(question_live_actions) >= repetition_limit)
+            if repetition_exhausted:
+                available_actions = ["answer", "give_up"]
+                cost_controls["repetition_terminations"] += 1
             persist_live_report(
                 phase="deciding_action",
-                summary=f"QDI 正在为问题 {qid} 决定第 {action_round} 个调查动作。",
+                summary=f"QDI 正在为问题 {qid} 执行第 {decision_call_index} 次动作决策（调查动作槽 {action_round}）。",
                 current_question_id=qid,
                 current_action="decide_next_action",
                 action_round=action_round,
@@ -445,60 +992,74 @@ def _run_question_investigator_inner(
                 action_digest_cards,
                 qid,
             )
-            dynamic = join_blocks(
-                json_block("1. Append-only action and digest timeline", action_timeline),
-                json_block("2. Current evidence-linked working memory", working_memory),
-                json_block(
-                    "3. Recent live action window",
-                    _recent_action_window(
-                        question_live_actions,
-                        count=int(getattr(cfg.investigation, "recent_action_count", 3)),
+            dynamic_payload = {
+                "decision_state": _qdi_decision_state(
+                    initial_question=initial_question,
+                    record=record,
+                    question_records=question_records,
+                    question_live_actions=question_live_actions,
+                    action_digest_cards=action_digest_cards,
+                    working_memory=working_memory,
+                    current_question_id=qid,
+                    available_actions=available_actions,
+                    pending_action_digest_requests=pending_digest_requests,
+                    investigation_actions_used=investigation_actions_used,
+                    remaining_investigation_actions=remaining_investigation_actions,
+                    max_actions_per_question=max_actions_per_question,
+                    scripts_for_question=scripts_for_question,
+                    script_actions_total=script_actions_total,
+                    max_scripts_per_question=max_scripts_per_question,
+                    max_scripts_total=max_scripts_total,
+                    context_retrievals_for_question=context_retrievals_for_question,
+                    max_context_retrievals=max_context_retrievals,
+                    document_retrievals_for_question=document_retrievals_for_question,
+                    max_document_retrievals=max_document_retrievals,
+                    artifact_retrievals_for_question=artifact_retrievals_for_question,
+                    max_artifact_retrievals=max_artifact_retrievals,
+                    retrieval_actions_since_terminal=retrieval_actions_since_terminal,
+                    max_retrieval_actions_before_terminal=max_retrieval_actions_before_terminal,
+                    retrieval_continuation_actions=retrieval_continuation_actions,
+                    decision_call_index=decision_call_index,
+                    max_decision_calls=max_decision_calls,
+                    max_total_questions=max_total_questions,
+                    max_depth=max_depth,
+                    max_output_chars=max_output_chars,
+                    task_hint=_qdi_bounded_text(context.get("task_hint"), 1600),
+                    full_project_context_artifact=context.get(
+                        "_qdi_full_project_context_artifact", {}
                     ),
+                    repetition_exhausted=repetition_exhausted,
+                    cfg=cfg,
                 ),
-                json_block("4. Compact question ledger", _question_records_for_prompt(question_records)),
-                json_block("5. Current dynamic action state", {
-                    "instruction": (
-                        "基于当前证据回答、继续探查或标记未解决。action_timeline 是动作与摘要组成的追加式轨迹，"
-                        "recent_action_window 是最近动作的精确可见区，working_memory 是证据关联的累计认知。"
-                        "任何 truncated=true 的内容都不得根据未显示部分推断；需要旧 QDI 证据时可分段读取其 artifact。"
-                        "不要为了保留历史而复写旧脚本；需要文档原文时优先 search_document/read_document_chunks。"
-                    ),
-                    "available_actions": available_actions,
-                    "pending_action_digest_requests": pending_digest_requests,
-                    "remaining_script_requests": max(0, max_scripts_total - len(all_requests)),
-                    "remaining_followup_questions": max(0, max_total_questions - len(question_records)),
-                    "current_depth": int(record.get("depth", 0) or 0),
-                    "max_depth": max_depth,
-                    "max_output_len": max_output_chars,
-                    "current_question": record,
-                    "initial_question": initial_question,
-                    "context_retrieval_policy": (
-                        "Use evidence already visible in stable table_cards, including schema, statistics, "
-                        "reading notes and warnings. Choose request_context only for missing, truncated "
-                        "or insufficient-scope evidence; its excerpt appears in recent_action_window next turn."
-                    ),
-                    "action_round": action_round,
-                    "action_policy": {
-                        "do_not_add_duplicate_questions": True,
-                        "use_mark_duplicate_when_needed": True,
-                        "use_refine_current_question_only_for_narrow_rewording": True,
-                        "do_not_print_full_tables_in_scripts": True,
-                        "script_results_are_artifact_backed": True,
-                        "document_retrieval_does_not_consume_script_budget": True,
-                        "artifact_retrieval_does_not_consume_script_or_repair_budget": True,
-                        "working_memory_is_interpretive_not_authoritative": True,
-                        "every_pending_action_digest_must_be_returned": True,
-                        "final_round_allows_terminal_actions_only": action_round >= max_actions_per_question,
-                    },
-                }),
+            }
+            dynamic = dynamic_json_block(
+                "Dynamic QDI action",
+                dynamic_payload,
+                qdi_stable_context,
+                preserve_string_keys={"question"},
             )
-            action = llm_client.ask_structured(
+            cost_controls["action_calls"] += 1
+            cost_controls["action_static_chars_before_projection"] += full_context_chars
+            cost_controls["action_static_chars_sent"] += len(answerer_stable_prefix) + len(question_stable_prefix)
+            cost_controls["action_project_context_chars_sent"] += len(answerer_stable_prefix)
+            cost_controls["action_question_context_chars_sent"] += len(question_stable_prefix)
+            cost_controls["action_dynamic_chars_sent"] += len(dynamic)
+            action = _qdi_structured_call(
+                node_cache=node_cache,
+                cost_controls=cost_controls,
+                llm_client=llm_client,
                 model_cls=QuestionInvestigationAction,
-                system_prompt=answerer_prompt,
+                    system_prompt=answerer_prompt,
                 user_prompt=dynamic,
-                prompt_name="question_investigator_action",
+                    prompt_name="question_investigator_action",
                 static_context_prompt=answerer_stable_prefix,
                 dynamic_user_prompt=dynamic,
+                stable_context_segments=qdi_stable_segments,
+                schema_prompt=QDI_ACTION_SCHEMA_PROMPT,
+                max_tokens=max(
+                    1024,
+                    int(getattr(cfg.investigation, "action_max_output_tokens", 6144)),
+                ),
             )
             action_name = str(action.action or "").strip().lower()
             log_event(
@@ -529,6 +1090,10 @@ def _run_question_investigator_inner(
             )
             entry = _compact_action_history(qid, action_name, "selected", action)
             entry["sequence"] = len(action_history) + 1
+            action_ref = artifact_store.put(
+                "qdi_action_full", f"{qid}:action:{entry['sequence']}", action.model_dump(),
+            )
+            entry["action_artifact_ref"] = _artifact_ref_index_for_prompt(action_ref)
             action_history.append(entry)
             question_action_ledger.append(entry)
             action_timeline.append(entry)
@@ -540,6 +1105,7 @@ def _run_question_investigator_inner(
                 artifact_store=artifact_store,
                 script_chars=int(getattr(cfg.investigation, "recent_script_chars", 12000)),
             )
+            live_entry["action_artifact_ref"] = entry["action_artifact_ref"]
             question_live_actions.append(live_entry)
             qdi_artifact_ids.update(_artifact_ids_in(live_entry))
             working_memory = _merge_working_memory_card(
@@ -548,6 +1114,11 @@ def _run_question_investigator_inner(
                 sequence=entry["sequence"],
                 max_chars=int(getattr(cfg.investigation, "working_memory_max_chars", 12000)),
             )
+            memory_ref = artifact_store.put(
+                "qdi_working_memory_full", f"{qid}:action:{entry['sequence']}", working_memory,
+            )
+            working_memory["_full_memory_artifact"] = _artifact_ref_index_for_prompt(memory_ref)
+            qdi_artifact_ids.add(memory_ref["artifact_id"])
             working_memory_cards[qid] = working_memory
             persist_live_report(
                 phase="executing_action",
@@ -564,6 +1135,12 @@ def _run_question_investigator_inner(
                 unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
                 break
 
+            if action_name in QDI_RETRIEVAL_ACTIONS:
+                retrieval_actions_since_terminal += 1
+
+            if action_name not in {"request_context", "search_document", "read_document_chunks", "read_qdi_artifact_excerpt"}:
+                investigation_actions_used += 1
+
             if action_name == "answer":
                 entry["status"] = "answered"
                 live_entry["observation"] = _bounded_json_view(
@@ -579,18 +1156,18 @@ def _run_question_investigator_inner(
                     question_id=qid,
                     question=str(record.get("question", "")),
                     answer=str(action.answer or ""),
-                    evidence=[str(x) for x in (action.evidence or [])[:12]],
+                    evidence=[str(x) for x in (action.evidence or [])],
                     confidence=str(action.confidence or "medium"),
                     remaining_uncertainty=str(action.remaining_uncertainty or ""),
-                    downstream_notes=[str(x) for x in (action.downstream_notes or [])[:12]],
+                    downstream_notes=[str(x) for x in (action.downstream_notes or [])],
                 )
                 answers.append(answer)
                 record.update(
                     {
                         "status": "resolved",
-                        "short_answer": answer.answer[:1200],
+                        "short_answer": answer.answer,
                         "confidence": answer.confidence,
-                        "used_files": [str(x) for x in (action.used_files or [])[:20]],
+                        "used_files": [str(x) for x in (action.used_files or [])],
                     }
                 )
                 _add_followups_from_action(
@@ -608,11 +1185,11 @@ def _run_question_investigator_inner(
             if action_name == "give_up":
                 entry["status"] = "given_up"
                 live_entry["observation"] = {
-                    "unresolved_reason": str(action.unresolved_reason or action.remaining_uncertainty or "")[:2000],
-                    "what_was_tried": [str(x)[:500] for x in (action.what_was_tried or [])[:12]],
+                    "unresolved_reason": str(action.unresolved_reason or action.remaining_uncertainty or ""),
+                    "what_was_tried": [str(x) for x in (action.what_was_tried or [])],
                 }
                 reason = str(action.unresolved_reason or action.remaining_uncertainty or "Evidence is insufficient.").strip()
-                record.update({"status": "unresolved", "unresolved_reason": reason[:1200]})
+                record.update({"status": "unresolved", "unresolved_reason": reason})
                 unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {reason}")
                 routing_notes.append(
                     f"[{qid}] Downstream agents must not assert facts that depend on this unresolved QDI question."
@@ -638,11 +1215,11 @@ def _run_question_investigator_inner(
             if action_name == "refine_current_question":
                 refined = str(action.refined_question or "").strip()
                 if refined:
-                    record["question"] = refined[:1000]
-                    question.question = refined[:1000]
+                    record["question"] = refined
+                    question.question = refined
                     record["status"] = "refined"
                 entry["status"] = "question_refined"
-                live_entry["observation"] = {"refined_question": refined[:1000]}
+                live_entry["observation"] = {"refined_question": refined}
                 continue
 
             if action_name == "add_followup_questions":
@@ -689,6 +1266,7 @@ def _run_question_investigator_inner(
                     result="context_retrieved",
                     retrieved_tables=[str(card.get("table_id") or card.get("source_file") or "") for card in retrieved],
                 )
+                live_entry["status"] = "context_retrieved"
                 live_entry["observation"] = _artifact_backed_observation(
                     retrieval_result,
                     artifact_store=artifact_store,
@@ -696,6 +1274,14 @@ def _run_question_investigator_inner(
                     source=f"{qid}:action:{entry['sequence']}",
                     max_chars=int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
                 )
+                # A context request exposes the original profile references as well
+                # as the bounded card view, including fields absent from that view.
+                live_entry["source_profile_artifacts"] = [
+                    _artifact_ref_index_for_prompt(ref)
+                    for card in retrieved for ref in (card.get("artifact_refs") or [])
+                    if isinstance(ref, dict)
+                    and ref.get("artifact_type") in {"file_profile_full", "excel_sheet_profile_full"}
+                ]
                 qdi_artifact_ids.update(_artifact_ids_in(live_entry))
                 continue
 
@@ -712,7 +1298,21 @@ def _run_question_investigator_inner(
                         max(1, int(request.top_k or 0)),
                         max(1, int(getattr(cfg.investigation, "document_search_top_k", 5))),
                     ),
+                    excerpt_chars=500,
                 )
+                matches = result.get("matches", [])
+                live_entry["continuation_chunk_ids"] = [
+                    str(match.get("chunk_id") or "")
+                    for match in matches
+                    if isinstance(match, dict) and str(match.get("chunk_id") or "").strip()
+                ]
+                if matches:
+                    # One deterministic search can also deliver exact nearby text.
+                    result["source_context"] = document_index.read_chunks(
+                        [matches[0]["chunk_id"]], neighbor_count=1, max_chunks=3,
+                        max_chars=min(5000, max(1, int(getattr(
+                            cfg.investigation, "document_retrieval_max_chars", 12000)))),
+                    )
                 document_retrievals_for_question += 1
                 question_action_ledger[-1].update(
                     status="document_searched",
@@ -729,10 +1329,13 @@ def _run_question_investigator_inner(
                         for match in result.get("matches", [])
                     ],
                 )
-                live_entry["observation"] = _bounded_json_view(
-                    result,
-                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                live_entry["status"] = "document_searched"
+                live_entry["observation"] = _artifact_backed_observation(
+                    result, artifact_store=artifact_store,
+                    artifact_type="qdi_document_search_full", source=f"{qid}:search:{entry['sequence']}",
+                    max_chars=int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
                 )
+                qdi_artifact_ids.update(_artifact_ids_in(live_entry))
                 continue
 
             if action_name == "read_document_chunks":
@@ -761,10 +1364,15 @@ def _run_question_investigator_inner(
                     ],
                     truncated=bool(result.get("truncated")),
                 )
-                live_entry["observation"] = _bounded_json_view(
+                live_entry["status"] = "document_chunks_read"
+                live_entry["observation"] = _artifact_backed_observation(
                     result,
-                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
+                    artifact_store=artifact_store,
+                    artifact_type="qdi_document_chunks_full",
+                    source=f"{qid}:document_chunks:{entry['sequence']}",
+                    max_chars=int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
                 )
+                qdi_artifact_ids.update(_artifact_ids_in(live_entry))
                 continue
 
             if action_name == "read_qdi_artifact_excerpt":
@@ -787,6 +1395,7 @@ def _run_question_investigator_inner(
                             max(1, int(getattr(cfg.investigation, "artifact_retrieval_max_chars", 8000))),
                         ),
                         json_path=str(request.json_path or ""),
+                        allowed_type_prefixes=("qdi_", "file_profile_full", "excel_sheet_profile_full"),
                     )
                 artifact_retrievals_for_question += 1
                 entry.update(
@@ -798,42 +1407,34 @@ def _run_question_investigator_inner(
                     has_more=bool(result.get("has_more")),
                     error=str(result.get("error") or "")[:500],
                 )
-                live_entry["observation"] = _bounded_json_view(
-                    result,
-                    int(getattr(cfg.investigation, "recent_retrieval_chars", 8000)),
-                )
+                live_entry["status"] = entry["status"]
+                # read_excerpt already enforces its own bound and next_offset. A second
+                # preview clip would hide bytes that the cursor claims were delivered.
+                live_entry["observation"] = result
                 continue
 
-            if action_name == "request_script":
+            if action_name in {"request_script", "request_checks"}:
                 entry["digest_policy"] = "summary_follows_as_separate_timeline_event"
-                script_req = action.request_script
-                script_req.question_id = script_req.question_id or qid
-                script_req.goal = script_req.goal or str(action.notes or record.get("question", ""))
-                req = InvestigationToolRequest(
-                    request_id="",
-                    question_id=qid,
-                    tool_name="custom_readonly_python",
-                    reason=script_req.goal or script_req.expected_output or script_req.reason_builtins_insufficient,
-                    params={},
-                    custom_python=script_req,
-                )
-                req = _normalize_request(req, len(all_requests) + 1)
-                key = _request_signature(req)
-                if key in seen_request_keys:
-                    current_result = InvestigationStepResult(
-                        request_id=f"{req.request_id}_duplicate",
-                        question_id=qid,
-                        tool_name="custom_readonly_python",
-                        status="failed",
-                        reason="duplicate_script_request",
-                        error="duplicate_script_request",
-                    )
-                    entry["status"] = "duplicate_script_request"
-                    live_entry["observation"] = {"status": "failed", "error": "duplicate_script_request"}
-                    continue
-                seen_request_keys.add(key)
-                all_requests.append(req)
                 scripts_for_question += 1
+                script_actions_total += 1
+                if action_name == "request_checks":
+                    try:
+                        req = compile_checks(action.request_checks, qid)
+                    except ValueError as exc:
+                        entry["status"] = "invalid_check_request"
+                        live_entry["observation"] = {"status": "failed", "error": str(exc)}
+                        continue
+                else:
+                    script_req = action.request_script
+                    script_req.question_id = qid
+                    script_req.goal = script_req.goal or str(action.notes or record.get("question", ""))
+                    req = InvestigationToolRequest(
+                        question_id=qid, tool_name="custom_readonly_python",
+                        reason=script_req.goal or script_req.expected_output or script_req.reason_builtins_insufficient,
+                        custom_python=script_req,
+                    )
+                req = _normalize_request(req, len(all_requests) + 1)
+                all_requests.append(req)
                 attempt_results, final_req = _execute_request_with_repair(
                     req=req,
                     tools=tools,
@@ -842,12 +1443,15 @@ def _run_question_investigator_inner(
                     cfg=cfg,
                     context=context,
                     table_card_details=table_card_details,
-                    previous_questions=_question_records_for_prompt(question_records),
+                    previous_questions=list(question_records.values()),
                     artifact_store=artifact_store,
+                    evidence_cache=evidence_cache,
                 )
                 current_request = final_req
                 all_results.extend(attempt_results)
                 current_result = attempt_results[-1]
+                if current_result.result.get("_evidence_reuse"):
+                    entry["evidence_reuse"] = current_result.result["_evidence_reuse"]
                 visible = _visible_output_payload(current_result.result, max_output_chars)
                 stored_result_ref = (
                     current_result.result.get("_full_result_artifact", {})
@@ -881,7 +1485,8 @@ def _run_question_investigator_inner(
                     request_id=current_result.request_id,
                     question_id=current_result.question_id,
                     attempts=len(attempt_results),
-                    error=current_result.error[:240],
+                    error=str(current_result.error or "")[:240],
+                    retryable=current_result.status != "completed",
                 )
                 persist_live_report(
                     phase="script_completed" if current_result.status == "completed" else "script_failed",
@@ -898,8 +1503,31 @@ def _run_question_investigator_inner(
 
         if record.get("status") in {"investigating", "refined"}:
             record["status"] = "unresolved"
-            record["unresolved_reason"] = "QDI action rounds exhausted before a final answer."
+            record["unresolved_reason"] = "QDI investigation-action budget exhausted before a final answer."
             unresolved_questions.append(f"[{qid}] {record['question']} unresolved: {record['unresolved_reason']}")
+
+        record["budget_usage"] = {
+            "investigation_actions_used": investigation_actions_used,
+            "investigation_action_limit": max_actions_per_question,
+            "model_action_decisions": decision_call_index,
+            "model_action_decision_limit": max_decision_calls,
+            "script_requests": scripts_for_question,
+            "context_retrievals": context_retrievals_for_question,
+            "document_retrievals": document_retrievals_for_question,
+            "artifact_retrievals": artifact_retrievals_for_question,
+            "retrieval_actions_since_terminal": retrieval_actions_since_terminal,
+            "max_retrieval_actions_before_terminal": max_retrieval_actions_before_terminal,
+        }
+
+        history_ref = artifact_store.put(
+            "qdi_question_history_full", qid,
+            {"timeline": scoped_timeline(action_timeline, qid), "live_actions": question_live_actions,
+             "working_memory": working_memory, "question": record},
+        )
+        history_ref_index = _artifact_ref_index_for_prompt(history_ref)
+        completed_question_artifacts[qid] = history_ref_index
+        record["history_artifact_ref"] = history_ref_index
+        qdi_artifact_ids.add(history_ref["artifact_id"])
 
         log_event(
             logger,
@@ -923,6 +1551,9 @@ def _run_question_investigator_inner(
         f"未解决 {len([r for r in question_records.values() if r.get('status') == 'unresolved'])} 个，"
         f"执行脚本 {len(all_results)} 次。"
     )
+    cost_controls["evidence_cache_hits"] = evidence_cache.hits
+    cost_controls["evidence_cache_local_hits"] = evidence_cache.local_hits
+    cost_controls["evidence_cache_shared_hits"] = evidence_cache.shared_hits
     report = QuestionInvestigationReport(
         enabled=True,
         summary=summary,
@@ -931,11 +1562,11 @@ def _run_question_investigator_inner(
         tool_requests=all_requests,
         step_results=all_results,
         answers=answers,
-        unresolved_questions=list(dict.fromkeys(unresolved_questions))[:80],
-        context_routing_notes=list(dict.fromkeys(routing_notes))[:80],
-        question_records=_question_records_for_prompt(question_records),
-        action_history=action_history[:200],
-        action_digest_cards=action_digest_cards[:200],
+        unresolved_questions=list(dict.fromkeys(unresolved_questions)),
+        context_routing_notes=list(dict.fromkeys(routing_notes)),
+        question_records=list(question_records.values()),
+        action_history=action_history,
+        action_digest_cards=action_digest_cards,
         working_memory_cards=list(working_memory_cards.values()),
         progress={
             "phase": "completed",
@@ -950,6 +1581,7 @@ def _run_question_investigator_inner(
             ),
             "actions": len(action_history),
             "script_attempts": len(all_results),
+            "cost_controls": dict(cost_controls),
         },
     )
     log_event(
@@ -960,7 +1592,10 @@ def _run_question_investigator_inner(
         scripts=len(report.step_results),
         answers=len(report.answers),
     )
-    return reconcile_question_memory(report.model_dump())
+    return reconcile_question_memory(
+        report.model_dump(),
+        verified_full_scans=verified_full_scans,
+    )
 
 
 def _execute_request_with_repair(
@@ -974,17 +1609,48 @@ def _execute_request_with_repair(
     table_card_details: dict[str, dict[str, Any]] | None = None,
     previous_questions: list[dict[str, Any]] | None = None,
     artifact_store: ArtifactStore | None = None,
+    evidence_cache: QDIEvidenceCache | None = None,
 ) -> tuple[list[InvestigationStepResult], InvestigationToolRequest]:
     max_retries = max(0, int(getattr(cfg.investigation, "custom_python_max_retries", 3)))
     results: list[InvestigationStepResult] = []
     current = req
+    if is_compiled_check(req):
+        max_retries = 0  # Fixed code is not rewritten by an LLM; fix parameters next round.
     for attempt in range(max_retries + 1):
         if attempt > 0 and not current.request_id.endswith(f"_retry{attempt + 1}"):
             current.request_id = f"{req.request_id}_retry{attempt + 1}"
-        result = tools.execute(current)
+        cache_key = evidence_cache.key(current) if evidence_cache is not None else None
+        result = evidence_cache.get(cache_key, current) if evidence_cache is not None else None
+        deterministic_pending = False
+        if result is None:
+            result = tools.execute(current)
+            if result.status != "completed":
+                deterministic = _deterministic_script_repair(current, result)
+                if deterministic is not None:
+                    deterministic_pending = True
+            if deterministic_pending:
+                result.result["deterministic_repair"] = {
+                    "rule": "os_path_join_to_pathlib",
+                    "status": "applied",
+                    "llm_repair_call_avoided": True,
+                }
+                result.result.setdefault("attempt", attempt + 1)
+                results.append(result)
+                current = deterministic
+                continue
+            # A source mutation during execution invalidates the result for reuse.
+            if evidence_cache is not None and cache_key == evidence_cache.key(current):
+                evidence_cache.put(cache_key, result)
         result.result.setdefault("attempt", attempt + 1)
         results.append(result)
         if result.status == "completed":
+            return results, current
+        if (result.error == "custom_python_result_size_limit_exceeded"
+                or (isinstance(result.result, dict)
+                    and result.result.get("error") == "custom_python_result_size_limit_exceeded")):
+            # The host deliberately refused to persist a partial JSON value. A
+            # repair model cannot recover the missing tail; the next QDI action
+            # must choose a smaller aggregate or a scoped script.
             return results, current
         if attempt >= max_retries:
             return results, current
@@ -1028,6 +1694,13 @@ def _execute_request_with_repair(
                     "question": _question_text(previous_questions or [], current.question_id),
                     "previous_request": current.custom_python.model_dump(),
                     "failed_result": _failed_result_for_prompt(result, artifact_store=artifact_store),
+                    "repair_budget": {
+                        "used": attempt,
+                        "remaining_including_this_attempt": max_retries - attempt,
+                        "limit": max_retries,
+                        "does_not_consume_investigation_action_or_script_request_quota": True,
+                        "model_call_still_has_token_cost": True,
+                    },
                     "repair_instruction": "Return a corrected ReadonlyPythonRequest. Keep the same question_id and only change python_code/input_files/expected_output if needed.",
                 },
                 stable_title="Stable read-only script repair context",
@@ -1064,6 +1737,156 @@ def _execute_request_with_repair(
     return results, current
 
 
+def _deterministic_script_repair(
+    request: InvestigationToolRequest,
+    result: InvestigationStepResult,
+) -> InvestigationToolRequest | None:
+    """Convert a bounded set of read-only ``os.path`` calls to pathlib."""
+    if not request.custom_python or not result.error:
+        return None
+    if result.error != "custom_python_static_validation_failed":
+        return None
+    issues = result.result.get("issues") if isinstance(result.result, dict) else None
+    if not isinstance(issues, list) or "banned_import:os" not in issues:
+        return None
+    code = str(request.custom_python.python_code or "")
+    if not code:
+        return None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    import_nodes: list[ast.Import] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        if any(alias.name == "os" for alias in node.names):
+            if any(alias.name == "os" and alias.asname for alias in node.names):
+                return None
+            import_nodes.append(node)
+    if not import_nodes:
+        return None
+
+    replacements: list[tuple[ast.Call, str]] = []
+    os_loads = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and node.id == "os" and isinstance(node.ctx, ast.Load)]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.keywords:
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "path"
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == "os"
+        ):
+            continue
+        method = func.attr
+        if method == "join" and len(node.args) >= 2:
+            if not isinstance(node.args[0], ast.Name) or node.args[0].id not in {"input_dir", "scratch_dir"}:
+                return None
+            parts = [ast.get_source_segment(code, arg) for arg in node.args]
+            if any(part is None for part in parts):
+                return None
+            expression = f"Path({parts[0]})"
+            for part in parts[1:]:
+                expression += f" / ({part})"
+            replacements.append((node, f"str({expression})"))
+        elif method in {"exists", "isfile", "isdir", "getsize"} and len(node.args) == 1:
+            argument = ast.get_source_segment(code, node.args[0])
+            if argument is None:
+                return None
+            path_expr = f"Path({argument})"
+            if method == "getsize":
+                replacement = f"{path_expr}.stat().st_size"
+            else:
+                path_method = {"exists": "exists", "isfile": "is_file", "isdir": "is_dir"}[method]
+                replacement = f"{path_expr}.{path_method}()"
+            replacements.append((node, replacement))
+        else:
+            # Leave ambiguous path operations to model repair.
+            continue
+
+    if not replacements:
+        return None
+
+    matched_os_loads = {
+        id(node.func.value.value)
+        for node, _ in replacements
+        if isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+    }
+    if len(os_loads) != len(matched_os_loads) or {id(node) for node in os_loads} != matched_os_loads:
+        return None
+
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    byte_cursor = 0
+    for line in lines:
+        line_offsets.append(byte_cursor)
+        byte_cursor += len(line.encode("utf-8"))
+    source_bytes = code.encode("utf-8")
+
+    def span(node: ast.AST) -> tuple[int, int]:
+        start = line_offsets[node.lineno - 1] + node.col_offset
+        end = line_offsets[node.end_lineno - 1] + node.end_col_offset
+        return start, end
+
+    edits: list[tuple[int, int, bytes]] = []
+    for node, replacement in replacements:
+        start, end = span(node)
+        edits.append((start, end, replacement.encode("utf-8")))
+
+    for node in import_nodes:
+        start, end = span(node)
+        remaining = [alias for alias in node.names if alias.name != "os"]
+        if remaining:
+            rendered = "import " + ", ".join(
+                alias.name + (f" as {alias.asname}" if alias.asname else "")
+                for alias in remaining
+            )
+            edits.append((start, end, rendered.encode("utf-8")))
+        else:
+            edits.append((start, end, b""))
+
+    has_path_import = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "pathlib"
+        and any(alias.name == "Path" and (alias.asname or "Path") == "Path" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    if not has_path_import:
+        leading = []
+        for node in tree.body:
+            is_docstring = (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                and not leading
+            )
+            is_future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            if is_docstring or is_future:
+                leading.append(node)
+                continue
+            break
+        insert_at = span(leading[-1])[1] if leading else 0
+        insertion = b"\nfrom pathlib import Path\n" if insert_at else b"from pathlib import Path\n"
+        edits.append((insert_at, insert_at, insertion))
+
+    for start, end, replacement in sorted(edits, key=lambda item: (item[0], item[1]), reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    repaired = source_bytes.decode("utf-8")
+    remaining = validate_custom_readonly_python(repaired)
+    if not remaining:
+        copied = deepcopy(request)
+        copied.custom_python.python_code = repaired
+        return copied
+    return None
+
+
 def _add_question_record(
     *,
     question: InvestigationQuestion,
@@ -1083,15 +1906,17 @@ def _add_question_record(
     if duplicate:
         return ""
     qid = str(question.question_id or "").strip() or f"q{len(question_records) + 1}"
+    next_id = len(question_records) + 1
     while qid in question_records:
-        qid = f"q{len(question_records) + 1}"
+        qid = f"q{next_id}"
+        next_id += 1
     question.question_id = qid
     question.parent_question_id = parent_question_id
     question.depth = int(depth)
     all_questions[qid] = question
     question_records[qid] = {
         "question_id": qid,
-        "question": qtext[:1000],
+        "question": qtext,
         "status": "pending",
         "short_answer": "",
         "unresolved_reason": "",
@@ -1101,11 +1926,51 @@ def _add_question_record(
         "depth": int(depth),
         "category": str(question.category or ""),
         "priority": str(question.priority or "medium"),
-        "candidate_files": [str(x) for x in (question.candidate_files or [])[:20]],
-        "why_blocking": str(question.why_blocking or "")[:800],
+        "candidate_files": [str(x) for x in (question.candidate_files or [])],
+        "why_blocking": str(question.why_blocking or ""),
     }
     queue.append(qid)
     return qid
+
+
+def _question_fixed_by_task_hint(
+    question: InvestigationQuestion,
+    task_hint: str,
+) -> str:
+    """Return a reason when the user has already fixed the requested rule.
+
+    QDI is for unresolved evidence gaps. Re-asking for a decision that is
+    explicitly stated in the user's task hint creates expensive, contradictory
+    history and often turns a known constraint into an artificial open issue.
+    The checks below are intentionally narrow and only suppress a question
+    when the hint contains the corresponding positive rule.
+    """
+
+    qtext = str(getattr(question, "question", "") or "").strip().lower()
+    hint = str(task_hint or "").strip().lower()
+    if not qtext or not hint:
+        return ""
+
+    if (
+        ("聚合" in qtext or "平均" in qtext or "重复时间" in qtext or "同一采样时间" in qtext)
+        and "算术平均" in hint
+        and ("同一采样时间" in hint or "重复" in hint)
+    ):
+        return "label aggregation is explicitly arithmetic mean"
+    if (
+        ("划分" in qtext or "切分" in qtext or "purge" in qtext)
+        and "60%" in hint
+        and "20%" in hint
+        and "purge" in hint
+    ):
+        return "chronological split and purge are explicit"
+    if (
+        ("化验" in qtext or "标签" in qtext or "结果" in qtext)
+        and ("历史特征" in qtext or "在线" in qtext or "可见" in qtext)
+        and ("不使用无法证明发布时间" in hint or "不得使用无法证明发布时间" in hint)
+    ):
+        return "unverifiable assay visibility is explicitly excluded"
+    return ""
 
 
 def _find_duplicate_question(question_records: dict[str, dict[str, Any]], question: str) -> str:
@@ -1116,8 +1981,8 @@ def _find_duplicate_question(question_records: dict[str, dict[str, Any]], questi
             continue
         if norm == existing:
             return qid
-        if len(norm) >= 20 and (norm in existing or existing in norm):
-            return qid
+        # Substring overlap may add a different population, period or constraint;
+        # it cannot justify dropping that investigation.
     return ""
 
 
@@ -1182,35 +2047,83 @@ def _entity_alias_verification_questions(context: dict[str, Any]) -> list[Invest
         relevance = str(group.get("task_relevance", "medium") or "medium")
         deterministic_coverage = group.get("deterministic_group_coverage") if isinstance(group.get("deterministic_group_coverage"), dict) else {}
         directional_coverage = deterministic_coverage.get("directional_coverage") if isinstance(deterministic_coverage.get("directional_coverage"), list) else []
+        covered_pairs = {
+            frozenset((str(item.get("left_collection", "")), str(item.get("right_collection", ""))))
+            for item in directional_coverage if isinstance(item, dict)
+        }
+        missing_pairs = [
+            [left, right] for i, left in enumerate(source_collections)
+            for right in source_collections[i + 1:]
+            if frozenset((left, right)) not in covered_pairs
+        ]
         concept_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(group.get("concept_id") or len(out) + 1)).strip("_")
         question_id = f"auto_entity_alias_{concept_id or len(out) + 1}"
+        measurement_candidate = _entity_alias_is_measurement(group, field_refs)
+        if measurement_candidate:
+            question_text = (
+                f"核验 `{label}` 中的候选字段是否表达同一测量定义，或只是名称相近/相关的不同测点："
+                f"{'、'.join(field_refs) if field_refs else '见 entity_alias_candidates'}。"
+                "先从精确物理 schema 确认每个字段是否存在，再分别确认参数/部位、工艺位置、单位、测量对象、采样频率与可见时间。"
+                "对连续测量值不得用唯一值精确交集、覆盖率或 join coverage 判定实体等价；这些统计只适用于有业务依据的实体键。"
+                "如字段存在且确有同一测量定义，再按已验证的时间可见性对齐后比较有效样本数、范围与误差/相关性；"
+                "相关性不能证明语义等价或因果关系。不存在的字段应记录 schema 不存在，不得反复要求全量数值交集。"
+                f"候选语义理由：{semantic_reason or '字段语义可能相关'}；evidence_status={evidence_status}，task_relevance={relevance}。"
+                "字段存在性、测量语义、实体关联键和预测时点可见性分别给出结论；未知项保留为未确认。"
+            )
+            category = "field_semantics"
+            why_blocking = (
+                "测量值字段即使名称相似或数值相关，也可能对应不同工艺位置、单位或采样时点；"
+                "错误复用会污染标签、特征或建议。"
+            )
+        else:
+            question_text = (
+                f"验证 `{label}` 是否可以作为同一实体键使用：对候选字段 "
+                f"{'、'.join(field_refs) if field_refs else '见 entity_alias_candidates'} "
+                f"分别统计非空数量、唯一值数量、两两唯一值交集、left/right coverage 和 join coverage。"
+                f"候选来源集合为 {source_collections or candidate_files}；先在每个 source_collection 内按 alias_family "
+                "读取全部成员文件并对唯一值取并集，再计算集合之间的方向性覆盖率，不能用单个文件代表整个集合。"
+                f"程序已计算的集合并集方向性覆盖证据为 {directional_coverage[:8]}；先复核并解释该证据，"
+                f"当前缺少覆盖证据的来源对为 {missing_pairs}。缺少来源对时必须补齐取证，不能只解释已有的一对就结束。"
+                "已有统计只有在来源、行覆盖范围、读取成功状态与比较规则都满足当前问题时才可直接复用；"
+                "read_errors、采样/截断、范围不明或格式不一致时，只补算缺失范围，不重复已充分验证的相同计算。"
+                "有界字段画像中的时间极值不代表全量文件起止时间；字面值零交集不证明解析后的日期也无交集。"
+                "时间字段需分别核验解析后精确时间及适当粒度的方向覆盖，报告分母与解析失败数；"
+                "粒度聚合不能自动确立可用于预测的时间匹配规则。"
+                f"LLM 提出候选的语义理由为：{semantic_reason or '字段语义和来源角色可能相关'}。"
+                f"当前 evidence_status={evidence_status}，task_relevance={relevance}。"
+                "不要预设这些字段等价；覆盖率不足或方向明显不对称时，记录未确认映射及其对下游 join/筛选的影响。"
+                "脚本应使用 pathlib/pandas，先对实际列名做 strip 后保留原名映射，"
+                "并分别输出 `left_covered_by_right_ratio` 与 `right_covered_by_left_ratio` 的明确分母。"
+            )
+            category = "join_key"
+            why_blocking = (
+                "名称不同但语义相近的字段可能表示同一实体，也可能只是相关但不等价的属性；"
+                "错误合并会使跨表 join、覆盖口径、特征构造或约束判断失真。"
+            )
         out.append(
             InvestigationQuestion(
                 question_id=question_id,
-                question=(
-                    f"验证 `{label}` 是否可以作为同一实体键使用：对候选字段 "
-                    f"{'、'.join(field_refs) if field_refs else '见 entity_alias_candidates'} "
-                    f"分别统计非空数量、唯一值数量、两两唯一值交集、left/right coverage 和 join coverage。"
-                    f"候选来源集合为 {source_collections or candidate_files}；先在每个 source_collection 内按 alias_family "
-                    "读取全部成员文件并对唯一值取并集，再计算集合之间的方向性覆盖率，不能用单个文件代表整个集合。"
-                    f"程序已计算的集合并集方向性覆盖证据为 {directional_coverage[:8]}；先复核并解释该证据，"
-                    "只有 read_errors 或缺少目标集合时才重新编写脚本计算实体键覆盖。"
-                    f"LLM 提出候选的语义理由为：{semantic_reason or '字段语义和来源角色可能相关'}。"
-                    f"当前 evidence_status={evidence_status}，task_relevance={relevance}。"
-                    "不要预设这些字段等价；覆盖率不足或方向明显不对称时，记录未确认映射及其对下游 join/筛选的影响。"
-                    "脚本应使用 pathlib/pandas，先对实际列名做 strip 后保留原名映射，"
-                    "并分别输出 `left_covered_by_right_ratio` 与 `right_covered_by_left_ratio` 的明确分母。"
-                ),
-                category="join_key",
-                why_blocking=(
-                    "名称不同但语义相近的字段可能表示同一实体，也可能只是相关但不等价的属性；"
-                    "错误合并会使跨表 join、覆盖口径、特征构造或约束判断失真。"
-                ),
+                question=question_text,
+                category=category,
+                why_blocking=why_blocking,
                 candidate_files=candidate_files,
                 priority="high" if relevance == "high" or "code" in value_kinds else "medium",
             )
         )
     return out
+
+
+def _entity_alias_is_measurement(group: dict[str, Any], field_refs: list[str]) -> bool:
+    identity = " ".join(
+        str(group.get(key) or "")
+        for key in ("concept_id", "label", "reason", "alias_family")
+    )
+    identity += " " + " ".join(field_refs)
+    return bool(re.search(
+        r"(?i)(measurement|concentration|temperature|pressure|flow(?:_rate)?|result|"
+        r"浓度|测量|测点|温度|压力|流量|结果|产量|含量)",
+        identity,
+    ))
 
 
 def _population_verification_questions(context: dict[str, Any]) -> list[InvestigationQuestion]:
@@ -1302,6 +2215,17 @@ def _reading_strategy_verification_questions(context: dict[str, Any]) -> list[In
         kind = str(card.get("table_kind", "") or "")
         source_suffix = Path(table_id.split("::", 1)[0]).suffix.lower()
         if kind == "document" or source_suffix in {".pdf", ".doc", ".docx", ".md", ".txt"}:
+            continue
+        # An actually empty worksheet has no reader ambiguity to resolve.
+        # Asking QDI to inspect header/skiprows again only burns a model call
+        # and can create a false "missing schema" issue downstream.
+        verified_rows = card.get("verified_row_count")
+        shape = card.get("shape")
+        if (
+            (isinstance(verified_rows, (int, float)) and int(verified_rows) == 0)
+            or (isinstance(shape, (list, tuple)) and len(shape) >= 1 and int(shape[0] or 0) == 0)
+            or str(card.get("layout_kind") or "").strip().lower() in {"empty", "empty_sheet", "empty_or_unreadable"}
+        ):
             continue
         notes = [str(x) for x in (card.get("reading_notes") or [])]
         warnings = [str(x) for x in (card.get("warnings") or [])]
@@ -1413,6 +2337,7 @@ def _available_qdi_actions(
     current_record: dict[str, Any],
     scripts_for_question: int,
     context_retrievals_for_question: int,
+    max_context_retrievals: int,
     document_retrievals_for_question: int,
     has_documents: bool,
     max_document_retrievals: int,
@@ -1428,15 +2353,15 @@ def _available_qdi_actions(
     allow_custom_readonly_python: bool,
 ) -> list[str]:
     actions = ["answer", "give_up", "refine_current_question", "mark_duplicate"]
-    if context_retrievals_for_question < 2:
+    if context_retrievals_for_question < max_context_retrievals:
         actions.insert(1, "request_context")
     if has_documents and document_retrievals_for_question < max_document_retrievals:
-        actions.insert(1, "read_document_chunks")
         actions.insert(1, "search_document")
     if has_qdi_artifacts and artifact_retrievals_for_question < max_artifact_retrievals:
         actions.insert(1, "read_qdi_artifact_excerpt")
     if allow_custom_readonly_python and scripts_for_question < max_scripts_per_question and total_scripts < max_scripts_total:
         actions.insert(1, "request_script")
+        actions.insert(1, "request_checks")
     depth = int(current_record.get("depth", 0) or 0)
     existing_children = [
         r for r in question_records.values()
@@ -1452,9 +2377,75 @@ def _available_qdi_actions(
 
 
 def _terminal_qdi_actions(actions: list[str]) -> list[str]:
-    terminal = {"answer", "give_up", "mark_duplicate", "add_followup_questions"}
+    terminal = {
+        "answer", "give_up", "mark_duplicate", "add_followup_questions",
+        "request_context", "search_document", "read_document_chunks", "read_qdi_artifact_excerpt",
+    }
     selected = [action for action in actions if action in terminal]
     return selected or ["answer", "give_up"]
+
+
+def _qdi_retrieval_continuation_actions(
+    question_live_actions: list[dict[str, Any]],
+    *,
+    document_retrievals_for_question: int,
+    max_document_retrievals: int,
+    artifact_retrievals_for_question: int,
+    max_artifact_retrievals: int,
+) -> list[str]:
+    """Return only continuations justified by the last retrieval result."""
+    if not question_live_actions:
+        return []
+    latest = question_live_actions[-1]
+    action = str(latest.get("action") or "")
+    observation = latest.get("observation") if isinstance(latest.get("observation"), dict) else {}
+    payload = observation.get("content") if isinstance(observation.get("content"), dict) else observation
+
+    if (
+        action == "read_qdi_artifact_excerpt"
+        and artifact_retrievals_for_question < max_artifact_retrievals
+        and payload.get("status") == "completed"
+        and payload.get("has_more") is True
+    ):
+        return ["read_qdi_artifact_excerpt"]
+
+    if action == "search_document" and document_retrievals_for_question < max_document_retrievals:
+        chunk_ids = [
+            str(value).strip()
+            for value in (latest.get("continuation_chunk_ids") or [])
+            if str(value).strip()
+        ]
+        if not chunk_ids:
+            matches = payload.get("matches") if isinstance(payload.get("matches"), list) else []
+            chunk_ids = [
+                str(item.get("chunk_id") or "").strip()
+                for item in matches
+                if isinstance(item, dict) and str(item.get("chunk_id") or "").strip()
+            ]
+        if chunk_ids:
+            return ["read_document_chunks"]
+    return []
+
+
+def _apply_qdi_retrieval_action_policy(
+    actions: list[str],
+    *,
+    retrieval_actions_since_terminal: int,
+    max_retrieval_actions_before_terminal: int,
+    continuation_actions: list[str],
+) -> list[str]:
+    """Cap repeated retrieval while keeping useful local evidence actions available."""
+    allowed = list(actions)
+    allowed.extend(action for action in continuation_actions if action not in allowed)
+    if retrieval_actions_since_terminal < max(1, int(max_retrieval_actions_before_terminal)):
+        return allowed
+    terminal = {"answer", "give_up", "mark_duplicate", "add_followup_questions"}
+    evidence_actions = {"request_checks", "request_script"}
+    retained = [
+        action for action in allowed
+        if action in terminal or action in continuation_actions or action in evidence_actions
+    ]
+    return retained or ["answer", "give_up"]
 
 
 def _pending_action_digest_requests(
@@ -1597,11 +2588,16 @@ def _question_records_for_prompt(question_records: dict[str, dict[str, Any]]) ->
             {
                 "question_id": str(record.get("question_id", "")),
                 "question": str(record.get("question", ""))[:1000],
+                "question_truncated": len(str(record.get("question", ""))) > 1000,
                 "status": str(record.get("status", "")),
                 "short_answer": str(record.get("short_answer", ""))[:1200],
+                "short_answer_truncated": len(str(record.get("short_answer", ""))) > 1200,
                 "unresolved_reason": str(record.get("unresolved_reason", ""))[:1000],
+                "unresolved_reason_truncated": len(str(record.get("unresolved_reason", ""))) > 1000,
                 "confidence": str(record.get("confidence", "")),
                 "used_files": [str(x) for x in (record.get("used_files", []) or [])[:12]],
+                "used_files_omitted_count": max(0, len(record.get("used_files", []) or []) - 12),
+                "history_artifact_ref": record.get("history_artifact_ref", {}),
                 "parent_id": str(record.get("parent_id", "")),
                 "depth": int(record.get("depth", 0) or 0),
                 "category": str(record.get("category", "")),
@@ -1609,6 +2605,395 @@ def _question_records_for_prompt(question_records: dict[str, dict[str, Any]]) ->
             }
         )
     return out
+
+
+def _qdi_question_ledger_for_decision(
+    question_records: dict[str, dict[str, Any]],
+    *,
+    current_question_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Return only cross-question routing state needed by the action model.
+
+    The complete question records are persisted in the report and history
+    artifacts. Re-sending every question's full prose and answer on every
+    action turn made the old protocol grow quadratically with the number of
+    questions. The current question is already sent as an immutable card, so
+    other questions only need a short status/answer pointer to avoid duplicate
+    follow-ups.
+    """
+    rows: list[dict[str, Any]] = []
+    for record in question_records.values():
+        qid = str(record.get("question_id") or "")
+        if not qid or qid == str(current_question_id):
+            continue
+        rows.append(
+            {
+                "question_id": qid,
+                "question": str(record.get("question") or "")[:320],
+                "status": str(record.get("status") or ""),
+                "short_answer": str(record.get("short_answer") or "")[:500],
+                "unresolved_reason": str(record.get("unresolved_reason") or "")[:320],
+                "confidence": str(record.get("confidence") or ""),
+                "history_artifact_ref": record.get("history_artifact_ref", {}),
+                "parent_id": str(record.get("parent_id") or ""),
+                "depth": int(record.get("depth", 0) or 0),
+            }
+        )
+        if len(rows) >= max(0, int(limit)):
+            break
+    return rows
+
+
+def _qdi_digest_cards_for_decision(
+    action_digest_cards: list[dict[str, Any]],
+    *,
+    question_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep a small, evidence-linked memory of completed prior actions."""
+    rows: list[dict[str, Any]] = []
+    for card in reversed(action_digest_cards):
+        if str(card.get("question_id") or "") != str(question_id):
+            continue
+        rows.append(
+            {
+                "sequence": int(card.get("digest_for_sequence", 0) or 0),
+                "action": str(card.get("action") or ""),
+                "what_was_done": str(card.get("what_was_done") or "")[:500],
+                "key_outputs": [str(x)[:320] for x in (card.get("key_outputs") or [])[:4]],
+                "temporary_conclusion": str(card.get("temporary_conclusion") or "")[:500],
+                "remaining_gap": str(card.get("remaining_gap") or "")[:500],
+                "evidence_refs": [str(x)[:240] for x in (card.get("evidence_refs") or [])[:6]],
+            }
+        )
+        if len(rows) >= max(0, int(limit)):
+            break
+    rows.reverse()
+    return rows
+
+
+def _qdi_latest_action_for_decision(
+    question_live_actions: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> dict[str, Any]:
+    """Project the latest observation without replaying the full action trace."""
+    if not question_live_actions:
+        return {}
+    entry = question_live_actions[-1]
+    action = str(entry.get("action") or "")
+    raw_request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    request: dict[str, Any] = {}
+    if action == "request_script":
+        for key in (
+            "question_id",
+            "goal",
+            "reason_builtins_insufficient",
+            "input_files",
+            "focus_sheets",
+            "focus_columns",
+            "expected_output",
+            "python_code_sha256",
+            "python_code_truncated",
+            "python_code_original_chars",
+            "source_artifact",
+        ):
+            if key in raw_request:
+                request[key] = raw_request[key]
+    elif action == "request_checks":
+        request = {
+            "checks": raw_request.get("checks", [])[:4],
+        }
+    else:
+        for key in (
+            "question_id",
+            "table_ids",
+            "input_files",
+            "focus_sheets",
+            "focus_columns",
+            "query",
+            "reason",
+            "document_ids",
+            "source_files",
+            "top_k",
+            "chunk_ids",
+            "neighbor_count",
+            "artifact_id",
+            "json_path",
+            "offset",
+            "max_chars",
+        ):
+            if key in raw_request:
+                request[key] = raw_request[key]
+    observation = entry.get("observation", {})
+    observation_view = _bounded_json_view(observation, max(1000, int(max_chars)))
+    if observation_view.get("truncated"):
+        observation_payload: Any = {
+            "visible_excerpt": observation_view.get("visible_excerpt", ""),
+            "truncated": True,
+            "original_chars": observation_view.get("original_chars", 0),
+            "visible_chars": observation_view.get("visible_chars", 0),
+        }
+        if isinstance(observation, dict):
+            for key in ("artifact_ref", "artifact_id", "status", "error", "has_more", "next_offset"):
+                if key in observation:
+                    observation_payload[key] = observation[key]
+    else:
+        observation_payload = observation_view.get("content", observation)
+    continuation_chunk_ids = [
+        str(value)
+        for value in (entry.get("continuation_chunk_ids") or [])
+        if str(value).strip()
+    ]
+    if continuation_chunk_ids and isinstance(observation_payload, dict):
+        observation_payload["available_chunk_ids"] = continuation_chunk_ids
+    return {
+        "sequence": int(entry.get("sequence", 0) or 0),
+        "action": action,
+        "status": str(entry.get("status") or ""),
+        "request": request,
+        "observation": observation_payload,
+    }
+
+
+def _qdi_next_step_hint(
+    *,
+    question_live_actions: list[dict[str, Any]],
+    working_memory: dict[str, Any],
+    available_actions: list[str],
+    repetition_exhausted: bool,
+    retrieval_actions_since_terminal: int,
+    max_retrieval_actions_before_terminal: int,
+    retrieval_continuation_actions: list[str],
+) -> str:
+    """Give the model a deterministic routing hint derived from host state."""
+    if repetition_exhausted:
+        return "The same evidence request has repeated. Interpret the existing evidence and answer or give_up."
+    if not question_live_actions:
+        return "Start with the smallest action that can resolve the blocking question; prefer a typed check over custom code."
+    if retrieval_actions_since_terminal >= max_retrieval_actions_before_terminal:
+        evidence_actions = [
+            action for action in available_actions if action in {"request_checks", "request_script"}
+        ]
+        if retrieval_continuation_actions or evidence_actions:
+            return (
+                "No more ordinary retrievals are allowed. Continue only with the explicitly allowed artifact/document "
+                "continuation, or use one bounded check/script for a concrete measurable gap; otherwise answer or give_up."
+            )
+        return "The retrieval budget is exhausted. Use the latest evidence to answer or give_up; do not request another retrieval."
+    latest = question_live_actions[-1]
+    observation = latest.get("observation") if isinstance(latest.get("observation"), dict) else {}
+    status = str(
+        observation.get("status")
+        or latest.get("status")
+        or ""
+    )
+    action = str(latest.get("action") or "")
+    if status in {"script_failed", "artifact_excerpt_failed"}:
+        return "The latest evidence action failed. Choose a different bounded source or give_up; do not repeat the same failed request."
+    if status in {"context_retrieved", "document_searched", "document_chunks_read", "artifact_excerpt_read",
+                  "script_completed", "checks_completed"}:
+        if working_memory.get("open_gaps"):
+            return "Use the latest evidence to close one listed gap. Request a new computation only if the gap is still measurable and no existing artifact answers it."
+        return "The latest evidence is available. Prefer answer now; investigate further only for a concrete unresolved gap."
+    if action in {"answer", "give_up", "mark_duplicate"}:
+        return "This question is terminal; emit the corresponding terminal action."
+    return f"Continue from action `{action}` using only a concrete, non-duplicate next step."
+
+
+def _qdi_decision_state(
+    *,
+    initial_question: dict[str, Any],
+    record: dict[str, Any],
+    question_records: dict[str, dict[str, Any]],
+    question_live_actions: list[dict[str, Any]],
+    action_digest_cards: list[dict[str, Any]],
+    working_memory: dict[str, Any],
+    current_question_id: str,
+    available_actions: list[str],
+    pending_action_digest_requests: list[dict[str, Any]],
+    investigation_actions_used: int,
+    remaining_investigation_actions: int,
+    max_actions_per_question: int,
+    scripts_for_question: int,
+    script_actions_total: int,
+    max_scripts_per_question: int,
+    max_scripts_total: int,
+    context_retrievals_for_question: int,
+    max_context_retrievals: int,
+    document_retrievals_for_question: int,
+    max_document_retrievals: int,
+    artifact_retrievals_for_question: int,
+    max_artifact_retrievals: int,
+    retrieval_actions_since_terminal: int,
+    max_retrieval_actions_before_terminal: int,
+    retrieval_continuation_actions: list[str],
+    decision_call_index: int,
+    max_decision_calls: int,
+    max_total_questions: int,
+    max_depth: int,
+    max_output_chars: int,
+    task_hint: str,
+    full_project_context_artifact: dict[str, Any],
+    repetition_exhausted: bool,
+    cfg: AutoRealizeConfig,
+) -> dict[str, Any]:
+    """Build the host-owned v6 action state frame.
+
+    This is intentionally a projection, not a lossy rewrite of the report:
+    full actions, scripts, results and memories remain addressable through
+    artifacts. The model receives only state that can change its next action.
+    """
+    return {
+        "protocol": str(getattr(cfg.investigation, "decision_state_protocol", "qdi-decision-state-v7")),
+        "scope": {
+            "task_hint": str(task_hint or ""),
+            "task_hint_policy": "Dynamic task scope; project facts remain in the stable prefix.",
+            "full_project_context_artifact": _artifact_ref_index_for_prompt(
+                full_project_context_artifact
+            )
+            if isinstance(full_project_context_artifact, dict)
+            else {},
+        },
+        # Compatibility marker for older local traces/consumers. The full
+        # question lives only in decision_state.current_question; this alias
+        # deliberately carries no duplicate prose.
+        "initial_question": {
+            "alias_of": "decision_state.current_question",
+            "question_id": str(initial_question.get("question_id") or ""),
+        },
+        "current_question": initial_question,
+        "question_status": {
+            "status": str(record.get("status") or ""),
+            "confidence": str(record.get("confidence") or ""),
+            "short_answer": str(record.get("short_answer") or "")[:800],
+            "unresolved_reason": str(record.get("unresolved_reason") or "")[:600],
+            "used_files": [str(x) for x in (record.get("used_files") or [])[:12]],
+        },
+        "evidence_state": {
+            "working_memory": _working_memory_prompt_view(
+                working_memory,
+                max_chars=int(getattr(cfg.investigation, "working_memory_max_chars", 12000)),
+            ),
+            "latest_action": _qdi_latest_action_for_decision(
+                question_live_actions,
+                max_chars=int(getattr(cfg.investigation, "decision_latest_evidence_chars", 6000)),
+            ),
+            "prior_evidence_digests": _qdi_digest_cards_for_decision(
+                action_digest_cards,
+                question_id=current_question_id,
+                limit=int(getattr(cfg.investigation, "decision_digest_count", 4)),
+            ),
+            "pending_action_digest_requests": pending_action_digest_requests,
+            "full_history_policy": (
+                "Complete action history and large evidence are local artifacts. "
+                "Use read_qdi_artifact_excerpt only when an omitted exact detail changes the decision."
+            ),
+        },
+        "other_question_ledger": _qdi_question_ledger_for_decision(
+            question_records,
+            current_question_id=current_question_id,
+            limit=int(getattr(cfg.investigation, "decision_question_ledger_limit", 8)),
+        ),
+        "decision": {
+            "available_actions": available_actions,
+            "next_step_hint": _qdi_next_step_hint(
+                question_live_actions=question_live_actions,
+                working_memory=working_memory,
+                available_actions=available_actions,
+                repetition_exhausted=repetition_exhausted,
+                retrieval_actions_since_terminal=retrieval_actions_since_terminal,
+                max_retrieval_actions_before_terminal=max_retrieval_actions_before_terminal,
+                retrieval_continuation_actions=retrieval_continuation_actions,
+            ),
+            "investigation_action_budget": {
+                "used": investigation_actions_used,
+                "remaining_slots": remaining_investigation_actions,
+                "limit": max_actions_per_question,
+            },
+            "script_budget": {
+                "remaining_for_question": max(0, max_scripts_per_question - scripts_for_question),
+                "remaining_for_run": max(0, max_scripts_total - script_actions_total),
+                "repair_attempts_per_script_max": max(
+                    0, int(getattr(cfg.investigation, "custom_python_max_retries", 3))
+                ),
+                "custom_python_max_result_bytes": max(
+                    1024, int(getattr(cfg.investigation, "custom_python_max_result_bytes", 67108864))
+                ),
+            },
+            "retrieval_budget": {
+                "context": {
+                    "used": context_retrievals_for_question,
+                    "remaining": max(0, max_context_retrievals - context_retrievals_for_question),
+                    "limit": max_context_retrievals,
+                },
+                "documents_shared_search_and_read": {
+                    "used": document_retrievals_for_question,
+                    "remaining": max(0, max_document_retrievals - document_retrievals_for_question),
+                    "limit": max_document_retrievals,
+                },
+                "qdi_artifact_excerpts": {
+                    "used": artifact_retrievals_for_question,
+                    "remaining": max(0, max_artifact_retrievals - artifact_retrievals_for_question),
+                    "limit": max_artifact_retrievals,
+                },
+            },
+            "retrieval_round": {
+                "actions_since_terminal": retrieval_actions_since_terminal,
+                "max_actions_before_terminal": max_retrieval_actions_before_terminal,
+                "continuation_actions_allowed": retrieval_continuation_actions,
+                "terminal_decision_required": (
+                    retrieval_actions_since_terminal >= max_retrieval_actions_before_terminal
+                    and not retrieval_continuation_actions
+                    and not any(action in available_actions for action in ("request_checks", "request_script"))
+                ),
+                "additional_evidence_actions_allowed": [
+                    action for action in available_actions if action in {"request_checks", "request_script"}
+                ],
+                "continuation_rule": (
+                    "After the retrieval cap, do not make ordinary repeated retrievals. A concrete measurable gap may use "
+                    "request_checks/request_script if listed; artifact has_more=true and exposed document chunk_ids permit "
+                    "their listed continuation. Successful request_context is not repeated by default."
+                ),
+            },
+            "decision_call_index": decision_call_index,
+            "max_decision_calls_including_retrievals": max_decision_calls,
+            "decision_budget": {
+                "used": decision_call_index,
+                "remaining": max(0, max_decision_calls - decision_call_index),
+                "limit": max_decision_calls,
+                "counts_model_action_decisions_only": True,
+            },
+            "remaining_followup_questions": max(0, max_total_questions - len(question_records)),
+            "current_depth": int(record.get("depth", 0) or 0),
+            "max_depth": max_depth,
+            "max_output_len": max_output_chars,
+            "remaining_action_rounds": remaining_investigation_actions,
+            "repeated_request_budget_exhausted": repetition_exhausted,
+            "action_policy": {
+                "answer_from_visible_evidence_before_new_work": True,
+                "do_not_add_duplicate_questions": True,
+                "use_mark_duplicate_when_needed": True,
+                "use_refine_current_question_only_for_narrow_rewording": True,
+                "prefer_request_checks_for_supported_typed_checks": True,
+                "batch_independent_checks_in_one_request": True,
+                "do_not_print_full_tables_in_scripts": True,
+                "script_results_are_artifact_backed": True,
+                "retrieval_actions_do_not_consume_investigation_action_slots": True,
+                "retrieval_actions_still_require_a_model_decision_and_provider_call": True,
+                "retrieval_round_cap_is_host_enforced": True,
+                "context_retrieval_is_not_repeated_after_success": True,
+                "artifact_continuation_requires_has_more": True,
+                "document_read_continuation_requires_search_chunk_ids": True,
+                "checks_or_scripts_remain_available_for_measurable_gaps": True,
+                "script_actions_consume_one_investigation_action_slot_and_one_script_quota": True,
+                "last_investigation_action_slot_allows_retrieval_or_terminal_actions_only": (
+                    remaining_investigation_actions <= 1
+                ),
+            },
+        },
+    }
 
 
 def _current_script_evidence(
@@ -1621,7 +3006,16 @@ def _current_script_evidence(
     if request is None and result is None:
         return {}
     payload = result.model_dump() if result is not None else {}
-    visible = _visible_output_payload(payload.get("result", {}), max_output_chars)
+    output = payload.get("result", {})
+    content = {key: value for key, value in output.items() if key != "_full_result_artifact"} if isinstance(output, dict) else output
+    upstream_omissions = {}
+    if isinstance(content, dict) and content.get("_truncated") and isinstance(content.get("visible_fields"), dict):
+        upstream_omissions = {
+            "omitted_field_count": content.get("omitted_field_count", 0),
+            "omitted_fields": content.get("omitted_fields", []),
+        }
+        content = content["visible_fields"]
+    visible = _visible_output_payload(content, max_output_chars)
     was_truncated = bool(payload.get("output_truncated")) or bool(visible["output_truncated"])
     original_chars = max(
         int(payload.get("original_output_chars") or 0),
@@ -1649,10 +3043,11 @@ def _current_script_evidence(
         "max_output_len": max_output_chars,
         "original_output_chars": original_chars,
         "visible_output_chars": visible["visible_output_chars"],
-        "current_output_artifact": artifact_ref,
+        "current_output_artifact": _artifact_ref_index_for_prompt(artifact_ref),
+        "upstream_omitted_fields": upstream_omissions,
         "instruction": (
-            "完整结构化结果已保存到 current_output_artifact。truncated=true 表示当前 prompt 仅显示前缀；"
-            "可以继续使用可见结论，但不能根据未显示部分推断。需要额外细节时生成更聚焦的新脚本。"
+            "完整结构化结果已保存到 current_output_artifact。truncated=true 表示当前 prompt 仅显示选中的完整字段；"
+            "可以继续使用可见结论，但不能根据未显示部分推断。旧结果细节优先用 read_qdi_artifact_excerpt 取回；只有新的计算才需要脚本。"
         ),
     }
 
@@ -1660,10 +3055,38 @@ def _current_script_evidence(
 def _visible_output_payload(value: Any, max_output_chars: int) -> dict[str, Any]:
     safe = _json_safe(value)
     text = json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)
-    visible = text[:max(1, int(max_output_chars))]
+    limit = max(1, int(max_output_chars))
+    if len(text) <= limit:
+        visible = text
+    else:
+        view: dict[str, Any] = {
+            "_truncated": True,
+            "original_chars": len(text),
+            "visible_fields": {},
+            "omitted_field_count": 0,
+        }
+        omitted_names: list[str] = []
+        if isinstance(safe, dict):
+            for key, item in safe.items():
+                candidate = {**view, "visible_fields": {**view["visible_fields"], str(key): item}}
+                if len(json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)) <= limit:
+                    view = candidate
+                else:
+                    view["omitted_field_count"] += 1
+                    omitted_names.append(str(key))
+        else:
+            view["root_value_omitted"] = True
+            view["omitted_field_count"] = 1
+        # Names are helpful for direct json_path reads, but only include the
+        # complete list if it fits. Otherwise the exact structure remains in
+        # the artifact and the generating script reveals its field paths.
+        named_view = {**view, "omitted_fields": omitted_names}
+        if omitted_names and len(json.dumps(named_view, ensure_ascii=False, sort_keys=True, default=str)) <= limit:
+            view = named_view
+        visible = json.dumps(view, ensure_ascii=False, sort_keys=True, default=str)
     return {
         "current_visible_output": visible,
-        "output_truncated": len(text) > len(visible),
+        "output_truncated": len(text) > limit,
         "original_output_chars": len(text),
         "visible_output_chars": len(visible),
     }
@@ -1784,21 +3207,33 @@ def _retrieve_qdi_context_excerpt(
         for x in (getattr(request, "table_ids", []) or [])
         if str(x).strip()
     ]
+    table_index = context.get("table_cards", []) if isinstance(context.get("table_cards"), list) else []
+    cards_by_id = {
+        str(item.get("table_id") or item.get("source_file") or ""): item
+        for item in table_index
+        if isinstance(item, dict) and str(item.get("table_id") or item.get("source_file") or "")
+    }
+    cards_by_id.update(
+        {
+            str(table_id): card
+            for table_id, card in table_card_details.items()
+            if isinstance(card, dict)
+        }
+    )
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for table_id in explicit_table_ids:
-        card = table_card_details.get(table_id)
+        card = cards_by_id.get(table_id)
         if isinstance(card, dict):
-            selected.append(_detail_card_for_prompt(card))
+            selected.append(_context_card_for_retrieval(card, wanted_cols))
             seen.add(table_id)
         if len(selected) >= max_cards:
             return selected
     if selected:
         return selected
-    table_index = context.get("table_cards", []) if isinstance(context.get("table_cards"), list) else []
-    return _select_related_table_cards(
+    matched = _select_related_table_cards(
         table_index,
-        table_card_details,
+        cards_by_id,
         wanted_files=candidate_files,
         wanted_cols=wanted_cols,
         wanted_sheets=wanted_sheets,
@@ -1811,6 +3246,54 @@ def _retrieve_qdi_context_excerpt(
         ),
         max_cards=max_cards,
     )
+    return [
+        _context_card_for_retrieval(cards_by_id.get(str(card.get("table_id")), card), wanted_cols)
+        for card in matched
+    ]
+
+
+def _context_card_for_retrieval(card: dict[str, Any], wanted_columns: set[str]) -> dict[str, Any]:
+    """Return whole-field prompt cards with exact schema and a path back to every full profile."""
+    full_card = deepcopy(card)
+    fields = full_card.get("fields")
+    fields = fields if isinstance(fields, list) else []
+    if wanted_columns:
+        fields = sorted(fields, key=lambda field: (
+            0 if isinstance(field, dict) and str(field.get("name")) in wanted_columns else 1,
+            str(field.get("name", "")) if isinstance(field, dict) else "",
+        ))
+        full_card["fields"] = fields
+    view = _detail_card_for_prompt(full_card)
+    view["fields"] = deepcopy(fields[:12])
+    for key in ("reading_notes", "warnings", "recommended_read", "row_count_note"):
+        if key in full_card:
+            view[key] = deepcopy(full_card[key])
+    full_field_names = [str(x) for x in (card.get("physical_columns_exact") or [])]
+    if not full_field_names:
+        full_field_names = [str(field.get("name", "")) for field in fields if isinstance(field, dict)]
+    view["field_count"] = len(full_field_names)
+    view["fields_omitted_count"] = max(0, len(full_field_names) - len(view.get("fields", [])))
+    view["field_catalog"] = full_field_names
+    view["artifact_refs"] = [
+        _artifact_ref_index_for_prompt(ref)
+        for ref in (card.get("artifact_refs") or [])
+        if isinstance(ref, dict)
+    ]
+    view["detail_policy"] = (
+        "Visible fields retain whole stored-card entries, which are still summaries of the source profiles. "
+        "field_catalog lists the physical schema; complete original profiles and meanings are recoverable from artifact_refs."
+    )
+    view["artifact_json_path_guide"] = {
+        str(ref.get("artifact_type")): (
+            {"all_field_names": "columns", "full_field_profiles": "column_profiles"}
+            if str(ref.get("artifact_type")) == "excel_sheet_profile_full"
+            else {"all_field_profiles": "column_profiles", "field_meanings": "column_semantics",
+                  "excel_sheets": "source_metadata.excel_sheet_profiles"}
+        )
+        for ref in (card.get("artifact_refs") or [])
+        if isinstance(ref, dict) and ref.get("artifact_type") in {"file_profile_full", "excel_sheet_profile_full"}
+    }
+    return view
 
 
 def _select_related_table_cards(
@@ -1893,6 +3376,15 @@ def _select_related_table_cards(
         if table_id in seen:
             continue
         card = table_card_details.get(table_id)
+        if not isinstance(card, dict):
+            card = next(
+                (
+                    item for item in table_index
+                    if isinstance(item, dict)
+                    and str(item.get("table_id") or item.get("source_file") or "") == table_id
+                ),
+                None,
+            )
         if isinstance(card, dict):
             related.append(_detail_card_for_prompt(card))
             seen.add(table_id)
@@ -1934,15 +3426,16 @@ def _failed_result_for_prompt(
     }
     stored_ref = result.result.get("_full_result_artifact") if isinstance(result.result, dict) else None
     if isinstance(stored_ref, dict):
-        payload["result_artifact"] = stored_ref
+        payload["result_artifact"] = _artifact_ref_index_for_prompt(stored_ref)
     elif artifact_store is not None:
-        payload["result_artifact"] = artifact_store.put(
+        ref = artifact_store.put(
             "qdi_failed_script_result_full",
             f"{result.question_id}:{result.request_id}",
             result.result,
             visible_excerpt=visible["current_visible_output"],
             visible_limit=max(1000, int(result.max_output_chars or 12000)),
         )
+        payload["result_artifact"] = _artifact_ref_index_for_prompt(ref)
     return payload
 
 
@@ -2090,13 +3583,10 @@ def _contains_question_note(items: list[str], question_id: str) -> bool:
 
 
 class CrossFileInvestigationTools:
-    """Script-only read-only executor used by the LLM investigator.
+    """Run custom scripts and engine-compiled checks through one read-only sandbox.
 
-    Older deterministic helpers remain as internal Python methods for debugging
-    and compatibility, but the public `execute()` surface intentionally accepts
-    only LLM-authored `custom_readonly_python` requests. This keeps the
-    Question-Driven Investigator aligned with the current backend design:
-    no tool menu, just sandboxed evidence scripts.
+    Legacy internal helper names remain unavailable to the public executor.
+    Typed checks are compiled from validated arguments rather than model code.
     """
 
     def __init__(
@@ -2137,9 +3627,9 @@ class CrossFileInvestigationTools:
                     visible_excerpt=visible["current_visible_output"],
                     visible_limit=max_chars,
                 )
-            visible_result = _truncate_result(result, max_chars)
+            visible_result = _truncate_result(result, max_chars) if full_result_artifact else result
             if isinstance(visible_result, dict) and full_result_artifact:
-                visible_result["_full_result_artifact"] = full_result_artifact
+                visible_result["_full_result_artifact"] = _artifact_ref_index_for_prompt(full_result_artifact)
             if isinstance(result, dict) and result.get("error"):
                 return _failed_result(request, str(result.get("error")), result=visible_result)
             return InvestigationStepResult(
@@ -2417,7 +3907,7 @@ class CrossFileInvestigationTools:
 
 
 def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeConfig) -> dict[str, Any]:
-    """Execute LLM-provided analysis code with input_dir read-only and scratch_dir temporary writable."""
+    """Run bounded analysis with best-effort path guards, not OS-level isolation."""
     code = str(code or "").strip()
     if not code:
         return {"error": "empty_custom_python_code"}
@@ -2426,48 +3916,72 @@ def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeCo
         return {"error": "custom_python_static_validation_failed", "issues": issues}
 
     timeout = float(getattr(cfg.investigation, "custom_python_timeout_seconds", 30.0))
-    max_stdout = int(getattr(cfg.investigation, "custom_python_max_stdout_chars", 12000))
+    max_stdout = max(1, int(getattr(cfg.investigation, "custom_python_max_stdout_chars", 12000)))
     with tempfile.TemporaryDirectory(prefix="autorealize_scratch_") as scratch:
         scratch_dir = Path(scratch).resolve()
         wrapper_path = scratch_dir / "run_custom_readonly.py"
         result_path = scratch_dir / "__autorealize_result.json"
-        stdout_path = scratch_dir / "__autorealize_stdout.log"
-        stderr_path = scratch_dir / "__autorealize_stderr.log"
-        wrapper_path.write_text(_custom_python_wrapper(code), encoding="utf-8")
-        env = dict(os.environ)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
+        max_result_bytes = max(
+            1024, int(getattr(cfg.investigation, "custom_python_max_result_bytes", 67108864))
+        )
+        wrapper_path.write_text(
+            _custom_python_wrapper(code, max_result_bytes=max_result_bytes), encoding="utf-8"
+        )
+        env = _custom_readonly_python_environment()
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-u", str(wrapper_path), str(input_dir.resolve()),
+                str(scratch_dir), str(result_path),
+            ],
+            cwd=str(scratch_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout_capture, stdout_thread = _start_bounded_pipe_capture(proc.stdout, max_stdout)
+        stderr_capture, stderr_thread = _start_bounded_pipe_capture(proc.stderr, max_stdout)
+        timed_out = False
         try:
-            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-                proc = subprocess.run(
-                    [sys.executable, str(wrapper_path), str(input_dir.resolve()), str(scratch_dir), str(result_path)],
-                    cwd=str(scratch_dir),
-                    env=env,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    timeout=timeout,
-                )
+            return_code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {
-                "error": f"custom_python_timeout:{timeout}",
-                "stdout_tail": _read_text_tail(stdout_path, max_stdout),
-                "stderr_tail": _read_text_tail(stderr_path, max_stdout),
-            }
-        stdout_info = _read_text_tail_info(stdout_path, max_stdout)
-        stderr_info = _read_text_tail_info(stderr_path, max_stdout)
+            timed_out = True
+            proc.kill()
+            return_code = proc.wait()
+        finally:
+            stdout_thread.join()
+            stderr_thread.join()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+
+        stdout_info = _finish_bounded_pipe_capture(stdout_capture, max_stdout)
+        stderr_info = _finish_bounded_pipe_capture(stderr_capture, max_stdout)
         stdout = stdout_info["visible_tail"]
         stderr = stderr_info["visible_tail"]
-        if proc.returncode != 0:
+        if timed_out:
             return {
-                "error": f"custom_python_exit_code:{proc.returncode}",
+                "error": f"custom_python_timeout:{timeout}",
                 "stdout_tail": stdout,
                 "stderr_tail": stderr,
+                "_stdout_capture": stdout_info,
+                "_stderr_capture": stderr_info,
+            }
+        if return_code != 0:
+            return {
+                "error": f"custom_python_exit_code:{return_code}",
+                "stdout_tail": stdout,
+                "stderr_tail": stderr,
+                "_stdout_capture": stdout_info,
+                "_stderr_capture": stderr_info,
             }
         if not result_path.exists():
             return {
                 "error": "custom_python_missing_result_file",
                 "stdout_tail": stdout,
                 "stderr_tail": stderr,
+                "_stdout_capture": stdout_info,
+                "_stderr_capture": stderr_info,
             }
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -2476,6 +3990,8 @@ def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeCo
                 "error": f"custom_python_result_not_json:{exc}",
                 "stdout_tail": stdout,
                 "stderr_tail": stderr,
+                "_stdout_capture": stdout_info,
+                "_stderr_capture": stderr_info,
             }
         if not isinstance(result, dict):
             return {"error": "custom_python_result_not_object", "result": _json_safe(result)}
@@ -2485,6 +4001,65 @@ def run_custom_readonly_python(code: str, *, input_dir: Path, cfg: AutoRealizeCo
         if stderr.strip():
             result["_stderr_capture"] = stderr_info
         return result
+
+
+def _custom_readonly_python_environment() -> dict[str, str]:
+    """Pass only platform/runtime variables needed by the local analysis child."""
+    allowed = {
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "APPDATA",
+        "USERPROFILE",
+        "HOME",
+        "PYTHONUSERBASE",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in allowed
+    }
+    env.update(
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONIOENCODING="utf-8",
+    )
+    return env
+
+
+def _start_bounded_pipe_capture(stream, max_chars: int):
+    max_bytes = max(4, max_chars * 4)
+    capture = {"tail": bytearray(), "original_bytes": 0}
+
+    def drain() -> None:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            capture["original_bytes"] += len(chunk)
+            capture["tail"].extend(chunk)
+            if len(capture["tail"]) > max_bytes:
+                del capture["tail"][:-max_bytes]
+
+    thread = threading.Thread(target=drain, daemon=True)
+    thread.start()
+    return capture, thread
+
+
+def _finish_bounded_pipe_capture(capture: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    visible = bytes(capture["tail"]).decode("utf-8", errors="replace")[-max_chars:]
+    return {
+        "visible_tail": visible,
+        "truncated": int(capture["original_bytes"]) > len(visible.encode("utf-8", errors="replace")),
+        "original_bytes": int(capture["original_bytes"]),
+        "visible_chars": len(visible),
+    }
 
 
 def _read_text_tail(path: Path, limit: int) -> str:
@@ -2532,6 +4107,13 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         "http",
         "ftplib",
         "pathlib2",
+        "pyarrow",
+        "fastparquet",
+        "polars",
+        "xarray",
+        "h5py",
+        "tables",
+        "zarr",
     }
     allowed_import_roots = {
         "__future__",
@@ -2540,15 +4122,8 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         "scipy",
         "sklearn",
         "statsmodels",
-        "polars",
-        "pyarrow",
-        "fastparquet",
         "networkx",
         "rapidfuzz",
-        "xarray",
-        "h5py",
-        "tables",
-        "zarr",
         "openpyxl",
         "xlrd",
         "pyxlsb",
@@ -2564,12 +4139,40 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         "datetime",
         "typing",
     }
-    banned_calls = {"eval", "exec", "compile", "__import__", "input", "breakpoint", "help"}
+    banned_calls = {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "input",
+        "breakpoint",
+        "help",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "getattr",
+        "setattr",
+        "delattr",
+        "hasattr",
+    }
+    banned_reflection_names = {
+        "__builtins__",
+        "__globals__",
+        "__dict__",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "getattr",
+        "setattr",
+        "delattr",
+        "hasattr",
+        "__import__",
+    }
     banned_attrs = {
         "unlink",
         "rmdir",
-        "rename",
-        "replace",
         "remove",
         "removedirs",
         "rmtree",
@@ -2582,6 +4185,25 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         "hardlink_to",
     }
     has_analyze = False
+
+    pandas_aliases = {"pd", "pandas"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "pandas":
+                    pandas_aliases.add(alias.asname or "pandas")
+        elif isinstance(node, ast.ImportFrom) and node.module == "pandas":
+            pandas_aliases.add(node.module)
+    dataframe_names, series_names = _readonly_pandas_names(tree, pandas_aliases)
+
+    def attribute_chain(node: ast.AST) -> list[str]:
+        parts: list[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return list(reversed(parts))
 
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)):
@@ -2597,13 +4219,20 @@ def validate_custom_readonly_python(code: str) -> list[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root in banned_import_roots:
+                if alias.name == "pandas.io" or alias.name.startswith("pandas.io."):
+                    issues.append(f"banned_pandas_internal_io_import:{alias.name}")
+                elif root in banned_import_roots:
                     issues.append(f"banned_import:{alias.name}")
                 elif root not in allowed_import_roots:
                     issues.append(f"import_not_allowlisted:{alias.name}")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if root in banned_import_roots:
+            module = node.module or ""
+            if module == "pandas.io" or module.startswith("pandas.io."):
+                issues.append(f"banned_pandas_internal_io_import:{module}")
+            elif module == "pandas" and any(alias.name == "io" for alias in node.names):
+                issues.append("banned_pandas_internal_io_import:pandas.io")
+            elif root in banned_import_roots:
                 issues.append(f"banned_import:{node.module}")
             elif root and root not in allowed_import_roots:
                 issues.append(f"import_not_allowlisted:{node.module}")
@@ -2612,8 +4241,20 @@ def validate_custom_readonly_python(code: str) -> list[str]:
             if name in banned_calls:
                 issues.append(f"banned_call:{name}")
             attr = _call_attr(node.func)
+            if attr in {"rename", "replace"} and not _is_readonly_data_transform(
+                node, attr, dataframe_names, series_names
+            ):
+                issues.append(f"banned_method:{attr}")
             if attr in banned_attrs and not (attr == "copy" and _is_memory_copy_call(node)):
                 issues.append(f"banned_method:{attr}")
+        elif isinstance(node, ast.Name) and node.id in banned_reflection_names:
+            issues.append(f"banned_python_reflection_name:{node.id}")
+        elif isinstance(node, ast.Attribute):
+            chain = attribute_chain(node)
+            if len(chain) >= 2 and chain[0] in pandas_aliases and chain[1] == "io":
+                issues.append(f"banned_pandas_internal_io_access:{'.'.join(chain[:2])}")
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                issues.append(f"banned_python_reflection_attribute:{node.attr}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             issue = _literal_path_issue(node.value)
             if issue:
@@ -2622,6 +4263,109 @@ def validate_custom_readonly_python(code: str) -> list[str]:
     if not has_analyze:
         issues.append("missing_analyze_function")
     return list(dict.fromkeys(issues))[:40]
+
+
+def _readonly_pandas_names(
+    tree: ast.AST,
+    pandas_aliases: set[str],
+) -> tuple[set[str], set[str]]:
+    dataframes: set[str] = set()
+    series: set[str] = set()
+    dataframe_transforms = {
+        "copy", "rename", "replace", "drop", "dropna", "fillna", "astype",
+        "sort_values", "sort_index", "reset_index", "set_index", "assign",
+        "query", "head", "tail", "groupby", "merge", "join", "select_dtypes",
+    }
+
+    def dataframe_expr(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in dataframes
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            if isinstance(owner, ast.Name) and owner.id in pandas_aliases:
+                return node.func.attr in {"DataFrame", "read_csv", "read_excel", "read_parquet", "read_json"}
+            return (
+                isinstance(owner, ast.Name)
+                and owner.id in dataframes
+                and node.func.attr in dataframe_transforms
+            )
+        return False
+
+    def series_expr(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in series
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            return node.value.id in dataframes
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return node.value.id in dataframes and node.attr not in {"columns", "index"}
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            return (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in series
+                and node.func.attr in {"copy", "rename", "replace", "astype", "fillna", "dropna"}
+            )
+        return False
+
+    def assignment_targets(node: ast.AST) -> list[ast.Name]:
+        if isinstance(node, ast.Name):
+            return [node]
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return [name for child in node.elts for name in assignment_targets(child)]
+        return []
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            value = None
+            targets: list[ast.Name] = []
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = [name for target in node.targets for name in assignment_targets(target)]
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets = assignment_targets(node.target)
+            elif isinstance(node, ast.NamedExpr):
+                value = node.value
+                targets = assignment_targets(node.target)
+            if value is None or not targets:
+                continue
+            is_frame = dataframe_expr(value)
+            is_series = series_expr(value)
+            for target in targets:
+                if is_frame and target.id not in dataframes:
+                    dataframes.add(target.id)
+                    changed = True
+                elif is_series and target.id not in series:
+                    series.add(target.id)
+                    changed = True
+    return dataframes, series
+
+
+def _is_readonly_data_transform(
+    node: ast.Call,
+    attr: str,
+    dataframe_names: set[str],
+    series_names: set[str],
+) -> bool:
+    receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+    if receiver is None:
+        return False
+    if attr == "rename":
+        return isinstance(receiver, ast.Name) and (
+            receiver.id in dataframe_names or receiver.id in series_names
+        )
+    if isinstance(receiver, ast.Constant) and isinstance(receiver.value, str):
+        return True
+    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name) and receiver.func.id == "str":
+        return True
+    if isinstance(receiver, ast.Attribute) and receiver.attr == "str":
+        return True
+    if isinstance(receiver, ast.Name):
+        return receiver.id in dataframe_names or receiver.id in series_names
+    if isinstance(receiver, ast.Subscript) and isinstance(receiver.value, ast.Name):
+        return receiver.value.id in dataframe_names
+    return False
 
 
 def _is_memory_copy_call(node: ast.Call) -> bool:
@@ -2643,11 +4387,13 @@ def _is_memory_copy_call(node: ast.Call) -> bool:
     return False
 
 
-def _custom_python_wrapper(user_code: str) -> str:
+def _custom_python_wrapper(user_code: str, *, max_result_bytes: int = 67108864) -> str:
     return (
         _CUSTOM_PYTHON_WRAPPER_PREFIX
         + "\nUSER_CODE = "
         + repr(user_code)
+        + "\nMAX_RESULT_BYTES = "
+        + str(max(1024, int(max_result_bytes)))
         + "\n"
         + _CUSTOM_PYTHON_WRAPPER_SUFFIX
     )
@@ -2658,8 +4404,10 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 from pathlib import Path
 import socket
+import stat as stat_module
 import sys
 import traceback
 
@@ -2679,18 +4427,22 @@ _orig_path_write_bytes = Path.write_bytes
 _orig_path_iterdir = Path.iterdir
 _orig_path_glob = Path.glob
 _orig_path_rglob = Path.rglob
+_orig_path_exists = Path.exists
+_orig_path_is_file = Path.is_file
+_orig_path_is_dir = Path.is_dir
+_orig_path_stat = Path.stat
 
 
 def _under(path, root):
-    path = Path(path).resolve()
-    root = Path(root).resolve()
+    path = Path(os.path.realpath(os.fspath(path)))
+    root = Path(os.path.realpath(os.fspath(root)))
     return path == root or root in path.parents
 
 
 def _resolve_user_path(file):
     if isinstance(file, int):
         return None
-    return Path(file).resolve()
+    return Path(os.path.realpath(os.fspath(file)))
 
 
 def _mode_is_write(mode):
@@ -2771,6 +4523,36 @@ def _safe_rglob(self, pattern, *args, **kwargs):
         yield path
 
 
+def _safe_exists(self):
+    _guard_read_path(self)
+    try:
+        _orig_path_stat(self)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_is_file(self):
+    _guard_read_path(self)
+    try:
+        return stat_module.S_ISREG(_orig_path_stat(self).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_is_dir(self):
+    _guard_read_path(self)
+    try:
+        return stat_module.S_ISDIR(_orig_path_stat(self).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_stat(self, *args, **kwargs):
+    _guard_read_path(self)
+    return _orig_path_stat(self, *args, **kwargs)
+
+
 builtins.open = _safe_open
 Path.open = _safe_path_open
 Path.read_text = _safe_read_text
@@ -2780,6 +4562,10 @@ Path.write_bytes = _safe_write_bytes
 Path.iterdir = _safe_iterdir
 Path.glob = _safe_glob
 Path.rglob = _safe_rglob
+Path.exists = _safe_exists
+Path.is_file = _safe_is_file
+Path.is_dir = _safe_is_dir
+Path.stat = _safe_stat
 
 
 def _blocked_socket(*args, **kwargs):
@@ -2802,6 +4588,67 @@ def _patch_pandas_writer(cls, method_name):
     setattr(cls, method_name, _safe_writer)
 
 
+def _guard_reader_source(source):
+    if isinstance(source, (str, bytes, os.PathLike)):
+        path = os.fsdecode(os.fspath(source))
+        if "://" in path:
+            raise PermissionError("remote paths are disabled in custom_readonly_python")
+        _guard_read_path(path)
+    elif isinstance(source, (list, tuple)):
+        for item in source:
+            _guard_reader_source(item)
+
+
+def _patch_pandas_reader(function_name, source_argument):
+    if not hasattr(pd, function_name):
+        return
+    original = getattr(pd, function_name)
+
+    def _safe_reader(*args, **kwargs):
+        source = args[0] if args else kwargs.get(source_argument)
+        _guard_reader_source(source)
+        if kwargs.get("storage_options") or kwargs.get("filesystem") is not None:
+            raise PermissionError("external filesystems are disabled in custom_readonly_python")
+        return original(*args, **kwargs)
+
+    setattr(pd, function_name, _safe_reader)
+
+
+def _patch_pandas_file_constructor(class_name):
+    cls = getattr(pd, class_name, None)
+    if cls is None or not hasattr(cls, "__init__"):
+        return
+    original = cls.__init__
+
+    def _safe_init(self, source, *args, **kwargs):
+        _guard_reader_source(source)
+        return original(self, source, *args, **kwargs)
+
+    cls.__init__ = _safe_init
+
+
+for _reader, _source_argument in {
+    "read_csv": "filepath_or_buffer",
+    "read_fwf": "filepath_or_buffer",
+    "read_table": "filepath_or_buffer",
+    "read_excel": "io",
+    "read_json": "path_or_buf",
+    "read_html": "io",
+    "read_xml": "path_or_buffer",
+    "read_parquet": "path",
+    "read_feather": "path",
+    "read_orc": "path",
+    "read_pickle": "filepath_or_buffer",
+    "read_hdf": "path_or_buf",
+    "read_sas": "filepath_or_buffer",
+    "read_stata": "filepath_or_buffer",
+}.items():
+    _patch_pandas_reader(_reader, _source_argument)
+
+_patch_pandas_file_constructor("ExcelFile")
+_patch_pandas_file_constructor("HDFStore")
+
+
 for _method in ["to_csv", "to_excel", "to_json", "to_parquet", "to_pickle", "to_feather", "to_hdf"]:
     _patch_pandas_writer(pd.DataFrame, _method)
     _patch_pandas_writer(pd.Series, _method)
@@ -2811,15 +4658,7 @@ def _json_safe(value):
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        values = list(value)
-        visible = [_json_safe(v) for v in values[:200]]
-        if len(values) > len(visible):
-            visible.append({
-                "_truncated_sequence": True,
-                "original_items": len(values),
-                "visible_items": 200,
-            })
-        return visible
+        return [_json_safe(v) for v in value]
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
@@ -2843,11 +4682,27 @@ try:
     if not callable(analyze):
         raise RuntimeError("custom code must define analyze(input_dir: str, scratch_dir: str) -> dict")
     result = analyze(str(INPUT_DIR), str(SCRATCH_DIR))
-    _orig_path_write_text(
-        RESULT_PATH,
-        json.dumps(_json_safe(result), ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    encoder = json.JSONEncoder(ensure_ascii=False, default=str, separators=(",", ":"))
+    serialized_bytes = 0
+    exceeded_limit = False
+    with _orig_path_open(RESULT_PATH, "w", encoding="utf-8") as result_stream:
+        for chunk in encoder.iterencode(_json_safe(result)):
+            chunk_bytes = len(chunk.encode("utf-8"))
+            if serialized_bytes + chunk_bytes > MAX_RESULT_BYTES:
+                exceeded_limit = True
+                break
+            result_stream.write(chunk)
+            serialized_bytes += chunk_bytes
+    if exceeded_limit:
+        _orig_path_write_text(
+            RESULT_PATH,
+            json.dumps({
+                "error": "custom_python_result_size_limit_exceeded",
+                "max_result_bytes": MAX_RESULT_BYTES,
+                "serialized_result_bytes_at_least": serialized_bytes + chunk_bytes,
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
 except Exception:
     traceback.print_exc()
     sys.exit(1)
@@ -3196,18 +5051,872 @@ def _immutable_question_card(record: dict[str, Any]) -> dict[str, Any]:
     """Freeze question identity separately from changing status/budget fields."""
     return {
         "question_id": str(record.get("question_id", "")),
-        "question": str(record.get("question", ""))[:1000],
+        "question": str(record.get("question", "")),
         "category": str(record.get("category", "")),
-        "why_blocking": str(record.get("why_blocking", ""))[:1000],
-        "candidate_files": [str(x) for x in (record.get("candidate_files", []) or [])[:20]],
+        "why_blocking": str(record.get("why_blocking", "")),
+        "candidate_files": [str(x) for x in (record.get("candidate_files", []) or [])],
         "parent_id": str(record.get("parent_id", "")),
         "depth": int(record.get("depth", 0) or 0),
     }
 
 
+def _qdi_cache_metrics(
+    *,
+    llm_client: Any,
+    node_cache: QDINodeResultCache,
+    evidence_cache: QDIEvidenceCache,
+) -> dict[str, Any]:
+    """Return QDI cache metrics without merging different cache layers."""
+    summary = getattr(llm_client, "_usage_summary", {})
+    by_prompt = summary.get("by_prompt", {}) if isinstance(summary, dict) else {}
+    qdi_rows = [
+        row for name, row in by_prompt.items()
+        if str(name).startswith("question_investigator")
+        and isinstance(row, dict)
+    ] if isinstance(by_prompt, dict) else []
+
+    def total(field: str) -> int:
+        return sum(int(row.get(field, 0) or 0) for row in qdi_rows)
+
+    provider_input = total("prompt_tokens")
+    provider_hit = total("prompt_cache_hit_tokens")
+    provider_miss = total("prompt_cache_miss_tokens")
+    provider_known = total("provider_cache_known_prompt_tokens")
+    local_hits = total("cache_hits_local")
+    return {
+        "metric_semantics": {
+            "provider_prompt_cache": "Provider-reported prompt prefix cache tokens for QDI network calls.",
+            "qdi_node_result_cache": "Validated local/shared QDI decision results; a hit avoids a provider call.",
+            "local_response_cache": "Exact LLM response cache hits; separate from provider prompt caching.",
+            "qdi_evidence_cache": "Validated deterministic evidence/tool result reuse; separate from all LLM caches.",
+        },
+        "provider_prompt_cache": {
+            "input_tokens": provider_input,
+            "hit_tokens": provider_hit,
+            "miss_tokens": provider_miss,
+            "known_input_tokens": provider_known,
+            "telemetry_coverage": round(provider_known / provider_input, 6) if provider_input else None,
+            "hit_ratio_known": round(provider_hit / provider_known, 6) if provider_known else None,
+            "hit_ratio_lower_bound": round(provider_hit / provider_input, 6) if provider_input else None,
+        },
+        "qdi_node_result_cache": node_cache.stats(),
+        "local_response_cache": {
+            "hits": local_hits,
+            "estimated_prompt_tokens_avoided": total(
+                "estimated_prompt_tokens_local_cache_hits"
+            ),
+        },
+        "qdi_evidence_cache": {
+            "hits": int(getattr(evidence_cache, "hits", 0) or 0),
+            "local_hits": int(getattr(evidence_cache, "local_hits", 0) or 0),
+            "shared_hits": int(getattr(evidence_cache, "shared_hits", 0) or 0),
+        },
+    }
+
+
 def _qdi_answerer_stable_prefix(context: dict[str, Any]) -> str:
-    """Share the planner's exact prefix and routing key across all questions."""
-    return stable_dynamic_prompt(stable=context)[0]
+    """Return the project prefix shared by Planner and every QDI question."""
+    segments, _ = _qdi_stable_context_segments(_qdi_project_cache_context(context), None)
+    return segments[0]["content"]
+
+
+def _qdi_answerer_cache_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility alias for callers that need only the shared project facts."""
+    return _qdi_project_cache_context(context)
+
+
+def _qdi_cfg_int(cfg: Any | None, name: str, default: int) -> int:
+    investigation = getattr(cfg, "investigation", None) if cfg is not None else None
+    try:
+        return max(1, int(getattr(investigation, name, default)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _qdi_bounded_text(value: Any, limit: int) -> str:
+    return str(value or "")[: max(0, int(limit))]
+
+
+def _qdi_unique_strings(values: Any, *, limit: int, item_chars: int = 700) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in list(values or []):
+        text = _qdi_bounded_text(value, item_chars).strip()
+        if not text:
+            continue
+        key = re.sub(r"\s+", " ", text).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _qdi_compact_authoritative_memory(memory: Any) -> dict[str, Any]:
+    """Keep authority-bearing facts while removing repeated prose and telemetry."""
+    if not isinstance(memory, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, limit, chars in (
+        ("summary", 1, 1800),
+        ("task_goal", 1, 1800),
+        ("source_files", 40, 220),
+        ("input_requirements", 18, 700),
+        ("output_requirements", 18, 700),
+        ("evaluation_requirements", 18, 700),
+        ("constraints", 28, 700),
+        ("leakage_guards", 18, 700),
+        ("unresolved_questions", 16, 600),
+    ):
+        value = memory.get(key)
+        if isinstance(value, list):
+            bounded = _qdi_unique_strings(value, limit=limit, item_chars=chars)
+        elif value not in (None, ""):
+            bounded = _qdi_bounded_text(value, chars)
+        else:
+            bounded = ""
+        if bounded not in ("", [], {}, None):
+            out[key] = bounded
+    for key in ("has_authoritative_sources", "authority_conflicts"):
+        value = memory.get(key)
+        if value not in (None, "", [], {}):
+            if isinstance(value, list):
+                out[key] = value[:16]
+            else:
+                out[key] = value
+    contract = memory.get("submission_contract")
+    if isinstance(contract, dict):
+        out["submission_contract"] = {
+            key: contract[key]
+            for key in (
+                "is_defined",
+                "is_authoritative",
+                "output_filename",
+                "sample_filename",
+                "columns",
+                "row_unit",
+                "row_count_rule",
+                "format_description",
+                "validation_rules",
+                "source",
+            )
+            if contract.get(key) not in (None, "", [], {})
+        }
+    return out
+
+
+def _qdi_compact_constraint_memory(memory: Any) -> dict[str, Any]:
+    """Retain high-impact constraint semantics without replaying the ledger.
+
+    The complete constraint memory is stored in the project artifact.  The
+    provider prefix only needs enough information to route a question.  Keep
+    hard/current items first, expose a small exact excerpt, and make omission
+    explicit so an omitted item can never be interpreted as a negative fact.
+    """
+    if not isinstance(memory, dict):
+        return {}
+    out: dict[str, Any] = {}
+    summary = _qdi_bounded_text(memory.get("summary"), 1400).strip()
+    if summary:
+        out["summary"] = summary
+    source_items = [item for item in list(memory.get("items") or []) if isinstance(item, dict)]
+    priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    strength_rank = {"hard": 0, "soft": 1, "unknown": 2}
+    status_rank = {"current": 0, "unresolved": 1, "current_candidate": 2}
+    source_items.sort(
+        key=lambda item: (
+            priority_rank.get(str(item.get("priority") or "medium").lower(), 4),
+            strength_rank.get(str(item.get("strength") or "unknown").lower(), 3),
+            status_rank.get(str(item.get("status") or "unresolved").lower(), 3),
+            str(item.get("name") or ""),
+        )
+    )
+    visible_limit = 16
+    items: list[dict[str, Any]] = []
+    for item in source_items[:visible_limit]:
+        if not isinstance(item, dict):
+            continue
+        compact = {
+            key: item[key]
+            for key in (
+                "name",
+                "description",
+                "priority",
+                "strength",
+                "status",
+                "related_fields",
+                "acceptance_check",
+                "status_reason",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        if isinstance(compact.get("description"), str):
+            compact["description"] = compact["description"][:420]
+        if isinstance(compact.get("acceptance_check"), str):
+            compact["acceptance_check"] = compact["acceptance_check"][:360]
+        if isinstance(compact.get("status_reason"), str):
+            compact["status_reason"] = compact["status_reason"][:280]
+        if isinstance(compact.get("related_fields"), list):
+            compact["related_fields"] = [str(x)[:100] for x in compact["related_fields"][:8]]
+        evidence = _qdi_unique_strings(item.get("evidence"), limit=1, item_chars=180)
+        if evidence:
+            compact["evidence"] = evidence
+        if compact:
+            items.append(compact)
+    if items:
+        out["items"] = items
+    if len(source_items) > len(items):
+        out["items_omitted_count"] = len(source_items) - len(items)
+    unresolved = _qdi_unique_strings(memory.get("unresolved_questions"), limit=12, item_chars=500)
+    if unresolved:
+        out["unresolved_questions"] = unresolved
+    aliases = memory.get("entity_alias_candidates")
+    if isinstance(aliases, list):
+        out["entity_alias_candidate_count"] = len(aliases)
+    return out
+
+
+def _qdi_table_index_card(card: dict[str, Any]) -> dict[str, Any]:
+    fields = card.get("fields") if isinstance(card.get("fields"), list) else []
+    field_names: list[str] = []
+    field_roles: dict[str, str] = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name = str(field.get("name") or "").strip()
+        if not name or name in field_names:
+            continue
+        field_names.append(name[:120])
+        role = str(field.get("role") or "").strip()
+        if role and role != "other":
+            field_roles[name[:120]] = role[:80]
+    if not field_names:
+        field_names = [
+            str(value)[:120]
+            for value in (card.get("physical_columns_exact") or card.get("field_hints") or [])
+            if str(value).strip()
+        ]
+    field_name_count = len(field_names)
+    result = {
+        key: card.get(key)
+        for key in (
+            "table_id",
+            "source_file",
+            "sheet_name",
+            "table_kind",
+            "role",
+            "shape",
+            "verified_row_count",
+            "row_count_basis",
+            "layout_kind",
+            "sheet_group_id",
+            "sheet_group_size",
+        )
+        if card.get(key) not in (None, "", [], {})
+    }
+    if field_names:
+        result["field_names"] = field_names[:16]
+        if field_name_count > 16:
+            result["field_names_omitted_count"] = field_name_count - 16
+    if field_roles:
+        result["field_roles"] = {
+            name: role
+            for name, role in list(field_roles.items())[:16]
+        }
+        if len(field_roles) > 16:
+            result["field_roles_omitted_count"] = len(field_roles) - 16
+    artifact_refs = card.get("artifact_refs")
+    if isinstance(artifact_refs, list):
+        refs = [
+            _artifact_ref_index_for_prompt(ref)
+            for ref in artifact_refs[:3]
+            if isinstance(ref, dict) and ref.get("artifact_id")
+        ]
+        if refs:
+            result["artifact_refs"] = refs
+    return result
+
+
+def _qdi_compact_project_table_cards(
+    cards: Any,
+    *,
+    cfg: Any | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return a route-complete index and a bounded evidence-card subset."""
+    source_cards = [card for card in list(cards or []) if isinstance(card, dict)]
+    source_cards.sort(
+        key=lambda card: (
+            str(card.get("source_file") or ""),
+            str(card.get("sheet_name") or ""),
+            str(card.get("table_id") or ""),
+        )
+    )
+    table_index = [_qdi_table_index_card(card) for card in source_cards]
+    card_limit = _qdi_cfg_int(cfg, "project_table_card_limit", 24)
+    field_limit = _qdi_cfg_int(cfg, "project_table_card_field_limit", 12)
+    max_chars = _qdi_cfg_int(cfg, "project_table_cards_max_chars", 60000)
+    per_source_limit = _qdi_cfg_int(cfg, "project_table_cards_per_source", 8)
+
+    def score(card: dict[str, Any]) -> tuple[int, str]:
+        role = str(card.get("role") or "").lower()
+        kind = str(card.get("table_kind") or "").lower()
+        priority = 0
+        if role in {"task_requirement", "data_description"} or kind == "document":
+            priority += 4
+        if role in {"raw_data_table", "label_table", "output_table"}:
+            priority += 3
+        if card.get("row_count_conflict") or card.get("reading_risks"):
+            priority += 1
+        return -priority, str(card.get("table_id") or card.get("source_file") or "")
+
+    selected: list[dict[str, Any]] = []
+    source_counts: dict[str, int] = {}
+    used_chars = 0
+    omitted: list[dict[str, Any]] = []
+    for card in sorted(source_cards, key=score):
+        source = str(card.get("source_file") or card.get("table_id") or "")
+        if len(selected) >= card_limit or source_counts.get(source, 0) >= per_source_limit:
+            omitted.append(_qdi_table_index_card(card))
+            continue
+        projected = _json_safe(compact_detail_table_card_for_prompt(card, field_limit=field_limit))
+        size = len(json.dumps(projected, ensure_ascii=False, sort_keys=True, default=str))
+        if selected and used_chars + size > max_chars:
+            omitted.append(_qdi_table_index_card(card))
+            continue
+        selected.append(projected)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        used_chars += size
+    if omitted:
+        selected.append(
+            {
+                "table_id": "__omitted_project_table_cards__",
+                "table_kind": "omitted_table_manifest",
+                "omitted_count": len(omitted),
+                "omitted_table_ids": [
+                    str(item.get("table_id") or item.get("source_file") or "")
+                    for item in omitted[:24]
+                ],
+                "omitted_table_ids_are_sample": len(omitted) > 24,
+                "detail_policy": (
+                    "Only the bounded evidence-card subset is visible here. "
+                    "Use request_context for a table card or read_qdi_artifact_excerpt "
+                    "on full_project_context_artifact for exact omitted details."
+                ),
+            }
+        )
+    return table_index, selected
+
+
+def _qdi_compact_relations(value: Any, *, limit: int) -> list[dict[str, Any]]:
+    relations = [item for item in list(value or []) if isinstance(item, dict)]
+    relations.sort(
+        key=lambda item: (
+            str(item.get("left_file") or ""),
+            str(item.get("right_file") or ""),
+            str(item.get("left_field") or ""),
+            str(item.get("right_field") or ""),
+        )
+    )
+    out: list[dict[str, Any]] = []
+    for item in relations[: max(1, int(limit))]:
+        compact = {
+            key: item.get(key)
+            for key in (
+                "left_file",
+                "left_field",
+                "right_file",
+                "right_field",
+                "relation_type",
+                "confidence",
+                "short_evidence",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        if isinstance(compact.get("short_evidence"), str):
+            compact["short_evidence"] = compact["short_evidence"][:320]
+        if compact:
+            out.append(compact)
+    return out
+
+
+def _qdi_compact_coverage(value: Any, *, limit: int = 80) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    source_entries = [item for item in list(value.get("entries") or []) if isinstance(item, dict)]
+
+    def attention_score(item: dict[str, Any]) -> tuple[int, str]:
+        score = 0
+        if item.get("row_count_conflict"):
+            score -= 6
+        if item.get("verified_row_count") in (None, ""):
+            score -= 4
+        if item.get("recommended_read") or item.get("layout_kind"):
+            score -= 2
+        if str(item.get("coverage_status") or "") in {"required", "supporting"}:
+            score -= 1
+        return score, str(item.get("table_id") or item.get("source_file") or "")
+
+    # table_index already carries the complete route inventory.  Coverage is
+    # therefore an exception ledger in the stable prefix, not a second copy of
+    # every table schema.
+    attention_entries = sorted(source_entries, key=attention_score)
+    visible_limit = max(1, min(int(limit), 24))
+    entries: list[dict[str, Any]] = []
+    for item in attention_entries[:visible_limit]:
+        if not isinstance(item, dict):
+            continue
+        is_attention = bool(
+            item.get("row_count_conflict")
+            or item.get("verified_row_count") in (None, "")
+            or item.get("recommended_read")
+            or item.get("layout_kind")
+            or str(item.get("coverage_status") or "") not in {"documentation", "required", "supporting"}
+        )
+        if not is_attention and len(entries) >= 8:
+            continue
+        compact = {
+            key: item.get(key)
+            for key in (
+                "table_id",
+                "source_file",
+                "sheet_name",
+                "table_kind",
+                "source_role",
+                "coverage_status",
+                "verified_shape",
+                "verified_row_count",
+                "row_count_basis",
+                "row_count_conflict",
+                "schema_signature_fields",
+                "recommended_read",
+                "layout_kind",
+                "primary_key_candidates",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        if isinstance(compact.get("schema_signature_fields"), list):
+            compact["schema_signature_fields"] = [
+                str(x)[:100] for x in compact["schema_signature_fields"][:12]
+            ]
+        entries.append(compact)
+    out = {
+        key: value[key]
+        for key in ("schema_version", "counts", "original_table_count", "visible_entry_count", "omitted_table_count")
+        if value.get(key) not in (None, "", [], {})
+    }
+    if entries:
+        out["entries"] = entries
+    out["entry_policy"] = (
+        "table_index is the complete source route; entries here are only coverage exceptions "
+        "and a small required/supporting sample. Read the full ledger artifact for exact inventory."
+    )
+    out["visible_entry_count"] = len(entries)
+    out["omitted_entry_count"] = max(0, len(source_entries) - len(entries))
+    return out
+
+
+def _qdi_compact_verification_queue(value: Any, *, limit: int = 6) -> list[dict[str, Any]]:
+    """Project only the routing fields of deterministic verification work.
+
+    Keep the historical list shape so prompt/report consumers do not need a
+    schema migration; the final marker carries the omission count.
+    """
+    source = [item for item in list(value or []) if isinstance(item, dict)]
+    out: list[dict[str, Any]] = []
+    for item in source[: max(1, int(limit))]:
+        compact = {
+            key: item.get(key)
+            for key in (
+                "question_id",
+                "category",
+                "priority",
+                "reason",
+                "left_file",
+                "left_field",
+                "right_file",
+                "right_field",
+                "relation_type",
+                "table_id",
+                "source_file",
+                "check_kind",
+                "recommended_action",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        if isinstance(compact.get("reason"), str):
+            compact["reason"] = compact["reason"][:320]
+        if compact:
+            out.append(compact)
+    if len(source) > len(out):
+        out.append(
+            {
+                "queue_policy": (
+                    "Only compact routing candidates are visible; use the full "
+                    "project-context artifact for omitted verification details."
+                ),
+                "omitted_count": len(source) - len(out),
+            }
+        )
+    return out
+
+
+def _qdi_compact_aliases(value: Any, *, limit: int) -> list[dict[str, Any]]:
+    groups = [item for item in list(value or []) if isinstance(item, dict)]
+    rank = {"high": 0, "medium": 1, "low": 2}
+    groups.sort(
+        key=lambda item: (
+            rank.get(str(item.get("task_relevance") or "medium").lower(), 3),
+            str(item.get("concept_id") or ""),
+        )
+    )
+    out: list[dict[str, Any]] = []
+    for group in groups[: max(1, int(limit))]:
+        compact = {
+            key: group.get(key)
+            for key in (
+                "concept_id",
+                "label",
+                "reason",
+                "confidence",
+                "task_relevance",
+                "evidence_status",
+                "status",
+                "caution",
+                "recommended_qdi_checks",
+            )
+            if group.get(key) not in (None, "", [], {})
+        }
+        candidates = []
+        for item in list(group.get("candidate_fields") or [])[:12]:
+            if not isinstance(item, dict):
+                continue
+            candidates.append(
+                {
+                    key: item.get(key)
+                    for key in ("source_file", "source_collection", "sheet_name", "field", "alias_family", "status")
+                    if item.get(key) not in (None, "", [], {})
+                }
+            )
+        if candidates:
+            compact["candidate_fields"] = candidates
+        if isinstance(compact.get("reason"), str):
+            compact["reason"] = compact["reason"][:520]
+        if isinstance(compact.get("caution"), str):
+            compact["caution"] = compact["caution"][:520]
+        if compact:
+            out.append(compact)
+    return out
+
+
+def _qdi_compact_document_manifest(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in list(value or [])[:120]:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "document_id",
+                    "source_file",
+                    "suffix",
+                    "pages",
+                    "paragraphs",
+                    "chunk_count",
+                    "text_chars",
+                    "requires_ocr",
+                    "parse_error",
+                    "full_text_local",
+                )
+                if item.get(key) not in (None, "", [], {})
+            }
+        )
+    return out
+
+
+def _qdi_compact_prior_memory(value: Any, *, answer_limit: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    answers: list[dict[str, Any]] = []
+    for item in list(value.get("answers") or [])[: max(1, int(answer_limit))]:
+        if not isinstance(item, dict):
+            continue
+        answers.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "question_id",
+                    "question",
+                    "answer",
+                    "evidence",
+                    "confidence",
+                    "remaining_uncertainty",
+                    "source_status",
+                    "source_inventory_status",
+                    "qdi_contract_status",
+                    "changed_source_files",
+                )
+                if item.get(key) not in (None, "", [], {})
+            }
+        )
+    delta = value.get("source_delta") if isinstance(value.get("source_delta"), dict) else {}
+    result = {
+        "available": bool(value.get("available") or answers),
+        "reuse_policy": _qdi_bounded_text(value.get("reuse_policy"), 700),
+    }
+    if answers:
+        result["answers"] = answers
+    if delta:
+        result["source_delta"] = {
+            key: [str(x)[:180] for x in list(delta.get(key) or [])[:40]]
+            for key in ("unchanged_files", "new_files", "changed_files", "removed_files")
+            if delta.get(key)
+        }
+    return {key: val for key, val in result.items() if val not in (None, "", [], {})}
+
+
+def _qdi_project_cache_context(
+    context: dict[str, Any],
+    cfg: Any | None = None,
+) -> dict[str, Any]:
+    """Project facts that remain stable across questions and QDI stages.
+
+    The full context is retained in ``qdi_project_context_full``.  This
+    projection is intentionally a small, deterministic cache prefix: all table
+    identifiers remain routable, while detailed cards and long ledgers are
+    available through bounded retrieval actions.
+    """
+    source = dict(context or {})
+    table_index, table_cards = _qdi_compact_project_table_cards(
+        source.get("table_cards"),
+        cfg=cfg,
+    )
+    relation_limit = _qdi_cfg_int(cfg, "project_relation_limit", 24)
+    relation_cards = _qdi_compact_relations(source.get("relations"), limit=relation_limit)
+    verified_relations = _qdi_compact_relations(
+        source.get("verified_relation_cards"),
+        limit=relation_limit,
+    )
+    field_glossary = []
+    for item in list(source.get("field_glossary") or [])[
+        : _qdi_cfg_int(cfg, "project_field_glossary_limit", 40)
+    ]:
+        if not isinstance(item, dict):
+            continue
+        field_glossary.append(
+            {
+                key: item.get(key)
+                for key in ("field", "meaning", "role", "files")
+                if item.get(key) not in (None, "", [], {})
+            }
+        )
+    stable: dict[str, Any] = {
+        "schema_version": QDI_PROJECT_CONTEXT_LAYOUT,
+        "context_policy": {
+            "stable_prefix_is_immutable": True,
+            "task_hint_is_dynamic": True,
+            "prior_qdi_memory_is_dynamic": True,
+            "prior_qdi_answers_are_hypotheses_until_current_source_check": True,
+            "full_project_context_is_local_artifact": True,
+            "table_index_is_route_complete": True,
+            "table_cards_are_bounded_evidence": True,
+            "omitted_details_are_not_negative_evidence": True,
+            "request_context_is_preferred_for_one_or_two_table_details": True,
+            "read_qdi_artifact_excerpt_is_preferred_for_exact_long_details": True,
+            "authoritative_memory_and_constraint_memory_are_compact_views": True,
+        },
+        "data_root_name": _qdi_bounded_text(source.get("data_root_name"), 240),
+        "authoritative_memory": _qdi_compact_authoritative_memory(source.get("authoritative_memory")),
+        "constraint_memory": _qdi_compact_constraint_memory(source.get("constraint_memory")),
+        "table_index": table_index,
+        "table_cards": table_cards,
+        "relations": relation_cards,
+        "verified_relation_cards": verified_relations,
+        "relation_verification_queue": _qdi_compact_verification_queue(
+            source.get("relation_verification_queue"),
+            limit=6,
+        ),
+        "population_verification_queue": _qdi_compact_verification_queue(
+            source.get("population_verification_queue"),
+            limit=6,
+        ),
+        "source_coverage_ledger": _qdi_compact_coverage(source.get("source_coverage_ledger")),
+        "document_manifest": _qdi_compact_document_manifest(source.get("document_manifest")),
+        "entity_alias_candidates": _qdi_compact_aliases(
+            source.get("entity_alias_candidates"),
+            limit=_qdi_cfg_int(cfg, "project_entity_alias_limit", 16),
+        ),
+        "field_glossary": field_glossary,
+        "sampled_filename_patterns": list(source.get("sampled_filename_patterns") or [])[:40],
+        "filename_sample_groups": list(source.get("filename_sample_groups") or [])[
+            : _qdi_cfg_int(cfg, "project_filename_group_limit", 16)
+        ],
+        "script_investigation_policy": {
+            "input_dir": "read-only",
+            "scratch_dir": "temporary writable and destroyed after execution",
+            "custom_python_contract": "def analyze(input_dir: str, scratch_dir: str) -> dict",
+            "output_policy": "Return compact aggregate JSON; never print full tables.",
+        },
+        "limits": {
+            key: source.get("limits", {}).get(key)
+            for key in (
+                "max_questions",
+                "max_rounds_per_run",
+                "question_bfs_max_depth",
+                "max_followup_questions_per_question",
+                "allow_custom_readonly_python",
+            )
+            if isinstance(source.get("limits"), dict)
+            and source.get("limits", {}).get(key) not in (None, "")
+        },
+    }
+    return {
+        key: value
+        for key, value in stable.items()
+        if value not in (None, "", [], {})
+    } | {"zz_qdi_cache_layout": QDI_CACHE_LAYOUT}
+
+
+def _qdi_question_cache_context(
+    context: dict[str, Any],
+    question: dict[str, Any],
+    routed_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Question route only; all bounded table evidence stays in project prefix."""
+    route = routed_context if isinstance(routed_context, dict) else context
+    cards = route.get("table_cards") if isinstance(route.get("table_cards"), list) else []
+    candidate_files = {
+        str(item).replace("\\", "/")
+        for item in (question.get("candidate_files") or [])
+        if str(item).strip()
+    }
+
+    def card_names(card: dict[str, Any]) -> set[str]:
+        return {
+            str(card.get(key, "")).replace("\\", "/")
+            for key in ("table_id", "source_file")
+            if str(card.get(key, "")).strip()
+        }
+
+    routed_cards = [
+        card for card in cards
+        if isinstance(card, dict) and (not candidate_files or card_names(card) & candidate_files)
+    ]
+    result: dict[str, Any] = {
+        "question_route": {
+            "candidate_files": sorted(candidate_files),
+            "candidate_table_ids": [
+                str(card.get("table_id") or "")
+                for card in routed_cards
+                if str(card.get("table_id") or "").strip()
+            ][:80],
+            "candidate_source_files": sorted({
+                str(card.get("source_file") or "")
+                for card in routed_cards
+                if str(card.get("source_file") or "").strip()
+            })[:80],
+            "all_table_details_are_in_project_prefix": True,
+        },
+        "question_context_policy": {
+            "table_details": "All bounded table cards are in the stable project prefix; this segment carries route identifiers only.",
+            "missing_details_are_not_negative_evidence": True,
+        },
+        "zz_qdi_segment": "question-route-v6",
+    }
+    if question:
+        result["initial_question"] = {
+            "question_id": str(question.get("question_id") or ""),
+            "question": str(question.get("question") or ""),
+            "category": str(question.get("category") or ""),
+            "why_blocking": str(question.get("why_blocking") or ""),
+            "candidate_files": [str(x) for x in (question.get("candidate_files") or [])],
+            "parent_id": str(question.get("parent_id") or ""),
+            "depth": int(question.get("depth", 0) or 0),
+        }
+    return result
+
+
+def _qdi_stable_context_segments(
+    project_context: dict[str, Any],
+    question_context: dict[str, Any] | None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    segments = [{
+        "name": "project",
+        "content": json_block("QDI project context", project_context, sort_keys=True),
+    }]
+    lookup = dict(project_context)
+    if question_context is not None:
+        segments.append({
+            "name": "question",
+            "content": json_block("QDI question context", question_context, sort_keys=True),
+        })
+        lookup.update(question_context)
+    return segments, lookup
+
+
+def _qdi_structured_call(
+    *,
+    node_cache: QDINodeResultCache,
+    cost_controls: dict[str, Any],
+    llm_client: Any,
+    model_cls: Any,
+    system_prompt: str,
+    user_prompt: str,
+    prompt_name: str,
+    fewshot: str = "",
+    max_tokens: int | None = None,
+    static_context_prompt: str = "",
+    dynamic_user_prompt: str | None = None,
+    stable_context_segments: list[dict[str, str]] | None = None,
+    schema_prompt: str = "",
+) -> Any:
+    """Call structured LLM with a validated, versioned QDI decision cache."""
+    request = {
+        "cache_layout": QDI_CACHE_LAYOUT,
+        "prompt_name": prompt_name,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "fewshot": fewshot,
+        "max_tokens": max_tokens,
+        "static_context_prompt": static_context_prompt,
+        "dynamic_user_prompt": dynamic_user_prompt if dynamic_user_prompt is not None else user_prompt,
+        "stable_context_segments": stable_context_segments or [],
+        "schema_prompt": schema_prompt,
+    }
+    key = node_cache.key(model_cls=model_cls, llm_client=llm_client, request=request)
+    cached = node_cache.get(key, model_cls)
+    if cached is not None:
+        cost_controls.update(node_cache.stats())
+        return cached
+    result = llm_client.ask_structured(
+        model_cls=model_cls,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        prompt_name=prompt_name,
+        fewshot=fewshot,
+        max_tokens=max_tokens,
+        static_context_prompt=static_context_prompt,
+        dynamic_user_prompt=dynamic_user_prompt,
+        stable_context_segments=stable_context_segments,
+        schema_prompt=schema_prompt,
+    )
+    metadata = getattr(llm_client, "last_call_metadata", None)
+    cacheable = bool(
+        isinstance(metadata, dict)
+        and metadata.get("parsed_ok")
+        and (
+            metadata.get("source") == "local_response_cache"
+            or (
+                metadata.get("source") == "provider"
+                and metadata.get("finish_reason") == "stop"
+            )
+        )
+    )
+    node_cache.put(key, result, cacheable=cacheable)
+    cost_controls.update(node_cache.stats())
+    return result
 
 
 def _empty_working_memory_card(question_id: str) -> dict[str, Any]:
@@ -3235,15 +5944,10 @@ def _merge_working_memory_card(
     max_chars: int,
 ) -> dict[str, Any]:
     merged = dict(card or {})
+    merged.pop("_full_memory_artifact", None)
     # Exact references prevent a new conclusion from erasing unrelated gaps.
     # Full resolution records remain in the existing action trajectory.
     evidence_refs = set(merged.get("evidence_refs") or []) | set(getattr(update, "evidence_refs", []) or [])
-    for resolution in getattr(update, "resolutions", []) or []:
-        if (resolution.field in {"open_gaps", "confirmed_facts", "temporary_conclusions"}
-                and resolution.reason.strip() and resolution.evidence_refs
-                and set(resolution.evidence_refs).issubset(evidence_refs)):
-            merged[resolution.field] = [item for item in merged.get(resolution.field, [])
-                                        if item != resolution.text]
     list_fields = (
         "confirmed_facts",
         "temporary_conclusions",
@@ -3252,33 +5956,68 @@ def _merge_working_memory_card(
         "invalidated_hypotheses",
     )
     for field in list_fields:
-        existing = [str(x)[:800] for x in (merged.get(field) or []) if str(x).strip()]
-        incoming = [str(x)[:800] for x in (getattr(update, field, []) or []) if str(x).strip()]
-        merged[field] = _dedupe_qdi_strings(existing + incoming, limit=24)
+        existing = [str(x) for x in (merged.get(field) or []) if str(x).strip()]
+        incoming = [str(x) for x in (getattr(update, field, []) or []) if str(x).strip()]
+        merged[field] = list(dict.fromkeys(existing + incoming))
+    for resolution in getattr(update, "resolutions", []) or []:
+        if (resolution.field in {"open_gaps", "confirmed_facts", "temporary_conclusions"}
+                and resolution.reason.strip() and resolution.evidence_refs
+                and set(resolution.evidence_refs).issubset(evidence_refs)):
+            merged[resolution.field] = [item for item in merged.get(resolution.field, [])
+                                        if item != resolution.text]
     focus = str(getattr(update, "recommended_next_focus", "") or "").strip()
     if focus:
-        merged["recommended_next_focus"] = focus[:1200]
+        merged["recommended_next_focus"] = focus
     merged["last_updated_sequence"] = int(sequence)
-    limit = max(1000, int(max_chars))
-    trim_order = (
-        "temporary_conclusions",
-        "open_gaps",
-        "invalidated_hypotheses",
-        "confirmed_facts",
-        "evidence_refs",
-    )
-    while len(json.dumps(merged, ensure_ascii=False, sort_keys=True, default=str)) > limit:
-        changed = False
-        for field in trim_order:
-            values = merged.get(field)
-            if isinstance(values, list) and len(values) > 1:
-                values.pop(0)
-                changed = True
-                break
-        if not changed:
-            merged["recommended_next_focus"] = str(merged.get("recommended_next_focus") or "")[:400]
-            break
     return merged
+
+
+def _working_memory_prompt_view(card: dict[str, Any], *, max_chars: int) -> dict[str, Any]:
+    """Project complete memory into whole, attributable entries with a readable original."""
+    limit = max(1000, int(max_chars))
+    serialized = json.dumps(card, ensure_ascii=False, sort_keys=True, default=str)
+    if len(serialized) <= limit:
+        return card
+    ref = card.get("_full_memory_artifact")
+    view: dict[str, Any] = {
+        "question_id": card.get("question_id", ""),
+        "last_updated_sequence": card.get("last_updated_sequence", 0),
+        "trust_policy": card.get("trust_policy", ""),
+        "truncated": True,
+        "original_chars": len(serialized),
+        "full_memory_artifact": _artifact_ref_index_for_prompt(ref) if isinstance(ref, dict) else {},
+        "omitted_entries": {},
+        "instruction": "Only included whole entries are visible; use full_memory_artifact to read omitted exact text.",
+    }
+    # Pending gaps and verified facts win prompt space over tentative interpretations.
+    fields = (
+        "open_gaps", "confirmed_facts", "invalidated_hypotheses",
+        "evidence_refs", "temporary_conclusions",
+    )
+    for field in fields:
+        items = list(card.get(field) or [])
+        view[field] = []
+        view["omitted_entries"][field] = len(items)
+    focus = str(card.get("recommended_next_focus") or "")
+    if focus:
+        view["recommended_next_focus_omitted"] = True
+    for field in fields:
+        items = list(card.get(field) or [])
+        for index in range(len(items) - 1, -1, -1):
+            item = items[index]
+            entry = {"index": index, "text": item}
+            view[field].append(entry)
+            view["omitted_entries"][field] -= 1
+            if len(json.dumps(view, ensure_ascii=False, sort_keys=True, default=str)) > limit:
+                view[field].pop()
+                view["omitted_entries"][field] += 1
+    if focus:
+        view["recommended_next_focus"] = focus
+        view.pop("recommended_next_focus_omitted", None)
+        if len(json.dumps(view, ensure_ascii=False, sort_keys=True, default=str)) > limit:
+            view.pop("recommended_next_focus")
+            view["recommended_next_focus_omitted"] = True
+    return view
 
 
 def _recent_action_window(actions: list[dict[str, Any]], *, count: int) -> list[dict[str, Any]]:
@@ -3323,7 +6062,7 @@ def _artifact_backed_observation(
         visible_excerpt=text[: max(1, int(max_chars))],
         visible_limit=max_chars,
     )
-    view["artifact_ref"] = ref
+    view["artifact_ref"] = _artifact_ref_index_for_prompt(ref)
     return view
 
 
@@ -3337,10 +6076,13 @@ def _new_live_action_entry(
     script_chars: int,
 ) -> dict[str, Any]:
     request: dict[str, Any]
-    if action_name == "request_script":
+    if action_name == "request_checks":
+        request = {"checks": [check.model_dump() for check in action.request_checks]}
+    elif action_name == "request_script":
         request = action.request_script.model_dump()
         code = str(request.get("python_code") or "")
-        if len(code) > max(1, int(script_chars)):
+        request["python_code_sha256"] = hashlib.sha256(code.encode()).hexdigest()
+        if code:
             ref = artifact_store.put(
                 "qdi_script_source_full",
                 f"{question_id}:action:{sequence}",
@@ -3349,10 +6091,10 @@ def _new_live_action_entry(
                 visible_limit=script_chars,
             )
             request["python_code"] = code[: max(1, int(script_chars))]
-            request["python_code_truncated"] = True
+            request["python_code_truncated"] = len(code) > max(1, int(script_chars))
             request["python_code_original_chars"] = len(code)
             request["python_code_visible_chars"] = len(request["python_code"])
-            request["source_artifact"] = ref
+            request["source_artifact"] = _artifact_ref_index_for_prompt(ref)
     elif action_name == "request_context":
         request = action.request_context.model_dump()
     elif action_name == "search_document":
@@ -3518,13 +6260,7 @@ def _normalize_request(req: InvestigationToolRequest, idx: int) -> Investigation
 
 
 def _request_signature(req: InvestigationToolRequest) -> str:
-    payload = {
-        "tool_name": req.tool_name,
-        "question_id": req.question_id,
-        "params": req.params,
-        "code": req.custom_python.python_code[:200] if req.tool_name == "custom_readonly_python" else "",
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return request_signature(req)
 
 
 def _failed_result(request: InvestigationToolRequest, error: str, *, result: dict[str, Any] | None = None) -> InvestigationStepResult:
@@ -3548,15 +6284,10 @@ def _compact_for_prompt(value: dict[str, Any], cfg: AutoRealizeConfig) -> dict[s
 
 
 def _truncate_result(value: Any, max_chars: int) -> Any:
-    safe = _json_safe(value)
-    text = json.dumps(safe, ensure_ascii=False, default=str)
-    if len(text) <= max_chars:
-        return safe
-    return {
-        "_truncated": True,
-        "chars": len(text),
-        "preview_json": text[:max_chars],
-    }
+    view = _visible_output_payload(value, max_chars)
+    if not view["output_truncated"]:
+        return _json_safe(value)
+    return json.loads(view["current_visible_output"])
 
 
 def _json_safe(value: Any) -> Any:

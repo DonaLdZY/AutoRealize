@@ -4,13 +4,14 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 from .config import AutoRealizeConfig
 from .context_compiler import ArtifactStore
 from .logging_utils import log_event
 from .models import CrossStageMemorySummary, CrossStageRetrievalPlan
-from .prompt_cache import estimate_text_tokens, json_block, stable_dynamic_prompt
+from .prompt_cache import estimate_text_tokens, json_block, stable_dynamic_prompt, dynamic_json_block
 from .utils.safe_json import json_safe, write_json_safe
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,30 @@ def _truncate_to_token_budget(text: str, max_tokens: int) -> str:
         else:
             high = middle - 1
     return value[:low]
+
+
+def _artifact_ids_in_value(value: Any, known: set[str]) -> list[str]:
+    """Collect only artifact IDs already present in the local catalog."""
+    found: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in {"artifact_id", "full_stable_context_artifact", "full_dynamic_payload_artifact"}:
+                    candidate = str(child if key == "artifact_id" else (child.get("artifact_id") if isinstance(child, dict) else "") or "").strip()
+                    if candidate in known and candidate not in found:
+                        found.append(candidate)
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        elif isinstance(item, str):
+            for candidate in re.findall(r"\b(?:cross_stage|qdi)_[A-Za-z0-9_]+\b", item):
+                if candidate in known and candidate not in found:
+                    found.append(candidate)
+
+    visit(value)
+    return found
 
 
 class CrossStageContextLedger:
@@ -227,14 +252,14 @@ class CrossStageContextLedger:
         if complete_current_snapshot:
             # Final cross-artifact review already carries every current contract,
             # exact source schema and QDI result. Old draft retrieval is redundant.
-            return self.static_context_prompt, json_block(dynamic_title, {
+            return self.static_context_prompt, dynamic_json_block(dynamic_title, {
                 "context_policy": "Complete current artifacts plus the unchanged authoritative prefix; prior drafts remain in the audit trail.",
                 "current_stage": stage,
                 "current_stage_evidence": json_safe(stage_evidence),
                 "latest_request": json_safe(latest_request),
-            }, sort_keys=False)
+            }, self.stable_context, sort_keys=False)
         self._compact_if_needed(stage)
-        recovered = self._retrieve_if_needed(stage, latest_request)
+        recovered = self._retrieve_if_needed(stage, stage_evidence, latest_request)
         payload = {
             "cross_stage_memory_policy": {
                 "summary_is_lossy": True,
@@ -291,10 +316,10 @@ class CrossStageContextLedger:
         payload["latest_request"] = safe_latest_request
         # Preserve insertion order so recent evidence and the latest request stay
         # at the tail, where recency-sensitive providers see them last.
-        return self.static_context_prompt, json_block(
+        return self.static_context_prompt, dynamic_json_block(
             dynamic_title,
             payload,
-            limit=None,
+            self.stable_context,
             sort_keys=False,
         )
 
@@ -418,48 +443,79 @@ class CrossStageContextLedger:
             budget_tokens=trigger_tokens,
             compacted_entries=len(older),
         )
-        dynamic = json_block(
-            "需要压缩的跨阶段动态记忆",
-            {
-                "instruction": (
-                    "把旧阶段记忆压缩成可继续工作的结构化状态。保留已确认事实、决定、矛盾、未决问题和 artifact_id。"
-                    "不得把推测提升为事实，不得丢失会影响任务、评估、输出、数据读取或硬约束的内容。"
-                ),
-                "next_stage": next_stage,
-                "target_max_chars": target_chars,
-                "previous_summary": self.summary.model_dump(),
-                "older_entries": older,
-            },
+        use_llm_compactor = bool(
+            getattr(self.config.context, "cross_stage_memory_use_llm_compactor", False)
         )
-        try:
-            compacted = self.llm_client.ask_structured(
-                model_cls=CrossStageMemorySummary,
-                system_prompt=self.prompt_mgr.load("system/cross_stage_context_compactor.md"),
-                user_prompt=dynamic,
-                prompt_name=f"cross_stage_context_compactor_{self.compaction_count + 1}",
-                max_tokens=max(1200, min(6000, int(target_tokens * 1.35))),
-                static_context_prompt=self.static_context_prompt,
-                dynamic_user_prompt=dynamic,
-            )
-            compacted.evidence_artifact_ids = list(
-                dict.fromkeys(compacted.evidence_artifact_ids + source_artifact_ids)
-            )[:120]
-            self.summary = self._bounded_summary(compacted, target_chars, target_tokens)
-            source = "llm"
-        except Exception as exc:  # noqa: BLE001
-            artifact_ids = [str(x.get("artifact_id") or "") for x in older if str(x.get("artifact_id") or "")]
+        if not use_llm_compactor:
+            # Stage entries are already typed and each full payload is sealed in
+            # an artifact.  A second LLM summary adds latency and can silently
+            # rewrite authority.  Keep only compact routing cards here; exact
+            # evidence remains available through the recorded artifact IDs.
+            stage_summaries = list(self.summary.stage_summaries)
+            for item in older:
+                stage = str(item.get("stage") or "stage")
+                authority = str(item.get("authority") or "derived")
+                excerpt = " ".join(str(item.get("content_excerpt") or "").split())
+                stage_summaries.append(
+                    f"{stage} [{authority}] -> artifact:{item.get('artifact_id', '')}; "
+                    f"visible: {excerpt[:420]}"
+                )
             self.summary = CrossStageMemorySummary(
-                task_state=self.summary.task_state,
+                task_state=str(next_stage or self.summary.task_state),
                 confirmed_facts=list(self.summary.confirmed_facts),
                 decisions=list(self.summary.decisions),
                 unresolved_questions=list(self.summary.unresolved_questions),
                 contradictions=list(self.summary.contradictions),
-                evidence_artifact_ids=list(dict.fromkeys(self.summary.evidence_artifact_ids + artifact_ids))[:80],
-                stage_summaries=list(self.summary.stage_summaries)
-                + [f"{item.get('stage')}: full result retained in {item.get('artifact_id')}" for item in older],
+                evidence_artifact_ids=list(
+                    dict.fromkeys(self.summary.evidence_artifact_ids + source_artifact_ids)
+                )[:120],
+                stage_summaries=stage_summaries,
             )
-            source = "deterministic_fallback"
-            log_event(logger, "context.cross_stage", "COMPACTION_FAILED", error=str(exc)[:240])
+            self.summary = self._bounded_summary(self.summary, target_chars, target_tokens)
+            source = "deterministic"
+        else:
+            dynamic = json_block(
+                "需要压缩的跨阶段动态记忆",
+                {
+                    "instruction": (
+                        "把旧阶段记忆压缩成可继续工作的结构化状态。保留已确认事实、决定、矛盾、未决问题和 artifact_id。"
+                        "不得把推测提升为事实，不得丢失会影响任务、评估、输出、数据读取或硬约束的内容。"
+                    ),
+                    "next_stage": next_stage,
+                    "target_max_chars": target_chars,
+                    "previous_summary": self.summary.model_dump(),
+                    "older_entries": older,
+                },
+            )
+            try:
+                compacted = self.llm_client.ask_structured(
+                    model_cls=CrossStageMemorySummary,
+                    system_prompt=self.prompt_mgr.load("system/cross_stage_context_compactor.md"),
+                    user_prompt=dynamic,
+                    prompt_name=f"cross_stage_context_compactor_{self.compaction_count + 1}",
+                    max_tokens=max(1200, min(6000, int(target_tokens * 1.35))),
+                    static_context_prompt=self.static_context_prompt,
+                    dynamic_user_prompt=dynamic,
+                )
+                compacted.evidence_artifact_ids = list(
+                    dict.fromkeys(compacted.evidence_artifact_ids + source_artifact_ids)
+                )[:120]
+                self.summary = self._bounded_summary(compacted, target_chars, target_tokens)
+                source = "llm"
+            except Exception as exc:  # noqa: BLE001
+                artifact_ids = [str(x.get("artifact_id") or "") for x in older if str(x.get("artifact_id") or "")]
+                self.summary = CrossStageMemorySummary(
+                    task_state=self.summary.task_state,
+                    confirmed_facts=list(self.summary.confirmed_facts),
+                    decisions=list(self.summary.decisions),
+                    unresolved_questions=list(self.summary.unresolved_questions),
+                    contradictions=list(self.summary.contradictions),
+                    evidence_artifact_ids=list(dict.fromkeys(self.summary.evidence_artifact_ids + artifact_ids))[:80],
+                    stage_summaries=list(self.summary.stage_summaries)
+                    + [f"{item.get('stage')}: full result retained in {item.get('artifact_id')}" for item in older],
+                )
+                source = "deterministic_fallback"
+                log_event(logger, "context.cross_stage", "COMPACTION_FAILED", error=str(exc)[:240])
         self.summary = self._bounded_summary(self.summary, target_chars, target_tokens)
         self.entries = recent
         self.compaction_count += 1
@@ -494,7 +550,7 @@ class CrossStageContextLedger:
         )
         self._persist()
 
-    def _retrieve_if_needed(self, stage: str, latest_request: Any) -> list[dict[str, Any]]:
+    def _retrieve_if_needed(self, stage: str, stage_evidence: Any, latest_request: Any) -> list[dict[str, Any]]:
         if not bool(getattr(self.config.context, "cross_stage_retrieval_enabled", True)):
             return []
         if self.compaction_count <= 0 or not self.artifact_catalog:
@@ -515,6 +571,56 @@ class CrossStageContextLedger:
             return self._retrieval_cache[cache_key]
         max_artifacts = max(1, int(getattr(self.config.context, "cross_stage_retrieval_max_artifacts", 3)))
         excerpt_chars = max(500, int(getattr(self.config.context, "cross_stage_retrieval_excerpt_chars", 6000)))
+        allowed = {str(item.get("artifact_id") or "") for item in self.artifact_catalog}
+        use_llm_planner = bool(
+            getattr(self.config.context, "cross_stage_retrieval_use_llm_planner", False)
+        )
+        if not use_llm_planner:
+            # The host already owns the artifact catalog.  Follow only
+            # explicit references in the current stage payload; this removes a
+            # paid "should I retrieve?" turn and avoids speculative context.
+            explicit_ids = _artifact_ids_in_value(
+                {"stage_evidence": stage_evidence,
+                 "latest_request": latest_request},
+                allowed,
+            )
+            recovered: list[dict[str, Any]] = []
+            for artifact_id in explicit_ids[:max_artifacts]:
+                result = self.artifact_store.read_excerpt(
+                    artifact_id,
+                    max_chars=excerpt_chars,
+                    json_path="",
+                    allowed_type_prefixes=("cross_stage_",),
+                )
+                recovered.append(
+                    {
+                        "request_reason": "explicit artifact reference in current stage input",
+                        **result,
+                    }
+                )
+            self.retrieval_count += len(recovered)
+            self.retrieval_history.append(
+                {
+                    "stage": str(stage),
+                    "compaction": self.compaction_count,
+                    "status": "completed" if recovered else "not_needed",
+                    "planner": "deterministic_explicit_refs",
+                    "requested_artifact_ids": explicit_ids[:max_artifacts],
+                    "recovered": [
+                        {
+                            "artifact_id": str(item.get("artifact_id") or ""),
+                            "json_path": str(item.get("json_path") or ""),
+                            "status": str(item.get("status") or ""),
+                            "visible_chars": int(item.get("visible_chars") or 0),
+                        }
+                        for item in recovered
+                    ],
+                }
+            )
+            self.retrieval_history = self.retrieval_history[-120:]
+            self._retrieval_cache[cache_key] = recovered
+            self._persist()
+            return recovered
         dynamic = json_block(
             "压缩记忆取回决策",
             {
@@ -566,7 +672,6 @@ class CrossStageContextLedger:
             self._retrieval_cache[cache_key] = []
             self._persist()
             return []
-        allowed = {str(item.get("artifact_id") or "") for item in self.artifact_catalog}
         recovered: list[dict[str, Any]] = []
         for request in plan.requests[:max_artifacts]:
             artifact_id = str(request.artifact_id or "").strip()

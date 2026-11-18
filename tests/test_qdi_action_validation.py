@@ -53,6 +53,46 @@ def _response(content):
     )
 
 
+def test_extra_root_close_keeps_code_and_memory_without_paid_retry(tmp_path, monkeypatch):
+    code = 'def analyze(input_dir, scratch_dir):\n    return {"quoted": "}, not syntax"}'
+    prefix = {"action": "request_script", "request_script": {"python_code": code}}
+    tail = {"working_memory_update": {"open_gaps": ["Still need full-population coverage"]}, "notes": "Exact scope"}
+    malformed = json.dumps(prefix) + ',' + json.dumps(tail)[1:]
+    client = _client(tmp_path)
+    calls = []
+    def completion(**kwargs):
+        calls.append(kwargs)
+        return _response(malformed)
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry", completion)
+    try:
+        action = client.ask_structured(QuestionInvestigationAction, "Inspect", "Inspect", "question_investigator_action")
+    finally:
+        client.client.close()
+    assert len(calls) == 1
+    assert action.request_script.python_code == code
+    assert action.working_memory_update.open_gaps == tail["working_memory_update"]["open_gaps"]
+    assert action.notes == "Exact scope"
+    assert json.loads(client.trace_path.read_text(encoding="utf-8").splitlines()[-1])["response"] == malformed
+
+
+@pytest.mark.parametrize("malformed", [
+    '{"action":"answer"},{"action":"give_up"}',
+    '{"action":"answer"},"action":"give_up"}',
+    '{"action":"answer"},"answer":"first","answer":"second"}',
+    '{"action":"answer"},"evidence":{"x":1,"x":2}}',
+    '{"action":"answer"},"notes":broken}',
+    '{"action":"answer"},"answer":"done"} {"ignore":"me"}',
+])
+def test_extra_close_repair_rejects_ambiguous_or_incomplete_objects(malformed):
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        _loads_json_object(malformed)
+
+
+def test_extra_close_repair_does_not_bypass_action_schema():
+    with pytest.raises(ValidationError):
+        QuestionInvestigationAction.model_validate(_loads_json_object('{"action":"give_up"},"notes":"no reason"}'))
+
+
 def test_provider_error_is_logged_as_failed_and_never_cached_as_success(tmp_path, monkeypatch):
     client = _client(tmp_path)
     monkeypatch.setattr(client, "_chat_completion_with_network_retry", lambda **_: _response(PROVIDER_ERROR_TRACE))

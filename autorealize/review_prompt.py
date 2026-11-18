@@ -5,11 +5,11 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from .models import ArtifactConsistencyReview
 
-from .prompt_cache import STABLE_CONTEXT_TITLE, json_block, lossless_json
+from .prompt_cache import STABLE_CONTEXT_TITLE, json_block, lossless_json, estimate_text_tokens
 from .utils.safe_json import json_safe
 
 
@@ -17,6 +17,31 @@ class ReviewDimension(BaseModel):
     status: Literal["consistent", "conflict", "not_applicable", "insufficient_evidence"]
     evidence_refs: list[str]
     reasoning: str
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_review_status(cls, value: Any) -> Any:
+        """Accept common reviewer synonyms without weakening the gate.
+
+        The audit contract deliberately has a small status vocabulary. Models
+        occasionally emit ``warning``/``unknown`` for a dimension that cannot
+        be proven either way; treating that as insufficient evidence preserves
+        the review finding and keeps the overall ``passed``/issue gate intact.
+        """
+        normalized = str(value or "").strip().lower()
+        aliases = {
+            "warning": "insufficient_evidence",
+            "warn": "insufficient_evidence",
+            "unknown": "insufficient_evidence",
+            "uncertain": "insufficient_evidence",
+            "not sure": "insufficient_evidence",
+            "confident": "insufficient_evidence",
+            "inconsistent_but_not_confirmed_by_numbers": "insufficient_evidence",
+            "ok": "consistent",
+            "pass": "consistent",
+            "passed": "consistent",
+        }
+        return aliases.get(normalized, value)
 
 
 class ReviewCoverage(BaseModel):
@@ -37,10 +62,15 @@ class ArtifactConsistencyAudit(ArtifactConsistencyReview):
     def validate_coverage(self):
         checks = self.coverage.model_dump()
         conflicts = [check for check in checks.values() if check["status"] == "conflict"]
+        insufficient = [check for check in checks.values() if check["status"] == "insufficient_evidence"]
+        if not self.passed and not self.issues:
+            raise ValueError("A failed review must include actionable issues")
         if conflicts and not self.issues:
             raise ValueError("Conflict coverage requires a locatable issue")
         if conflicts and self.passed:
             raise ValueError("An unresolved coverage conflict cannot pass the review")
+        if insufficient and self.passed:
+            raise ValueError("Insufficient coverage evidence cannot pass the review")
         if any(issue.severity == "blocking" for issue in self.issues) and self.passed:
             raise ValueError("A blocking issue cannot pass the review")
         for check in checks.values():
@@ -51,6 +81,8 @@ class ArtifactConsistencyAudit(ArtifactConsistencyReview):
 
 REVIEW_COVERAGE_INSTRUCTIONS = """
 逐项完成 coverage 中的八个维度，不得因已找到若干明显冲突而结束审查。
+每个 status 必须严格使用 consistent、conflict、not_applicable、insufficient_evidence 之一；warning、confident、unknown 等不确定状态一律写 insufficient_evidence。
+存在 conflict 或 insufficient_evidence 时 passed 必须为 false，并在 issues 中给出可定位、可修复的问题；不得只把问题写进 summary。
 coverage 的每项给出短推导和可定位证据；不适用时明确说明原因，不虚构文件或字段。
 population_arithmetic 必须独立推导集合的首个和末个合法索引、端点包含关系、起点数及行数。
 时间窗口、切分比例、分组数量须从公式实际计算，不能因为各文件重复同一个数就视为正确。
@@ -74,6 +106,13 @@ aggregation_rule、audit_metrics 及 validation_protocol 的一致性，不能�
 同一分区和同一评估人口上的主排序指标不能在其他字段中又被称为“仅审计、不参与排序”。
 列举审计指标时逐项排除该主排序指标；若同名指标在另一分区仅作审计，必须明确分区与用途。
 逐个代入端点推导索引数量与输出行数，保留所有未裁决口径、真实业务缺口和防泄漏规则。
+
+输出完整但紧凑的机器合同：每条规则只在最合适的字段定义一次，避免把用户原文、约束、证据和缺口逐段复制。
+公式保留可执行定义；其余字段用短句和精确文件/Sheet/列名/路径表达，不写长篇推理。
+evidence 仅列可定位来源，不重述规则；issues/fixes 只写当前阻塞及对应处理，assumptions 写实现默认值，
+residual_issues 只保留仍未裁决的业务事实，不在多个列表重复同一条内容。
+列表保留全部实质规则并合并重复项；submission_checks、leakage_guards、invalid_solution_rules、
+audit_metrics、assumptions、residual_issues 和 evidence 均以每项一个可验证要点为限。
 """
 
 
@@ -136,7 +175,7 @@ def encode_review_snapshot(snapshot: Any) -> str:
 
 
 def review_prompt_parts(*, authority: Any, stage_evidence: Any, latest_request: dict,
-                        dynamic_title: str) -> tuple[str, str]:
+                        dynamic_title: str, dynamic_evidence: Any | None = None) -> tuple[str, str]:
     # Only control fields move to the tail. Every evidence value remains in the
     # snapshot, including full descriptions, nonidentical contracts and unknowns.
     control_keys = {
@@ -155,4 +194,137 @@ def review_prompt_parts(*, authority: Any, stage_evidence: Any, latest_request: 
     if canonical(decoded) != canonical(snapshot):
         raise ValueError("Review prompt round-trip failed; refusing to send incomplete evidence")
     controls = {key: value for key, value in latest_request.items() if key in control_keys}
+    if dynamic_evidence is not None:
+        controls["batch_evidence"] = dynamic_evidence
     return f"{STABLE_CONTEXT_TITLE}\n{encoded}", json_block(dynamic_title, controls, sort_keys=False)
+
+
+def bounded_review_batches(*, authority: dict, stage_evidence: Any, latest_request: dict,
+                           dynamic_title: str, input_budget: int) -> list[dict]:
+    """Partition oversized audits without clipping any evidence values.
+
+    Every batch repeats the original requirements and current description;
+    other complete evidence branches are distributed by exact JSON paths.
+    Full source files remain unchanged. A too-large indivisible value fails
+    explicitly; it is never shortened to make an audit appear successful.
+    """
+    common_authority_keys = {'original_requirements_full', 'task_hint',
+        'authoritative_submission_contract', 'authority_order', 'context_policy',
+        'output_language_policy', 'schema_version'}
+    common_stage_keys = {'full_scan_evidence'}
+    common_request_keys = {'description_markdown', 'instruction', 'round', 'deterministic_defects'}
+    common_authority = {k: v for k, v in authority.items() if k in common_authority_keys}
+    common_stage = {k: v for k, v in stage_evidence.items() if k in common_stage_keys}
+    common_request = {k: v for k, v in latest_request.items() if k in common_request_keys}
+
+    def _path_label(path: tuple[Any, ...]) -> str:
+        return "/".join(str(part) for part in path)
+
+    def _assign_path(root: dict[str, Any], origin: str, path: tuple[Any, ...], value: Any) -> None:
+        """Rebuild a lossless dict/list projection from a mixed JSON path."""
+        if not path:
+            root[origin] = value
+            return
+        current: Any = root[origin]
+        for index, part in enumerate(path):
+            last = index == len(path) - 1
+            next_part = None if last else path[index + 1]
+            if isinstance(current, dict):
+                key = str(part) if not isinstance(part, str) else part
+                if last:
+                    current[key] = value
+                    return
+                if key not in current:
+                    current[key] = [] if isinstance(next_part, int) else {}
+                current = current[key]
+                continue
+            if not isinstance(current, list) or not isinstance(part, int):
+                raise ValueError(f"Invalid mixed audit evidence path: {origin}/{_path_label(path)}")
+            while len(current) <= part:
+                current.append(None)
+            if last:
+                current[part] = value
+                return
+            if current[part] is None:
+                current[part] = [] if isinstance(next_part, int) else {}
+            current = current[part]
+
+    def render(extra):
+        partial_authority = dict(common_authority)
+        batch_evidence: dict[str, Any] = {
+            "authority": {},
+            "stage_evidence": dict(common_stage),
+            "latest_request": {},
+        }
+        for (origin, path), value in extra:
+            _assign_path(batch_evidence, origin, path, value)
+        shared_paths = (
+            ['authority/' + key for key in common_authority]
+            + ['stage_evidence/' + key for key in common_stage]
+            + ['latest_request/' + key for key in common_request]
+        )
+        scope = {
+            'policy': '本轮是完整审查的一个无损分片。每批重复原始需求与当前 description；batch_evidence 按 included_paths 映射原始 authority/stage_evidence/latest_request 路径。只核对本批可见证据，不因兄弟分片内容未出现而判为原文件缺失。所有分片合并通过才通过总审查。',
+            'shared_paths': shared_paths,
+            'included_paths': shared_paths + [
+                origin + '/' + _path_label(path) for (origin, path), _ in extra
+            ]}
+        stable, dynamic = review_prompt_parts(authority=partial_authority, stage_evidence={},
+            latest_request=common_request, dynamic_title=dynamic_title,
+            dynamic_evidence={'review_batch_scope': scope, 'evidence': batch_evidence})
+        tokens = estimate_text_tokens(json.dumps({'messages':[{'role':'user','content':stable},
+            {'role':'user','content':dynamic}]}, ensure_ascii=False))
+        return {'stable':stable, 'dynamic':dynamic, 'input_tokens':tokens,
+            'included_paths':scope['included_paths']}
+
+    if render([])['input_tokens'] > input_budget:
+        raise ValueError('Common authoritative audit evidence exceeds context budget; refusing to truncate')
+    pending = []
+    for origin, values, common in (
+        ('authority', authority, common_authority_keys),
+        ('stage_evidence', stage_evidence, common_stage_keys),
+        ('latest_request', latest_request, common_request_keys),
+    ):
+        if isinstance(values, dict):
+            pending.extend(
+                ((origin, (str(key),)), value)
+                for key, value in values.items()
+                if key not in common
+            )
+        elif isinstance(values, (list, tuple)):
+            pending.extend(
+                ((origin, (index,)), value)
+                for index, value in enumerate(values)
+            )
+        else:
+            pending.append(((origin, ()), values))
+    batches, current = [], []
+    while pending:
+        item = pending.pop(0)
+        if render(current + [item])['input_tokens'] <= input_budget:
+            current.append(item)
+            continue
+        if current:
+            batches.append(render(current));current=[]
+            pending.insert(0,item)
+            continue
+        (origin, path), value = item
+        if isinstance(value, dict) and value:
+            pending[0:0] = [
+                ((origin, path + (str(key),)), child)
+                for key, child in value.items()
+            ]
+            continue
+        if isinstance(value, list) and value:
+            pending[0:0] = [
+                ((origin, path + (index,)), child)
+                for index, child in enumerate(value)
+            ]
+            continue
+        raise ValueError(
+            'Indivisible audit evidence exceeds context budget: '
+            + origin + '/' + _path_label(path)
+        )
+    if current or not batches:
+        batches.append(render(current))
+    return batches

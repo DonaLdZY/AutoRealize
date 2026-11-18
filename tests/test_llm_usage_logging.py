@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 from pydantic import BaseModel, Field
 
 from autorealize.config import AutoRealizeConfig
@@ -36,7 +37,7 @@ class _StructuredPayload(BaseModel):
     count: int = Field(description="Observed count.")
 
 
-def test_stable_context_precedes_agent_schema_and_dynamic_payload(tmp_path, monkeypatch) -> None:
+def test_static_instructions_and_schema_precede_stable_context(tmp_path, monkeypatch) -> None:
     cfg = AutoRealizeConfig()
     cfg.llm.api_key = "test-key"
     cfg.llm.enable_cache = False
@@ -70,17 +71,136 @@ def test_stable_context_precedes_agent_schema_and_dynamic_payload(tmp_path, monk
     assert parsed.count == 2
     messages = calls[0]["messages"]
     assert messages[0] == {"role": "system", "content": CACHE_FRIENDLY_SYSTEM_PROMPT}
-    assert "authoritative stable evidence" in messages[1]["content"]
-    assert messages[2]["content"].startswith(AGENT_INSTRUCTIONS_TITLE)
-    assert "Required JSON Schema" in messages[3]["content"]
-    assert "JSON 示例" in messages[3]["content"]
-    assert '{"child":{"code":""},"count":0}' in messages[3]["content"]
+    assert messages[1]["content"].startswith(AGENT_INSTRUCTIONS_TITLE)
+    assert "Stage-specific reviewer." in messages[1]["content"]
+    assert "Required JSON Schema" in messages[2]["content"]
+    assert "JSON 示例" in messages[2]["content"]
+    assert '{"child":{"code":""},"count":0}' in messages[2]["content"]
+    assert "authoritative stable evidence" in messages[3]["content"]
     assert "current changing request" in messages[-1]["content"]
     assert "prompt_cache_key" not in calls[0]
     assert calls[0]["max_tokens"] == 32768
 
 
-def test_normal_text_and_structured_requests_enforce_output_floor(tmp_path, monkeypatch) -> None:
+def test_custom_compact_schema_prompt_keeps_full_local_validation(tmp_path, monkeypatch) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.enable_cache = False
+    cfg.llm.structured_include_json_example = True
+    client = LLMClient(cfg, tmp_path)
+    calls: list[dict] = []
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content='{"child":{"code":"A"},"count":2}'),
+                finish_reason="stop",
+            )
+        ],
+        usage={"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+    )
+    monkeypatch.setattr(
+        client,
+        "_chat_completion_with_network_retry",
+        lambda **kwargs: (calls.append(kwargs["create_kwargs"]) or response),
+    )
+
+    parsed = client.ask_structured(
+        model_cls=_StructuredPayload,
+        system_prompt="Return the compact protocol.",
+        user_prompt="Build the payload.",
+        prompt_name="custom_schema_test",
+        schema_prompt="Compact protocol: child.code and integer count.",
+    )
+
+    assert parsed == _StructuredPayload(child=_StructuredChild(code="A"), count=2)
+    static_prompt = "\n".join(message["content"] for message in calls[0]["messages"])
+    assert "Compact protocol: child.code and integer count." in static_prompt
+    assert '"$defs"' not in static_prompt
+    assert "JSON 示例" not in static_prompt
+
+
+def test_structured_requests_keep_a_shared_prefix_when_context_changes(tmp_path, monkeypatch) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.enable_cache = False
+    client = LLMClient(cfg, tmp_path)
+    calls: list[dict] = []
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":{"code":"A"},"count":2}'), finish_reason="stop")],
+        usage={"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+    )
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry",
+                        lambda **kwargs: (calls.append(kwargs["create_kwargs"]) or response))
+
+    for context, dynamic in [("project A evidence", "question A"), ("project B evidence", "question B")]:
+        client.ask_structured(
+            model_cls=_StructuredPayload,
+            system_prompt="Stage-specific reviewer.",
+            user_prompt=dynamic,
+            prompt_name="cache_prefix_reuse_test",
+            static_context_prompt=context,
+            dynamic_user_prompt=dynamic,
+        )
+
+    first, second = [call["messages"] for call in calls]
+    assert first[:3] == second[:3]
+    assert first[3]["content"] != second[3]["content"]
+    assert first[-1]["content"] != second[-1]["content"]
+
+
+def test_immutable_task_ledger_is_shared_before_changing_agent_and_schema(tmp_path, monkeypatch):
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.enable_cache = False
+    client = LLMClient(cfg, tmp_path)
+    calls = []
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":{"code":"A"},"count":2}'), finish_reason="stop")],
+        usage={"prompt_tokens": 40, "completion_tokens": 10},
+    )
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry",
+                        lambda **kwargs: (calls.append(kwargs["create_kwargs"]) or response))
+    shared = '{"schema_version":"autorealize.shared_task_context.v1","task_hint":"exact task evidence"}'
+    for stage in ("classifier", "contract reviewer"):
+        client.ask_structured(model_cls=_StructuredPayload, system_prompt=stage, user_prompt=stage,
+                              prompt_name=stage, static_context_prompt=shared, dynamic_user_prompt=stage)
+    first, second = [call["messages"] for call in calls]
+    assert first[:2] == second[:2]
+    assert shared in first[1]["content"]
+    assert first[2]["content"] != second[2]["content"]
+    assert first[-1]["content"] != second[-1]["content"]
+    assert first[0]["role"] == "system"
+
+
+def test_openai_structured_cache_key_uses_the_fixed_prefix(tmp_path, monkeypatch) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.base_url = "https://api.openai.com/v1"
+    cfg.llm.model_name = "gpt-5.6"
+    cfg.llm.enable_cache = False
+    client = LLMClient(cfg, tmp_path)
+    calls: list[dict] = []
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":{"code":"A"},"count":2}'), finish_reason="stop")],
+        usage={"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+    )
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry",
+                        lambda **kwargs: (calls.append(kwargs["create_kwargs"]) or response))
+
+    for context, dynamic in [("project A evidence", "question A"), ("project B evidence", "question B")]:
+        client.ask_structured(
+            model_cls=_StructuredPayload,
+            system_prompt="Stage-specific reviewer.",
+            user_prompt=dynamic,
+            prompt_name="openai_cache_prefix_test",
+            static_context_prompt=context,
+            dynamic_user_prompt=dynamic,
+        )
+
+    assert calls[0]["prompt_cache_key"] == calls[1]["prompt_cache_key"]
+
+
+def test_explicit_text_and_structured_budgets_override_legacy_floor(tmp_path, monkeypatch) -> None:
     cfg = AutoRealizeConfig()
     cfg.llm.api_key = "test-key"
     cfg.llm.enable_cache = False
@@ -120,7 +240,7 @@ def test_normal_text_and_structured_requests_enforce_output_floor(tmp_path, monk
     )
 
     assert parsed.count == 2
-    assert [call["max_tokens"] for call in calls] == [32768, 32768]
+    assert [call["max_tokens"] for call in calls] == [1024, 3072]
 
 
 def test_health_check_keeps_small_non_business_output_cap(tmp_path, monkeypatch) -> None:
@@ -259,6 +379,11 @@ def test_provider_prompt_cache_key_auto_is_openai_only() -> None:
         base_url="https://api.openai.com/v1/",
         stable_prefix=stable_prefix,
     )
+    assert openai_key == _provider_prompt_cache_key(
+        config=cfg,
+        base_url="https://api.openai.com/v1",
+        stable_prefix="different project evidence",
+    )
     assert _provider_prompt_cache_key(
         config=cfg,
         base_url="https://api.deepseek.com/beta",
@@ -266,11 +391,18 @@ def test_provider_prompt_cache_key_auto_is_openai_only() -> None:
     ) is None
 
     cfg.llm.prompt_cache_key_mode = "enabled"
-    assert _provider_prompt_cache_key(
+    compatible_key = _provider_prompt_cache_key(
         config=cfg,
         base_url="https://compatible-provider.example/v1",
         stable_prefix=stable_prefix,
-    ) == openai_key
+    )
+    assert compatible_key is not None
+    assert compatible_key != openai_key
+    assert compatible_key == _provider_prompt_cache_key(
+        config=cfg,
+        base_url="https://compatible-provider.example/v1/",
+        stable_prefix="different project evidence",
+    )
 
     cfg.llm.prompt_cache_key_mode = "disabled"
     assert _provider_prompt_cache_key(
@@ -439,6 +571,8 @@ def test_prompt_stage_groups_known_autorealize_prompts() -> None:
     assert _prompt_stage("question_investigator_action_1") == "qdi"
     assert _prompt_stage("description_protocol_static_optimization_1") == "description_protocol"
     assert _prompt_stage("evaluation_contract_reviewer_2") == "evaluation_contract"
+    assert _prompt_stage("artifact_consistency_reviewer_2_batch_1") == "artifact_consistency_review"
+    assert _prompt_stage("source_field_alias_resolver") == "source_field_resolution"
 
 
 def test_compact_structured_schema_removes_prompt_metadata_but_preserves_validation_shape() -> None:
@@ -510,7 +644,7 @@ def test_structured_length_retry_disables_deepseek_thinking(monkeypatch, tmp_pat
     assert len(calls) == 2
     assert calls[0]["extra_body"]["thinking"]["type"] == "enabled"
     assert calls[1]["extra_body"]["thinking"]["type"] == "disabled"
-    assert calls[0]["max_tokens"] == 32768
+    assert calls[0]["max_tokens"] == 4096
     assert calls[1]["max_tokens"] == 32768
     assert "temperature" not in calls[0]
     assert calls[1]["temperature"] == cfg.llm.temperature
@@ -519,11 +653,134 @@ def test_structured_length_retry_disables_deepseek_thinking(monkeypatch, tmp_pat
     assert usage_rows[0]["raw_usage"]["completion_tokens_details"]["reasoning_tokens"] == 4090
 
 
+def test_structured_stop_response_repairs_only_missing_json_closers(monkeypatch, tmp_path) -> None:
+    class _StructuredWithList(BaseModel):
+        child: _StructuredChild
+        count: int
+        items: list[str]
+
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.model_name = "compatible-model"
+    cfg.llm.max_retries = 1
+    client = LLMClient(cfg, tmp_path)
+    malformed = '{"child":{"code":"A"},"count":2,"items":["one","two"}'
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=malformed), finish_reason="stop")],
+        usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    )
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry", lambda **kwargs: response)
+
+    parsed = client.ask_structured(
+        model_cls=_StructuredWithList,
+        system_prompt="Return structured data.",
+        user_prompt="Build the payload.",
+        prompt_name="structured_missing_closer_repair_test",
+        max_tokens=4096,
+    )
+
+    assert parsed.child.code == "A"
+    assert parsed.count == 2
+    assert parsed.items == ["one", "two"]
+
+
+def test_structured_length_response_does_not_repair_missing_json_closers() -> None:
+    from autorealize.llm.client import _loads_json_object
+
+    with pytest.raises(json.JSONDecodeError):
+        _loads_json_object('{"items":["one","two"}', repair_missing_closers=False)
+    assert _loads_json_object(
+        '{"items":["one","two"}',
+        repair_missing_closers=True,
+    ) == {"items": ["one", "two"]}
+
+
+def test_structured_length_retry_honors_call_specific_output_cap(monkeypatch, tmp_path) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.model_name = "compatible-model"
+    cfg.llm.max_retries = 2
+    client = LLMClient(cfg, tmp_path)
+    calls: list[dict] = []
+    responses = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":'), finish_reason="length")],
+            usage={"prompt_tokens": 100, "completion_tokens": 4096, "total_tokens": 4196},
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":{"code":"A"},"count":2}'), finish_reason="stop")],
+            usage={"prompt_tokens": 100, "completion_tokens": 18, "total_tokens": 118},
+        ),
+    ]
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs["create_kwargs"])
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(client, "_chat_completion_with_network_retry", fake_completion)
+    parsed = client.ask_structured(
+        model_cls=_StructuredPayload,
+        system_prompt="Return structured data.",
+        user_prompt="Build the payload.",
+        prompt_name="structured_retry_cap_test",
+        max_tokens=4096,
+        length_retry_max_tokens=8192,
+    )
+    assert parsed == _StructuredPayload(child=_StructuredChild(code="A"), count=2)
+    assert [call["max_tokens"] for call in calls] == [4096, 8192]
+
+
+def test_structured_length_at_fixed_cap_stops_without_duplicate_paid_retry(monkeypatch, tmp_path) -> None:
+    cfg = AutoRealizeConfig()
+    cfg.llm.api_key = "test-key"
+    cfg.llm.model_name = "compatible-model"
+    cfg.llm.max_retries = 3
+    cfg.llm.structured_length_retry_max_tokens = 8192
+    client = LLMClient(cfg, tmp_path)
+    calls: list[dict] = []
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"child":'), finish_reason="length")],
+        usage={"prompt_tokens": 90000, "completion_tokens": 8192, "total_tokens": 98192},
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        client,
+        "_chat_completion_with_network_retry",
+        lambda **kwargs: (calls.append(kwargs["create_kwargs"]) or response),
+    )
+    monkeypatch.setattr(
+        "autorealize.llm.client.log_event",
+        lambda _logger, _component, event, **fields: events.append((event, fields)),
+    )
+
+    try:
+        client.ask_structured(
+            model_cls=_StructuredPayload,
+            system_prompt="Return structured data.",
+            user_prompt="Build the payload.",
+            prompt_name="fixed_cap_length_test",
+            max_tokens=8192,
+            length_retry_max_tokens=8192,
+        )
+    except RuntimeError as exc:
+        assert "finish_reason=length" in str(exc)
+    else:
+        raise AssertionError("truncated structured response must fail")
+
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == 8192
+    parse_events = [(event, fields) for event, fields in events if event in {"PARSE_RETRYING", "PARSE_FAILED"}]
+    assert [event for event, _ in parse_events] == ["PARSE_FAILED"]
+    assert parse_events[0][1]["error"].endswith("retry_stopped=no_higher_output_budget")
+
+
 def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> None:
     cfg = AutoRealizeConfig()
     cfg.llm.api_key = "test-key"
     cfg.llm.model_name = "deepseek-v4-pro"
     client = LLMClient(cfg, tmp_path)
+    client._usage_local.prompt_cache_namespace = "structured:project-prefix:v7"
+    client._usage_local.prompt_cache_prefix_fingerprint = "0123456789abcdef"
     response = SimpleNamespace(
         id="chatcmpl-deepseek-test",
         model="deepseek-v4-pro-202607",
@@ -564,11 +821,17 @@ def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> N
     assert row["prompt_cache_hit_tokens"] == 80
     assert row["prompt_cache_miss_tokens"] == 40
     assert row["cache_write_tokens"] == 24
+    assert row["prompt_cache_namespace"] == "structured:project-prefix:v7"
+    assert row["prompt_cache_prefix_fingerprint"] == "0123456789abcdef"
+    assert row["stage_id"] == "other"
+    assert row["stage_id_source"] == "inferred_from_prompt_name"
     assert row["provider_cache_write_tokens_known"] is True
     assert row["estimated_prompt_tokens"] > 0
     assert [p["name"] for p in row["prompt_parts"]] == ["system_prompt", "stable_context", "dynamic_payload"]
     usage_rows = [json.loads(line) for line in (tmp_path / "llm_usage.jsonl").read_text(encoding="utf-8").splitlines()]
     assert usage_rows[-1]["prompt_name"] == "unit_prompt"
+    assert usage_rows[-1]["stage_id"] == "other"
+    assert usage_rows[-1]["stage_id_source"] == "inferred_from_prompt_name"
     assert usage_rows[-1]["provider_cache_tokens_known"] is True
     assert usage_rows[-1]["prompt_parts"][1]["name"] == "stable_context"
     assert usage_rows[-1]["prompt_parts"][1]["provider_prompt_tokens_estimate"] > 0
@@ -587,6 +850,7 @@ def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> N
     assert summary["provider_cache_hit_ratio"] == 0.666667
     assert summary["deepseek_cost_breakdown_usd"]["cache_miss_input_tokens"] == 40
     assert summary["by_prompt"]["unit_prompt"]["calls"] == 1
+    assert summary["by_prompt"]["unit_prompt"]["stage_id"] == "other"
     assert summary["by_prompt"]["unit_prompt"]["by_part_ranked"][0]["estimated_tokens"] >= 1
     assert summary["by_prompt_part_ranked"][0]["prompt_name"] == "unit_prompt"
     brief = json.loads((tmp_path / "llm_usage_brief.json").read_text(encoding="utf-8"))
@@ -597,6 +861,7 @@ def test_log_provider_usage_writes_jsonl_summary_and_prompt_parts(tmp_path) -> N
     assert brief["cache_write_tokens"] == 24
     assert brief["provider_cache_write_known_calls"] == 1
     assert brief["top_prompts_by_estimated_cost"][0]["cache_write_tokens"] == 24
+    assert brief["top_prompts_by_estimated_cost"][0]["stage_id_source"] == "inferred_from_prompt_name"
     assert brief["by_stage"][0]["cache_write_tokens"] == 24
     assert brief["top_prompts_by_estimated_cost"][0]["stage"] == "other"
     assert brief["by_stage"][0]["stage"] == "other"
@@ -647,5 +912,11 @@ def test_log_local_cache_usage_is_separate_from_provider_calls(tmp_path) -> None
     summary = json.loads((tmp_path / "llm_usage_summary.json").read_text(encoding="utf-8"))
     assert summary["calls"] == 0
     assert summary["cache_hits_local"] == 1
+    assert summary["estimated_prompt_tokens_local_cache_hits"] > 0
     assert summary["by_prompt"]["cached_prompt"]["cache_hits_local"] == 1
+    assert summary["by_prompt"]["cached_prompt"]["estimated_prompt_tokens_local_cache_hits"] > 0
     assert summary["by_prompt"]["cached_prompt"]["estimated_prompt_tokens"] > 0
+    row = json.loads(client.usage_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["stage_id"] == "other"
+    assert row["stage_id_source"] == "inferred_from_prompt_name"
+    assert row["source"] == "local_cache"

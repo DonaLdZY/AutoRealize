@@ -27,6 +27,8 @@ _current_status = "created"
 _started_at = ""
 _last_event: dict[str, Any] | None = None
 _raw_event_log = False
+_retryable_failures = 0
+_unrecoverable_failures = 0
 
 TERMINAL_EVENTS = {"COMPLETED", "FAILED", "SKIPPED", "DELETED", "ROLLED_BACK", "FLUSHED"}
 ACTIVE_EVENTS = {"STARTED", "ACTIVATED", "RUNNING", "CREATED", "LEVEL_STARTED", "VERIFY_SCRIPT_RUNNING"}
@@ -129,6 +131,7 @@ def configure_event_sink(
     global _event_sink_path, _state_sink_path, _event_seq, _run_id, _recent_limit, _telemetry_enabled
     global _recent_events, _status_counts, _layer_counts, _component_counts, _active_components
     global _current_status, _started_at, _last_event
+    global _retryable_failures, _unrecoverable_failures
     _event_sink_path = path if enabled else None
     _state_sink_path = state_path if enabled else None
     _event_seq = 0
@@ -143,6 +146,8 @@ def configure_event_sink(
     _current_status = "running"
     _started_at = datetime.now(timezone.utc).isoformat()
     _last_event = None
+    _retryable_failures = 0
+    _unrecoverable_failures = 0
     for p in [_event_sink_path, _state_sink_path]:
         if p is not None:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +236,7 @@ def log_event(logger: logging.Logger, component: str, event: str, **fields: Any)
         return
 
     global _event_seq, _last_event, _current_status
+    global _retryable_failures, _unrecoverable_failures
     classification = _event_classification(component)
     status = _infer_status(event)
     severity = _infer_severity(status, safe_fields)
@@ -256,10 +262,21 @@ def log_event(logger: logging.Logger, component: str, event: str, **fields: Any)
         _layer_counts[classification["layer"]] = _layer_counts.get(classification["layer"], 0) + 1
         _component_counts[component] = _component_counts.get(component, 0) + 1
         _update_active_components(component, event, payload)
+        retryable = bool(safe_fields.get("retryable"))
+        if status == "failed":
+            if retryable:
+                _retryable_failures += 1
+            else:
+                _unrecoverable_failures += 1
         if component == "pipeline" and event == "RUN_COMPLETED":
             _current_status = "completed"
         elif status == "failed" and _current_status != "completed":
-            _current_status = "failed"
+            # A failed attempt can be retried by the surrounding workflow.
+            # Keep it visible in the event stream without making the run-level
+            # snapshot terminal until the pipeline actually gives up.
+            _current_status = "retrying" if retryable else "failed"
+        elif status == "running" and _current_status in {"created", "retrying", "degraded"}:
+            _current_status = "running"
         elif _current_status == "created":
             _current_status = "running"
         if _event_sink_path is not None:
@@ -294,6 +311,8 @@ def _write_state_snapshot() -> None:
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "event_count": _event_seq,
         "status_counts": _status_counts,
+        "retryable_failures": _retryable_failures,
+        "unrecoverable_failures": _unrecoverable_failures,
         "layer_counts": _layer_counts,
         "component_counts": _component_counts,
         "active_components": list(_active_components.values()),

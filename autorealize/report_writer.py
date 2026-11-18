@@ -18,6 +18,11 @@ from .models import (
 from .entity_alias import build_entity_alias_candidates, enrich_entity_alias_candidates_with_coverage
 from .context_compiler import build_relation_verification_queue, build_source_coverage_ledger, reconcile_table_shape, source_columns_exact
 from .execution_contract import build_execution_contract
+from .profiling.full_scan import (
+    csv_scan_read_options_from_metadata,
+    csv_scan_read_options_fingerprint,
+    verified_full_scan_population,
+)
 from .scalar_score import scalar_score_shape_defects
 from .profiling.relations import RelationHint
 
@@ -134,6 +139,25 @@ def _direction_label_zh(direction: str) -> str:
     if d == "maximize":
         return "越大越好"
     return d or "未明确"
+
+
+def _full_scan_time_range_label(scan: dict[str, Any]) -> str:
+    minimum = scan.get("minimum_timestamp")
+    maximum = scan.get("maximum_timestamp")
+    if minimum is not None and maximum is not None:
+        return f"{minimum} 至 {maximum}"
+    ranges = scan.get("timestamp_ranges_by_timezone_awareness")
+    if isinstance(ranges, dict):
+        labels = [
+            f"{name}: {item.get('minimum_timestamp')} 至 {item.get('maximum_timestamp')}"
+            for name, item in ranges.items()
+            if isinstance(item, dict) and int(item.get("rows") or 0) > 0
+        ]
+        if labels:
+            return "；".join(labels)
+    if type(scan.get("valid_timestamp_rows")) is int and scan["valid_timestamp_rows"] == 0:
+        return "无有效时间值"
+    return "时间范围不可比较"
 
 
 def _is_document_like(fs: FileSummary) -> bool:
@@ -467,6 +491,20 @@ def write_data_description(
             lines.append(f"- 可能关联: {', '.join(fs.related_files[:12])}")
         if fs.warnings:
             lines.append(f"- 风险: {'; '.join(fs.warnings[:8])}")
+        scan = (fs.source_metadata or {}).get("full_table_scan")
+        if isinstance(scan, dict):
+            if scan.get("status") == "completed":
+                preview = scan.get("preview_scope") if isinstance(scan.get("preview_scope"), dict) else {}
+                preview_rows = preview.get("rows_read")
+                preview_label = f"字段画像预览前 {preview_rows} 行" if preview_rows is not None else "字段画像范围为预览"
+                lines.append(
+                    f"- 全表分块扫描：{scan.get('rows_scanned')} 条记录；"
+                    f"`{scan.get('column')}` 有效时间 {scan.get('valid_timestamp_rows')} 条、"
+                    f"无效时间 {scan.get('invalid_timestamp_rows')} 条；"
+                    f"全表时间范围 {_full_scan_time_range_label(scan)}；{preview_label}。"
+                )
+            else:
+                lines.append(f"- 全表分块扫描未完成：{scan.get('error') or '具体原因未记录'}。")
         lines.append("")
     lines.append("## 跨文件关系")
     if relations:
@@ -513,7 +551,8 @@ def _standard_excel_read_contract(fs: FileSummary, sheet: dict) -> dict:
         example = "pd.read_excel(" + repr(_quote_input_path(fs.path)) + ", " + ", ".join(
             f"{key}={value!r}" for key, value in kwargs.items()) + ")"
         return {**profiled, "path": fs.path, "read_example": example, "column_access": "named",
-                "requires_full_parse_before_evaluation": True, "population_verified": False}
+                "requires_full_parse_before_evaluation": True,
+                "population_verified": _excel_sheet_population_verified(fs, sheet)}
     empty = (reconcile_table_shape(sheet).get("verified_row_count") == 0
              and not sheet.get("columns"))
     layout = sheet.get("layout_kind")
@@ -538,6 +577,35 @@ def _standard_excel_read_contract(fs: FileSummary, sheet: dict) -> dict:
             "verification_scope": ("verified_empty_sheet_inspection" if empty else
                                    "raw_layout_inspection_required" if positional else "profiled_sheet_name_and_header_layout"),
             "population_verified": False, "requires_full_parse_before_evaluation": True}
+
+
+def _excel_sheet_population_verified(fs: FileSummary, sheet: dict) -> bool:
+    metadata = fs.source_metadata or {}
+    sampling = metadata.get("profile_sampling") if isinstance(metadata.get("profile_sampling"), dict) else {}
+    rows_read = sampling.get("rows_read")
+    row_cap = sampling.get("configured_max_rows")
+    if (
+        sampling.get("is_large_file") is True
+        or type(rows_read) is not int
+        or type(row_cap) is not int
+        or rows_read >= row_cap
+    ):
+        return False
+    if (
+        sheet.get("profile_policy") != "full_all_sheets"
+        or sheet.get("is_deep_profiled") is not True
+        or sheet.get("profile_rows_limit") is not None
+    ):
+        return False
+    facts = reconcile_table_shape(sheet)
+    profiled_shape = sheet.get("shape_profiled")
+    return (
+        facts.get("verified_row_count") is not None
+        and isinstance(profiled_shape, (list, tuple))
+        and len(profiled_shape) == 2
+        and type(profiled_shape[0]) is int
+        and profiled_shape[0] == facts["verified_row_count"]
+    )
 
 
 def _sole_populated_excel_sheet(fs: FileSummary) -> dict | None:
@@ -584,7 +652,9 @@ def _read_example_for_file(fs: FileSummary) -> tuple[str, str, list[str]]:
         if encoding != "utf-8-sig":
             notes.append(f"检测到编码候选为 {encoding!r}。")
         notes.append("如果出现编码错误，可使用 gb18030 作为备选编码重试。")
-        return "pandas.read_csv", example, notes
+        reader_kwargs = ", ".join(kwargs[1:])
+        method = f"pandas.read_csv({reader_kwargs})" if reader_kwargs else "pandas.read_csv"
+        return method, example, notes
     if suffix in {".xlsx", ".xls"}:
         sheet_names = _excel_sheet_names_from_metadata(fs)
         sheet_profiles = _excel_sheet_profiles(fs)
@@ -659,7 +729,8 @@ def _read_contract_for_file(fs: FileSummary, read_example: str) -> dict[str, Any
         if sole:
             return _standard_excel_read_contract(fs, sole)
         return {}
-    contract = dict((fs.source_metadata or {}).get("csv_read_contract") or {})
+    metadata = fs.source_metadata or {}
+    contract = dict(metadata.get("csv_read_contract") or {})
     if not contract:
         return {}
     if "verified" in contract:
@@ -678,7 +749,44 @@ def _read_contract_for_file(fs: FileSummary, read_example: str) -> dict[str, Any
         ]))
     contract["path"] = str(fs.path)
     contract["read_example"] = str(read_example or "")
+    scan = metadata.get("full_table_scan")
+    fingerprint = str(metadata.get("source_fingerprint") or "")
+    scan_verified = verified_full_scan_population(
+        scan,
+        source_fingerprint=fingerprint,
+        read_options_fingerprint=csv_scan_read_options_fingerprint(
+            csv_scan_read_options_from_metadata(metadata)
+        ),
+    )
+    if scan_verified:
+        verified_shape = [scan["rows_scanned"], len(fs.columns)]
+        contract.update(
+            {
+                "population_verified": True,
+                "verification_scope": "full_row_population_and_time_column_scan",
+                "verified_shape": verified_shape,
+                "verified_row_count": verified_shape[0],
+                "row_count_basis": "csv_full_table_scan",
+                "full_table_scan": scan,
+            }
+        )
     return contract
+
+
+def _verified_csv_full_scan(fs: FileSummary) -> dict[str, Any] | None:
+    metadata = fs.source_metadata or {}
+    scan = metadata.get("full_table_scan")
+    fingerprint = str(metadata.get("source_fingerprint") or "")
+    if not verified_full_scan_population(
+        scan,
+        source_fingerprint=fingerprint,
+        read_options_fingerprint=csv_scan_read_options_fingerprint(
+            csv_scan_read_options_from_metadata(metadata)
+        ),
+    ):
+        return None
+    return scan
+
 
 def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessProtocol:
     """Build deterministic file reading hints from parser metadata."""
@@ -695,6 +803,20 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
             continue
         read_method, read_example, notes = _read_example_for_file(fs)
         row_grain = str(fs.summary or "").strip()[:240]
+        full_scan = _verified_csv_full_scan(fs)
+        if full_scan:
+            sampling = (fs.source_metadata or {}).get("profile_sampling")
+            sampling = sampling if isinstance(sampling, dict) else {}
+            preview_rows = sampling.get("rows_read")
+            preview_text = f"字段画像仅覆盖前 {preview_rows} 行" if preview_rows is not None else "字段画像为预览"
+            row_grain = (
+                f"全表扫描记录数: {full_scan['rows_scanned']} x {len(fs.columns)}；"
+                f"{full_scan['column']} 时间范围: {_full_scan_time_range_label(full_scan)}；{preview_text}"
+            )
+            notes.append(
+                f"完整 CSV 已按 {full_scan['chunk_rows']} 行分块扫描 `{full_scan['column']}`；"
+                f"有效时间 {full_scan['valid_timestamp_rows']} 行，无效时间 {full_scan['invalid_timestamp_rows']} 行。"
+            )
         sheets = _excel_sheet_profiles(fs)
         if sheets:
             row_grain = "; ".join(
@@ -737,7 +859,31 @@ def build_data_access_protocol(file_summaries: list[FileSummary]) -> DataAccessP
                 target_fields=target_fields[:8],
                 relation_keys=[str(x) for x in fs.key_entities[:12]],
                 important_fields=important_fields[:30],
-                parsing_notes=notes + [str(x) for x in fs.warnings[:4]],
+                parsing_notes=notes + [
+                    str(x) for x in fs.warnings[:4]
+                    if not (
+                        full_scan
+                        and (
+                            ("字段统计基于前 " in str(x) and "未全量扫描" in str(x))
+                            or "行数或 shape 由轻量方式估算" in str(x)
+                        )
+                    )
+                    and not (
+                        "字段统计基于前 " in str(x)
+                        and "行采样，未全量扫描" in str(x)
+                        and suffix in {".xlsx", ".xls"}
+                        and _excel_sheet_population_verified(
+                            fs,
+                            next(
+                                (
+                                    sheet for sheet in sheets
+                                    if sheet.get("profiled_read_contract", {}).get("columns_exact") == sheet.get("columns")
+                                ),
+                                {},
+                            ),
+                        )
+                    )
+                ],
             )
         )
     return DataAccessProtocol(files=files, global_notes=global_notes)
@@ -1251,6 +1397,9 @@ def _compact_file_metadata_for_automl(fs: FileSummary) -> dict[str, Any]:
         "kind",
         "shape",
         "shape_estimated",
+        "shape_verification_basis",
+        "source_fingerprint",
+        "full_table_scan",
         "preview_rows_used",
         "dtypes",
         "csv_dialect",
@@ -2169,8 +2318,9 @@ def build_automl_context_pack(
             evaluation["final_score_formula"] = final_formula
         evaluation["single_scalar_score_required"] = True
         evaluation["final_validation_score_rule"] = (
-            "The code must print one numeric `Final Validation Score`. "
-            "Use `final_score_formula` / `metric_formula` as the single ranking score. "
+            "The code must print one numeric `Final Validation Score` on the frozen development/search population. "
+            "Use `final_score_formula` / `metric_formula` as the single candidate-ranking score. "
+            "Never use final_evaluation_* metrics or a reserved final holdout/test population during candidate execution. "
             "`scalar_score_formula` is a legacy mirror only when identical; never optimize a second score."
         )
     else:
@@ -2304,6 +2454,19 @@ def build_automl_context_pack(
         "Non-default CSV dialects, repeated-file groups, multi-sheet Excel, and JSON table extraction notes are recorded only when detected.",
         "This file is fixed-context supplemental facts; `description.md` remains the primary task statement.",
     ]
+    temporal_scan_requirement = ctx.get("temporal_scan_requirement")
+    if not isinstance(temporal_scan_requirement, dict):
+        agent_context_pack = ctx.get("agent_context_pack")
+        temporal_scan_requirement = (
+            agent_context_pack.get("temporal_scan_requirement", {})
+            if isinstance(agent_context_pack, dict)
+            else {}
+        )
+    if temporal_scan_requirement.get("required") is True:
+        data_orchestration.append(
+            "A host full-table time-column scan is required before execution; use its verified row population "
+            "and timestamp range in the execution_contract, and stop on an incomplete or blocked scan."
+        )
     if explicit_rl_requested and paradigm in {"static_optimization", "hybrid_ml_optimization"}:
         data_orchestration.append(
             "RL was requested in the task text, but AutoRealize classified the executable contract as static optimization because evaluation consumes a complete solution table/plan."
@@ -2401,10 +2564,60 @@ def build_automl_context_pack(
     )
 
 
-def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> str:
+def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any], *, include_audit_details: bool = False) -> str:
     """Render the AutoML context pack into a concise prompt-friendly markdown file."""
     if not isinstance(pack, AutoMLContextPack):
         pack = AutoMLContextPack.model_validate(pack)
+    if not include_audit_details:
+        # Only a prompt projection. The complete JSON pack remains the audit source.
+        pack = pack.model_copy(deep=True)
+        pack.execution_contract.pop("resolved_question_history", None)
+        for group in pack.entity_alias_candidates:
+            if isinstance(group, dict):
+                group.pop("qdi_routing", None)
+        # Descriptive distributions are reproducible from input data and are not
+        # the authority for limits or allowable categories. Keep ranges, nulls,
+        # exact names, meanings, read recipes, warnings, and sampling boundaries.
+        def project_profiles(value):
+            if isinstance(value, dict):
+                numeric_profile = str(value.get("logical_type", "")).lower() in {
+                    "numeric", "integer", "float", "int", "int64", "float64", "number",
+                }
+                return {k: project_profiles(v) for k, v in value.items()
+                        if not (k == "top_values" and numeric_profile)}
+            if isinstance(value, list):
+                return [project_profiles(v) for v in value]
+            return value
+        pack.data_access = project_profiles(pack.data_access)
+        tables = pack.data_schema_contract.get("tables")
+        tables = tables if isinstance(tables, list) else []
+        for entry in pack.data_access:
+            matches = [table for table in tables if isinstance(table, dict)
+                       and entry.get("table_id") and table.get("table_id") == entry["table_id"]]
+            # Deduplicate only against fields actually rendered above (first 16),
+            # never against hidden JSON data or an inferred schema-group match.
+            if len(matches) == 1:
+                visible_fields = matches[0].get("field_summaries")
+                visible_fields = visible_fields[:16] if isinstance(visible_fields, list) else []
+                shared = False
+                for field in entry.get("fields") or []:
+                    if not isinstance(field, dict):
+                        continue
+                    peers = [f for f in visible_fields if isinstance(f, dict) and f.get("name") == field.get("name")]
+                    if len(peers) != 1:
+                        continue
+                    for key in ("meaning", "logical_type", "null_ratio", "unique_count", "numeric_range", "datetime_range"):
+                        if (key in field and field[key] is not None
+                                and json.dumps(field[key], ensure_ascii=False, sort_keys=True)
+                                == json.dumps(peers[0].get(key), ensure_ascii=False, sort_keys=True)):
+                            field.pop(key)
+                            shared = True
+                if shared:
+                    entry["_prompt_schema_ref"] = entry["table_id"]
+            for field in entry.get("fields") or []:
+                if isinstance(field, dict) and isinstance(field.get("numeric_stats"), dict):
+                    field["numeric_stats"] = {k: v for k, v in field["numeric_stats"].items()
+                                              if k not in {"mean", "std", "median", "quantiles", "25%", "50%", "75%"}}
     lines: list[str] = [
         "## AutoRealize Structured Context",
         "",
@@ -2414,6 +2627,10 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         "",
         "## Priority Rules",
     ]
+    if not include_audit_details:
+        lines[6:6] = [
+            "Selected numeric frequency distributions and resolved investigation history remain in `realize_report/automl_context_pack.json`; they are not repeated in this execution view. Textual rule values, current contracts, unresolved questions and exact schema remain applicable.", "",
+        ]
     for item in _dedupe_any(pack.priority_rules, limit=12):
         lines.append(f"- {item}")
 
@@ -2731,6 +2948,10 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
         "ranking_scope",
         "primary_metric",
         "metric_direction",
+        "final_evaluation_metric",
+        "final_evaluation_direction",
+        "final_evaluation_formula",
+        "final_evaluation_protocol",
         "prediction_unit",
         "computation_scope",
         "aggregation_rule",
@@ -2814,6 +3035,8 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     for entry in pack.data_access[:20]:
         title = entry.get("pattern") or entry.get("table_id") or entry.get("path") or "data file"
         lines.extend(["", f"### {title}"])
+        if entry.get("_prompt_schema_ref"):
+            lines.append(f"- Field meanings/types/statistics identical to Exact Source Schema Contract / `{entry['_prompt_schema_ref']}` apply here; only additional or differing field facts follow.")
         for key in ["kind", "file_count", "file_role", "sheet_name", "shape", "summary", "read_method", "row_grain", "orchestration_note"]:
             value = entry.get(key)
             if value not in (None, "", []):
@@ -3025,7 +3248,8 @@ def render_automl_context_markdown(pack: AutoMLContextPack | dict[str, Any]) -> 
     if pack.pitfalls:
         lines.extend(["", "## Pitfalls"])
         lines.extend(f"- {x}" for x in _dedupe_any(pack.pitfalls, limit=24))
-    return "\n".join(lines).strip() + "\n"
+    rendered = "\n".join(lines).strip() + "\n"
+    return rendered if include_audit_details else _dedupe_repeated_fact_bullets(rendered)
 
 
 def _compact_field_profile(profile: dict) -> str:
@@ -3649,7 +3873,7 @@ def render_description_protocol_markdown(
         f"- 问题范式：{_paradigm_label(paradigm)}。",
         "",
         "## 评估协议",
-        "### 主指标",
+        "### 候选搜索评分（开发/验证人口）",
         f"- {bundle.evaluation_summary or '以任务定义中的唯一主指标进行排序。'}",
         "### 计算公式",
         "- 由后续评估协议合同固化为唯一可计算公式。",
@@ -4177,6 +4401,58 @@ def _remove_markdown_section(text: str, level: int, headers: set[str]) -> str:
     return "\n".join(out)
 
 
+def _remove_duplicate_placeholder_sections(text: str) -> str:
+    lines = text.splitlines()
+    sections: list[tuple[int, int, str, bool]] = []
+    starts = [index for index, line in enumerate(lines) if line.startswith("## ")]
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        title = re.sub(r"^\d+\.\s+", "", lines[start][3:].strip())
+        body = [line.strip() for line in lines[start + 1:end] if line.strip()]
+        body = [line for line in body if not line.startswith("### ")]
+        placeholder_only = bool(body) and all(
+            re.fullmatch(r"[-*]\s*(?:当前材料不足，无法生成该章节。|暂无(?:相关)?(?:材料|内容)。?)", line)
+            for line in body
+        )
+        sections.append((start, end, title, placeholder_only))
+
+    substantive_titles = {
+        title for _, _, title, placeholder_only in sections if not placeholder_only
+    }
+    remove_lines = {
+        index
+        for start, end, title, placeholder_only in sections
+        if placeholder_only and title in substantive_titles
+        for index in range(start, end)
+    }
+    return "\n".join(line for index, line in enumerate(lines) if index not in remove_lines)
+
+
+def _dedupe_repeated_fact_bullets(text: str, *, minimum_chars: int = 120) -> str:
+    """Drop exact repeated long facts while retaining structured and code content."""
+    seen: set[str] = set()
+    output: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        stripped = line.strip()
+        if (
+            not in_fence
+            and stripped.startswith("- ")
+            and len(stripped) >= minimum_chars
+            and not re.match(r"^-\s*(?:evidence|acceptance_check|additional_source|read_example|fields|warnings|summary)\s*:", stripped)
+        ):
+            key = re.sub(r"\s+", " ", stripped)
+            if key in seen:
+                continue
+            seen.add(key)
+        output.append(line)
+    return "\n".join(output)
+
+
 def finalize_description_markdown(text: str) -> str:
     """Final reader-facing cleanup before writing description.md."""
     out = _replace_legacy_section_titles(text)
@@ -4200,6 +4476,7 @@ def finalize_description_markdown(text: str) -> str:
             "正式评分前的修复项",
         },
     )
+    out = _remove_duplicate_placeholder_sections(out)
     replacements = {
         "Submission Format": "输出或提交格式",
         "Task Definition": "任务定义",
@@ -4241,6 +4518,7 @@ def finalize_description_markdown(text: str) -> str:
             continue
         kept.append(line.rstrip())
     out = "\n".join(kept)
+    out = _dedupe_repeated_fact_bullets(out)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out + "\n"
 
@@ -4828,6 +5106,43 @@ def evaluation_contract_defects(review: EvaluationContractReview | dict[str, Any
         if not str(value).strip():
             defects.append(f"evaluation_contract missing field: {name}")
 
+    coverage_screen_required = bool(re.search(
+        r"(?:基础设备(?:历史)?覆盖(?:前置)?筛查|基础覆盖(?:前置)?筛查|N_eligible)",
+        contract.validation_protocol,
+        re.IGNORECASE,
+    ))
+    if coverage_screen_required:
+        scope = str(contract.computation_scope or "")
+        uses_eligible_population = (
+            "N_eligible" in scope
+            and bool(re.search(r"基础(?:设备)?(?:历史)?覆盖(?:前置)?筛查", scope))
+            and bool(re.search(r"floor\(\s*0\.6\s*\*?\s*N_eligible\s*\)", scope))
+            and bool(re.search(r"floor\(\s*0\.2\s*\*?\s*N_eligible\s*\)", scope))
+        )
+        if not uses_eligible_population:
+            defects.append(
+                "evaluation_contract computation_scope must screen base history coverage before splitting and use N_eligible for both 60/20/20 counts"
+            )
+
+    final_evaluation_fields = {
+        "final_evaluation_metric": contract.final_evaluation_metric,
+        "final_evaluation_direction": contract.final_evaluation_direction,
+        "final_evaluation_formula": contract.final_evaluation_formula,
+        "final_evaluation_protocol": contract.final_evaluation_protocol,
+    }
+    has_final_population = bool(re.search(
+        r"(?:holdout|final[ -]?test|test[ -]?set|留出集|留出分区|最终测试|测试集|测试分区)",
+        contract.validation_protocol,
+        re.IGNORECASE,
+    ))
+    any_final_evaluation_field = any(str(value or "").strip() for value in final_evaluation_fields.values())
+    if has_final_population or any_final_evaluation_field:
+        for name, value in final_evaluation_fields.items():
+            if not str(value or "").strip():
+                defects.append(f"evaluation_contract missing final evaluation field: {name}")
+        if str(contract.final_evaluation_direction or "") not in {"minimize", "maximize"}:
+            defects.append("evaluation_contract final_evaluation_direction must be minimize or maximize")
+
     direction = _direction_label(contract.metric_direction)
     if direction not in {"minimize", "maximize"}:
         defects.append("evaluation_contract metric_direction must be minimize or maximize")
@@ -4850,6 +5165,7 @@ def evaluation_contract_defects(review: EvaluationContractReview | dict[str, Any
             str(contract.primary_metric),
             str(contract.metric_formula),
             str(contract.validation_protocol),
+            *[str(value or "") for value in final_evaluation_fields.values()],
             "\n".join(_nonempty_list(contract.submission_checks)),
             "\n".join(_nonempty_list(contract.leakage_guards)),
             "\n".join(_nonempty_list(contract.invalid_solution_rules)),
@@ -4898,14 +5214,25 @@ def apply_evaluation_contract(desc: str, review: EvaluationContractReview | dict
         true_label = "`y_true` 来源"
         pred_label = "`y_pred` 来源"
     final_formula = _final_score_formula(contract)
+    final_evaluation_fields = {
+        "final_evaluation_metric": contract.final_evaluation_metric,
+        "final_evaluation_direction": contract.final_evaluation_direction,
+        "final_evaluation_formula": contract.final_evaluation_formula,
+        "final_evaluation_protocol": contract.final_evaluation_protocol,
+    }
     lines: list[str] = [
         "## 评估协议",
-        "### 主指标",
+        "### 候选搜索评分（开发/验证人口）",
         f"- 指标名称：{contract.primary_metric.strip()}",
         f"- 优化方向：{_direction_label_zh(direction)}。所有候选方案必须按该方向比较，禁止在实验过程中切换排序方向。",
         f"- 预测或决策单元：{contract.prediction_unit.strip()}",
         "### 计算公式",
+        # Keep the established Chinese label for report consumers while
+        # making the candidate-search phase explicit in the surrounding
+        # heading.  The final holdout formula is rendered in its own section
+        # below and is never conflated with this search score.
         f"- 最终评分公式：{final_formula}",
+        "- 上述最终评分公式仅用于候选开发/验证人口的搜索排序，不代表冻结后的最终留出集评估。",
         "### 计算范围",
         f"- {true_label}：{contract.y_true_source.strip()}",
         f"- {pred_label}：{contract.y_pred_source.strip()}",
@@ -4914,6 +5241,20 @@ def apply_evaluation_contract(desc: str, review: EvaluationContractReview | dict
         "### 验证协议",
         f"- {contract.validation_protocol.strip()}",
     ]
+    if any(str(value or "").strip() for value in final_evaluation_fields.values()):
+        lines.extend([
+            "### 最终留出集评估（候选全局选定后，仅一次）",
+            f"- 指标名称：{contract.final_evaluation_metric.strip()}",
+            f"- 优化方向：{contract.final_evaluation_direction.strip()}",
+            f"- 计算公式：{contract.final_evaluation_formula.strip()}",
+            f"- 执行规则：{contract.final_evaluation_protocol.strip()}",
+            "- 该结果仅用于审计冻结后的最终方案，不得反馈给搜索、排序、参数或模型选择。",
+        ])
+    else:
+        lines.extend([
+            "### 最终留出集评估",
+            "- 未定义独立最终评估人口；不得在候选执行期间读取留出数据，也不得声称已完成留出集评估。",
+        ])
     lines.extend(_render_contract_list("提交校验与防作弊规则", contract.submission_checks))
     lines.extend(_render_contract_list("防泄漏要求", contract.leakage_guards))
     lines.extend(_render_contract_list("非法输出处理", contract.invalid_solution_rules))

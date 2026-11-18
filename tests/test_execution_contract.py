@@ -3,7 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 from types import SimpleNamespace
 
-from autorealize.execution_contract import build_constraint_ledger, build_execution_contract
+from autorealize.execution_contract import (
+    artifact_consistency_gate_passes,
+    build_constraint_ledger,
+    build_execution_contract,
+)
 from autorealize.config import AutoRealizeConfig
 from autorealize.llm.client import LLMClient
 from autorealize.modules.task_definition import TaskDefinitionModule
@@ -116,6 +120,30 @@ def test_blocked_evaluation_and_unresolved_hard_constraints_are_not_ready():
     assert any("Unresolved hard constraint" in issue for issue in result["blocking_issues"])
 
 
+def test_required_temporal_scan_is_part_of_executable_handoff_contract():
+    blocked = _contract(context={
+        "agent_context_pack": {
+            "temporal_scan_requirement": {
+                "required": True,
+                "status": "blocked",
+                "blocking_issues": ["measurements.csv: 2 timestamp values could not be parsed."],
+            },
+        },
+    })
+    assert blocked["readiness"] == "blocked"
+    assert any("timestamp values could not be parsed" in issue for issue in blocked["blocking_issues"])
+
+    passed = _contract(context={
+        "temporal_scan_requirement": {
+            "required": True,
+            "status": "passed",
+            "files": [{"file": "measurements.csv", "rows_scanned": 100}],
+        },
+    })
+    assert passed["readiness"] == "ready"
+    assert passed["temporal_scan_requirement"]["status"] == "passed"
+
+
 def test_single_metric_contract_does_not_require_invented_tie_break_rules():
     contract = EvaluationContractReview(
         **_evaluation(), prediction_unit="one validation row", y_true_source="train.csv.sales",
@@ -178,6 +206,187 @@ def test_current_unresolved_authority_conflict_blocks_handoff():
     assert any("authority conflict" in issue for issue in result["blocking_issues"])
 
 
+def test_shared_unspecified_metadata_is_visible_without_inventing_a_conflict():
+    conflict = {"conflict_id": "AC-3", "topic": "Submission filename", "execution_disposition": "unknown",
+                "positions": ["task_hint: 未显式规定提交文件名。",
+                              "description.md: 未给出提交文件名，仅给出头部格式 Id,SalePrice 及示例 sample_submission.csv。"]}
+    context = {"authoritative_memory": {"authority_conflicts": [conflict]}}
+    before = deepcopy(context)
+    result = _contract(context=context)
+    assert result["readiness"] == "ready_with_assumptions"
+    assert result["authority_conflicts"] == [conflict]
+    assert result["authority_conflict_assessments"][0]["disposition"] == "shared_unspecified"
+    assert context == before
+    # This classification never fills a required execution field.
+    missing_metric = _contract(context=context, evaluation={**_evaluation(), "metric_formula": ""})
+    assert missing_metric["readiness"] == "blocked"
+
+
+def test_one_explicit_rule_or_blocking_flag_cannot_be_waived_as_shared_absence():
+    for conflict in (
+        {"positions": ["user: 未规定输出文件名", "spec: 必须输出 required.csv"]},
+        {"positions": ["user: not specified", "spec: does not specify a filename"], "blocks_execution": True},
+        {"positions": ["user: 未规定提交文件名，但禁止输出结果", "spec: 未规定文件名"]},
+    ):
+        assert _contract(context={"authoritative_memory": {"authority_conflicts": [conflict]}})["readiness"] == "blocked"
+
+
+def test_unrecognized_authority_conflict_status_fails_closed():
+    for status in ("pending_review", "uncertain", "unknown"):
+        result = _contract(context={"authoritative_memory": {"authority_conflicts": [
+            {"status": status, "message": "Two incompatible official target definitions"},
+        ]}})
+
+        assert result["readiness"] == "blocked"
+        assert result["authority_conflict_assessments"][0]["disposition"] == "blocking"
+        assert any("authority conflict" in issue for issue in result["blocking_issues"])
+
+
+def test_scoped_unresolved_authority_conflicts_are_retained_without_blocking():
+    conflicts = [
+        {
+            "conflict_id": "C1",
+            "topic": "质量合格阈值",
+            "description": "设定值与合格标记不一致。",
+            "resolution": "保留冲突记录，不推导质量合格阈值。",
+            "status": "unresolved",
+        },
+        {
+            "conflict_id": "C2",
+            "topic": "蒸汽最佳流量主导因素",
+            "description": "天气因素与进料量因素的观点不同。",
+            "resolution": "保留双方观点，不判定为硬约束；蒸汽建议仅作数据参考，非因果结论。",
+            "status": "unresolved",
+        },
+        {
+            "conflict_id": "C3",
+            "topic": "液位适用范围",
+            "description": "日常工况和开机工况的液位口径不同。",
+            "resolution": "按不同情境分别保留，不得混用。",
+            "status": "unresolved",
+        },
+    ]
+    result = _contract(context={
+        "authoritative_memory": {
+            "authority_conflicts": conflicts,
+            "unresolved_questions": ["阈值与工况仍需现场确认"],
+        },
+    })
+
+    assert result["readiness"] == "ready_with_assumptions"
+    assert result["blocking_issues"] == []
+    assert result["authority_conflicts"] == conflicts
+    assert result["open_questions"] == ["阈值与工况仍需现场确认"]
+    assert [item["disposition"] for item in result["authority_conflict_assessments"]] == [
+        "retained_non_blocking",
+        "retained_non_blocking",
+        "retained_non_blocking",
+    ]
+
+
+def test_safe_use_boundary_does_not_unblock_core_target_conflict_or_explicit_blocker():
+    conflicts = [
+        {
+            "topic": "预测目标定义",
+            "description": "Two incompatible official target definitions.",
+            "resolution": "Retain the conflict; do not infer which target is authoritative.",
+            "status": "unresolved",
+        },
+        {
+            "topic": "工况差异",
+            "description": "Two operating regimes have different settings.",
+            "resolution": "按不同情境分别保留，不得混用。",
+            "status": "unresolved",
+            "severity": "blocking",
+        },
+    ]
+    result = _contract(context={"authoritative_memory": {"authority_conflicts": conflicts}})
+
+    assert result["readiness"] == "blocked"
+    assert len(result["blocking_issues"]) == 2
+    assert [item["disposition"] for item in result["authority_conflict_assessments"]] == [
+        "blocking",
+        "blocking",
+    ]
+
+
+def test_structured_conflict_disposition_requires_explicit_limits_and_respects_resolution_status():
+    conflicts = [
+        {
+            "topic": "质量合格阈值",
+            "fact_a": "设定值为0.5。",
+            "fact_b": "合格标记与设定值不一致。",
+            "resolution_status": "unresolved_conflict_documented",
+            "execution_disposition": "non_blocking_with_limits",
+            "execution_limits": ["不推导质量阈值；缺少质量证据时蒸汽建议返回 review_required。"],
+        },
+        {
+            "topic": "蒸汽流量因素",
+            "resolution_status": "unresolved_conflict_documented",
+            "execution_disposition": "non_blocking_with_limits",
+            "execution_limits": [],
+        },
+        {
+            "topic": "预测目标定义",
+            "resolution_status": "unresolved_conflict_documented",
+            "execution_disposition": "non_blocking_with_limits",
+            "execution_limits": ["保留双方观点，不选择目标。"],
+        },
+        {
+            "topic": "旧工况记录",
+            "resolution_status": "resolved_by_authority",
+        },
+    ]
+    result = _contract(context={"authoritative_memory": {"authority_conflicts": conflicts}})
+
+    assert result["readiness"] == "blocked"
+    assert [item["disposition"] for item in result["authority_conflict_assessments"]] == [
+        "retained_non_blocking",
+        "blocking",
+        "blocking",
+    ]
+    assert any("蒸汽流量因素" in issue for issue in result["blocking_issues"])
+    assert any("预测目标定义" in issue for issue in result["blocking_issues"])
+    assert all("旧工况记录" not in issue for issue in result["blocking_issues"])
+
+
+def test_explicit_task_hint_boundary_can_scope_a_core_contract_conflict():
+    conflict = {
+        "topic": "granularity_and_target",
+        "conflict": "Historical documents use minute-level results; task_hint fixes hourly t+1 prediction.",
+        "highest_priority": "task_hint",
+        "sources": ["task_hint", "historical_results.pdf", "requirements.docx"],
+        "execution_disposition": "non_blocking_with_limits",
+        "execution_limits": ["Historical minute-level results do not enter the hourly target or metrics."],
+    }
+
+    result = _contract(context={"authoritative_memory": {"authority_conflicts": [conflict]}})
+
+    assert result["readiness"] == "ready_with_assumptions"
+    assert result["authority_conflict_assessments"][0]["disposition"] == "retained_non_blocking"
+    assert not any("authority conflict" in issue for issue in result["blocking_issues"])
+
+
+def test_core_conflict_requires_task_hint_to_be_a_recorded_highest_priority_source():
+    for changes in (
+        {"highest_priority": "requirements.docx"},
+        {"sources": ["historical_results.pdf", "requirements.docx"]},
+    ):
+        conflict = {
+            "topic": "prediction target",
+            "description": "Two incompatible official target definitions.",
+            "highest_priority": "task_hint",
+            "sources": ["task_hint", "requirements.docx"],
+            "execution_disposition": "non_blocking_with_limits",
+            "execution_limits": ["Use the documented boundary."],
+            **changes,
+        }
+        result = _contract(context={"authoritative_memory": {"authority_conflicts": [conflict]}})
+
+        assert result["readiness"] == "blocked"
+        assert result["authority_conflict_assessments"][0]["disposition"] == "blocking"
+
+
 def test_description_and_investigation_open_issues_survive_handoff():
     result = _contract(context={
         "description_sections": {"overview_task_definition": {"open_issues": ["Forecast cutoff missing"]}},
@@ -207,6 +416,10 @@ def test_keyword_hints_cannot_reintroduce_business_constraints_after_extraction(
     assert result["items"] == []
     assert result["heuristic_observations"]
     assert all(item["strength"] == "unknown" and item["status"] == "unresolved" for item in result["heuristic_observations"])
+    assert all(item["priority"] == "medium" and "约束" not in item["name"]
+               for item in result["heuristic_observations"])
+    assert "价格/费用线索" in {item["name"] for item in result["heuristic_observations"]}
+    assert all("运价" not in item["name"] for item in result["heuristic_observations"])
 
 
 def test_stable_prompt_prefix_is_identical_for_equivalent_mapping_order():
@@ -275,6 +488,17 @@ def test_local_cache_identity_accounts_for_control_prompt_language(tmp_path):
     first = client._cache_key(**args)
     config.prompt.control_language = "en"
     assert client._cache_key(**args) != first
+
+
+def test_local_cache_identity_accounts_for_output_budget(tmp_path):
+    config = AutoRealizeConfig()
+    config.llm.api_key = "test-key"
+    client = LLMClient(config, tmp_path)
+    args = {"prompt_name": "test", "system_prompt": "stage", "user_prompt": "data"}
+
+    assert client._cache_key(**args, output_max_tokens=1024) != client._cache_key(
+        **args, output_max_tokens=2048,
+    )
 
 
 def test_known_source_filenames_do_not_become_business_field_aliases():
@@ -361,6 +585,63 @@ def test_pipe_qualified_exact_source_field_is_not_blocked_as_an_alias():
             "rule": "Use the exact physical column for raw pandas access; keep the alias only as business wording or a derived/output name.",
         },
     ]
+
+
+def test_colon_and_slash_sheet_qualified_fields_resolve_to_their_exact_sources():
+    schema = {"tables": [
+        {"table_id": "设备.csv", "source_file": "设备.csv",
+         "physical_columns_exact": ["SampleTime", "蒸汽进气压力", "蒸汽进气流量"]},
+        {"table_id": "浓度.xls::Sheet1", "source_file": "浓度.xls", "sheet_name": "Sheet1",
+         "physical_columns_exact": ["参数", "部位", "采样时间", "结果\n[单位为当量]"]},
+    ]}
+    aliases = [
+        "设备.csv:蒸汽进气压力",
+        "设备.csv:蒸汽进气流量",
+        "浓度.xls/Sheet1:采样时间",
+        "浓度.xls/Sheet1:结果\n[单位为当量]",
+    ]
+    guard = TaskDefinitionModule._collect_source_alias_guard(
+        sample_spec=SampleSubmissionSpec(),
+        schema_contract=schema,
+        downstream_context={"constraint_memory": {"items": [{"related_fields": aliases}]}},
+    )
+    assert {item["alias"]: item["exact_physical_column"] for item in guard} == {
+        alias: alias.rsplit(":", 1)[-1] for alias in aliases
+    }
+    assert all(item["status"] == "corrected_to_exact_physical_column" for item in guard)
+
+
+def test_unquoted_slash_sheet_reference_extracts_only_the_qualified_field_alias():
+    schema = {"tables": [{
+        "table_id": "浓度.xls::Sheet1",
+        "source_file": "浓度.xls",
+        "sheet_name": "Sheet1",
+        "physical_columns_exact": ["采样时间"],
+    }]}
+    names = TaskDefinitionModule._exact_schema_non_column_names(schema)
+    columns = set(TaskDefinitionModule._exact_schema_columns(schema))
+    tokens = TaskDefinitionModule._source_field_alias_tokens(
+        "按 浓度.xls/Sheet1:采样时间戳 读取",
+        names,
+        columns,
+    )
+    assert tokens == ["采样时间戳"]
+
+
+def test_warning_only_consistency_result_does_not_block_execution_contract():
+    review = {"passed": False, "issues": [{"severity": "warning", "message": "Residual uncertainty"}]}
+    assert artifact_consistency_gate_passes(review)
+    ready = _contract(context={"artifact_consistency_review": review})
+    assert ready["readiness"] != "blocked"
+    assert "Final artifact consistency review has not passed." not in ready["blocking_issues"]
+
+    assert not artifact_consistency_gate_passes({"passed": False, "issues": []})
+    assert not artifact_consistency_gate_passes(
+        {"passed": False, "issues": [{"severity": "blocking"}]}
+    )
+    assert not artifact_consistency_gate_passes(
+        {"passed": True, "issues": [{"severity": "unknown"}]}
+    )
 
 
 def test_source_diagnostics_do_not_parse_metadata_or_prose_as_columns():

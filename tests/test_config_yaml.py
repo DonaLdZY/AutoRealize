@@ -25,6 +25,9 @@ def test_commented_default_yaml_loads(monkeypatch) -> None:
 
     assert cfg.llm.api_key == "env-test-key"
     assert cfg.llm.max_concurrent_requests == 100
+    assert cfg.llm.context_headroom_ratio == 0.01
+    assert cfg.llm.structured_disable_thinking is False
+    assert cfg.llm.structured_reasoning_fallback_on_length is False
     assert cfg.parallel.cognition_max_workers == 100
     assert cfg.prompt.output_language == "zh"
     assert cfg.telemetry.config_snapshot_filename == "final_config.yaml"

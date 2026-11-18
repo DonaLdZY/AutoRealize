@@ -865,6 +865,59 @@ def test_evaluation_contract_requires_direction_and_guardrails() -> None:
         apply_evaluation_contract("## Evaluation\nold\n## Submission Format\nx\n", contract)
 
 
+def test_final_evaluation_contract_is_optional_without_a_separate_holdout() -> None:
+    contract = EvaluationContractReview(
+        passed=True,
+        primary_metric="MAE",
+        metric_direction="minimize",
+        metric_formula="mean(abs(y_true-y_pred))",
+        prediction_unit="one validation row",
+        y_true_source="development labels",
+        y_pred_source="prediction column",
+        computation_scope="all development rows",
+        aggregation_rule="equal row weights",
+        validation_protocol="Fixed development split; no independent final population is available.",
+        submission_checks=["schema is valid"],
+        leakage_guards=["no future labels"],
+        invalid_solution_rules=["reject NaN"],
+    )
+    assert evaluation_contract_defects(contract) == []
+
+
+def test_final_evaluation_contract_requires_all_fields_when_holdout_is_declared() -> None:
+    contract = EvaluationContractReview(
+        passed=True,
+        primary_metric="MAE",
+        metric_direction="minimize",
+        metric_formula="mean(abs(y_true-y_pred))",
+        prediction_unit="one validation row",
+        y_true_source="development labels",
+        y_pred_source="prediction column",
+        computation_scope="all development rows",
+        aggregation_rule="equal row weights",
+        validation_protocol="Use the final holdout month once after global candidate selection.",
+        submission_checks=["schema is valid"],
+        leakage_guards=["no future labels"],
+        invalid_solution_rules=["reject NaN"],
+    )
+    defects = evaluation_contract_defects(contract)
+    assert all(
+        f"evaluation_contract missing final evaluation field: {name}" in defects
+        for name in (
+            "final_evaluation_metric",
+            "final_evaluation_direction",
+            "final_evaluation_formula",
+            "final_evaluation_protocol",
+        )
+    )
+
+    contract.final_evaluation_metric = "MAE"
+    contract.final_evaluation_direction = "minimize"
+    contract.final_evaluation_formula = "mean(abs(y_true-y_pred))"
+    contract.final_evaluation_protocol = "Evaluate the frozen winner once on the final holdout month."
+    assert evaluation_contract_defects(contract) == []
+
+
 def test_evaluation_contract_requires_scalar_score_for_multi_objective() -> None:
     contract = EvaluationContractReview(
         passed=True,
@@ -1239,3 +1292,21 @@ def test_finalize_description_removes_internal_process_sections() -> None:
     assert "## 输出或提交格式" in cleaned
     assert "Output Layout" not in cleaned
     assert "Contract Status" not in cleaned
+
+
+def test_finalize_description_drops_duplicate_empty_section_and_long_duplicate_fact() -> None:
+    fact = "- " + ("这是一条重复的完整评估约束，所有候选必须使用相同固定人口与指标。" * 5)
+    text = (
+        "# 赛题说明\n\n"
+        "## 任务定义\n- 明确预测目标和时间边界。\n"
+        f"{fact}\n\n"
+        "## 任务定义\n- 当前材料不足，无法生成该章节。\n\n"
+        "## 评估协议\n"
+        f"{fact}\n"
+    )
+
+    cleaned = finalize_description_markdown(text)
+
+    assert cleaned.count("## 任务定义") == 1
+    assert "当前材料不足，无法生成该章节" not in cleaned
+    assert cleaned.count(fact) == 1

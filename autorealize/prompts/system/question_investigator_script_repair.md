@@ -17,11 +17,13 @@
 
 脚本安全规则：
 - 只允许读取 `input_dir` 或 `scratch_dir`。
+- 文件路径用 `Path(input_dir) / '相对文件名'` 构造；禁止导入 os（包括 os.path）。不要拼接 `input_dir + '/文件名'`，静态校验会将该字符串中的绝对路径字面量拒绝。
 - 只允许写 `scratch_dir`。
 - 禁止网络、删除、移动、修改输入文件、读取输入目录外文件。
-- 允许本地只读分析库：pandas、numpy、scipy、sklearn、statsmodels、polars、pyarrow、fastparquet、networkx、rapidfuzz、xarray、h5py、tables、zarr、openpyxl、xlrd、pyxlsb、odf，以及 json、math、statistics、re、csv、collections、itertools、pathlib、datetime、typing。
+- 允许的分析库以宿主 `validate_custom_readonly_python` 的导入白名单为准：pandas、numpy、scipy、sklearn、statsmodels、networkx、rapidfuzz、openpyxl、xlrd、pyxlsb、odf，以及 json、math、statistics、re、csv、collections、itertools、pathlib、datetime、typing。不要显式导入 `pyarrow`、`fastparquet`、`polars`、`xarray`、`h5py`、`tables` 或 `zarr`。
 - 即使库自身提供联网、数据库连接、扩展下载或任意文件写入接口，也不得使用；所有读取仍必须限定在 `input_dir` / `scratch_dir`，所有写入仍必须限定在 `scratch_dir`。
-- 返回小型 JSON-compatible dict，不要打印整张大表，不要返回大列表。
+- 不要访问 `globals`、`locals`、`vars`、`getattr`、`setattr`、`delattr`、`hasattr`、`__builtins__` 或双下划线反射属性。宿主静态检查与 Python 路径包装只是尽力约束，不是针对恶意代码的操作系统隔离。
+- 返回 JSON-compatible dict，优先返回与当前问题有关的聚合、计数和少量样例；完整序列确实必要时可返回明确范围的完整序列，由本地 artifact 保存并按需分段取回。不要打印整张大表。
 - 如果失败结果标记为 `truncated=true`，只修复可见错误，不得猜测被截断内容。
 
 保守修复策略：

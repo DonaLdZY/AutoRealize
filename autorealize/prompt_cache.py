@@ -127,6 +127,79 @@ def text_block(title: str, text: Any, *, limit: int | None = None) -> str:
     return f"{title}\n{value}"
 
 
+def dynamic_json_block(
+    title: str,
+    payload: Any,
+    stable: Any,
+    *,
+    sort_keys: bool = False,
+    preserve_string_keys: set[str] | None = None,
+) -> str:
+    """Reference exact values already visible in the stable message, never summaries.
+
+    Pointers address the original stable object (after resolving its $prompt_ref
+    encoding, if present). Unknown values and changed constraints stay literal.
+    The immutable prefix is not rewritten and source artifacts are not modified.
+    """
+    plain = json_block(title, payload, sort_keys=sort_keys)
+    dumps = lambda x: json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    if not isinstance(stable, (dict, list, tuple)) or '"$stable_ref"' in dumps([stable, payload]):
+        return plain
+    index: dict[str, str] = {}
+
+    def children(value: Any):
+        if isinstance(value, dict):
+            return value.items()
+        if isinstance(value, (list, tuple)):
+            return enumerate(value)
+        return ()
+
+    def collect(value: Any, pointer: str) -> None:
+        serialized = dumps(value)
+        if len(serialized) >= 160:
+            index.setdefault(serialized, pointer)
+        for key, item in children(value):
+            collect(item, pointer + "/" + str(key).replace("~", "~0").replace("/", "~1"))
+
+    preserve_keys = {str(key) for key in (preserve_string_keys or set())}
+
+    def replace(value: Any, key: str = "") -> Any:
+        # Long question text is part of the model's active task state. Keep it
+        # literal in the dynamic tail instead of replacing it with a pointer;
+        # this keeps the prompt self-contained for providers/clients that do
+        # not resolve our private reference envelope.
+        if key in preserve_keys and isinstance(value, str):
+            return value
+        serialized = dumps(value)
+        # Do not replace a containing object when it owns a preserved string
+        # field. Otherwise a long ``initial_question`` dict can collapse to a
+        # private reference before the recursive ``question`` field is seen.
+        # The preserved field is intentionally the small dynamic exception;
+        # all unrelated stable values can still be factored normally.
+        contains_preserved_field = (
+            isinstance(value, dict) and bool(preserve_keys.intersection(value.keys()))
+        )
+        if not contains_preserved_field and len(serialized) >= 160 and serialized in index:
+            return {"$stable_ref": index[serialized]}
+        if isinstance(value, dict):
+            return {k: replace(v, str(k)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [replace(v, "") for v in value]
+        return value
+
+    collect(stable, "")
+    encoded = json_block(title, {
+        "_stable_reference_encoding": (
+            "A sole $stable_ref object aliases the exact complete value at that JSON Pointer "
+            "in the original stable task/data object in the earlier message (resolve its "
+            "$prompt_ref aliases first; ignore encoding envelope). All referenced content is "
+            "already visible. Apply it at every reference; no fact or constraint is omitted."
+        ),
+        "data": replace(payload),
+    }, sort_keys=sort_keys)
+    return encoded if len(encoded) + 200 < len(plain) else plain
+
+
 def join_blocks(*blocks: str) -> str:
     """Join non-empty prompt blocks without changing their internal content."""
     return "\n\n".join(block.strip() for block in blocks if str(block or "").strip())
@@ -177,7 +250,9 @@ def stable_dynamic_prompt(
         else text_block(STABLE_CONTEXT_TITLE, stable, limit=stable_limit)
     )
     dynamic_text = (
-        json_block(dynamic_title, dynamic, limit=dynamic_limit)
+        (dynamic_json_block(dynamic_title, dynamic, stable, sort_keys=True)
+         if dynamic_limit is None and stable_limit is None
+         else json_block(dynamic_title, dynamic, limit=dynamic_limit))
         if isinstance(dynamic, (dict, list, tuple))
         else text_block(dynamic_title, dynamic, limit=dynamic_limit)
     )

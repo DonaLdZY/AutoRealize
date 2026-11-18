@@ -11,7 +11,15 @@ import shutil
 from pathlib import Path
 
 from ..agents.architect import Architect
-from ..artifact_contract_repair import DerivedContractRepair, apply_derived_repairs, repairable_fields, section_fact_fields, apply_section_fact_repairs, section_fact_evidence_refs
+from ..artifact_contract_repair import (
+    DerivedContractRepair,
+    apply_derived_repairs,
+    normalize_explicit_time_series_contract,
+    repairable_fields,
+    section_fact_fields,
+    apply_section_fact_repairs,
+    section_fact_evidence_refs,
+)
 from ..config import AutoRealizeConfig
 from ..context_memory import CrossStageContextLedger
 from ..context_compiler import (
@@ -29,11 +37,12 @@ from ..context_compiler import (
     context_telemetry,
     reconcile_table_shape,
 )
+from ..execution_contract import artifact_consistency_gate_passes, artifact_consistency_warning_only
 from ..logging_utils import log_event
-from ..prompt_cache import stable_dynamic_prompt
+from ..prompt_cache import stable_dynamic_prompt, estimate_text_tokens
 from ..review_prompt import (
-    ArtifactConsistencyAudit, EVALUATION_REVIEW_INSTRUCTIONS, REVIEW_COVERAGE_INSTRUCTIONS,
-    review_prompt_parts,
+    EVALUATION_REVIEW_INSTRUCTIONS,
+    review_prompt_parts, bounded_review_batches,
 )
 from ..report_writer import (
     SECTION_ALIASES,
@@ -63,8 +72,10 @@ from ..models import (
     DownstreamContextResolution,
     DescriptionProtocolBundle,
     DescriptionSectionDraft,
+    ConstraintsAndTipsDraft,
     DescriptionTaskProtocolDraft,
     EvaluationContractReview,
+    HybridProtocol,
     OutputSectionDraft,
     OverviewTaskDefinitionDraft,
     PipelinePlan,
@@ -395,6 +406,8 @@ class TaskDefinitionModule:
         memory = authoritative_memory if isinstance(authoritative_memory, dict) else {}
         pack = agent_context_pack if isinstance(agent_context_pack, dict) else {}
         downstream_context["agent_context_pack"] = pack
+        if isinstance(pack.get("temporal_scan_requirement"), dict):
+            downstream_context["temporal_scan_requirement"] = pack["temporal_scan_requirement"]
         if pack.get("context_routes"):
             downstream_context["context_routes"] = pack.get("context_routes")
         if pack.get("do_not_invent"):
@@ -432,6 +445,7 @@ class TaskDefinitionModule:
             "submission_contract": pack.get("submission_contract", {}),
             "constraint_memory": pack.get("constraint_memory", {}),
             "question_memory": pack.get("question_memory", {}),
+            "temporal_scan_requirement": pack.get("temporal_scan_requirement", {}),
             "data_memory": {
                 "tables": data_memory.get("tables", [])[:20],
                 "documents": data_memory.get("documents", [])[:12],
@@ -509,7 +523,288 @@ class TaskDefinitionModule:
             original_text="\n".join([task_hint or "", original_text or ""]),
             downstream_context=downstream_context,
         )
+        self._normalize_prediction_with_reference_review(
+            review,
+            task_hint="\n".join([task_hint or "", original_text or ""]),
+        )
+        review = self._synchronize_authoritative_steam_formula(review, task_hint)
         return review
+
+    @classmethod
+    def _normalize_prediction_with_reference_review(
+        cls,
+        review: ProblemParadigmReview,
+        *,
+        task_hint: str,
+    ) -> None:
+        """Normalize a prediction task with an attached reference output.
+
+        Some tasks ask for a forecast plus a non-causal historical reference
+        (for example a nearest-neighbour operating range). A reference output
+        does not create an optimization problem. Route it as ordinary prediction
+        unless the task defines both an actionable decision variable and an
+        optimization objective.
+        """
+        if review.problem_paradigm != "hybrid_ml_optimization" or review.rl_required:
+            return
+        evidence = "\n".join(
+            [
+                str(task_hint or ""),
+                str(review.reasoning or ""),
+                *[str(item or "") for item in review.evidence or []],
+                *[str(item or "") for item in review.key_signals or []],
+                *[str(item or "") for item in review.method_routing_notes or []],
+            ]
+        ).lower()
+        prediction_signal = any(
+            token in evidence
+            for token in (
+                "监督预测",
+                "监督回归",
+                "一小时提前预测",
+                "明确目标列",
+                "预测截止",
+                "predicted_",
+                "supervised prediction",
+                "supervised regression",
+                "forecast",
+                "predict(",
+            )
+        )
+        reference_signal = (
+            any(token in evidence for token in ("蒸汽", "steam"))
+            and any(
+                token in evidence
+                for token in (
+                    "参考建议",
+                    "操作参考",
+                    "非因果参考",
+                    "流量参考",
+                    "建议值",
+                    "参考输出",
+                    "reference advice",
+                    "recommendation",
+                )
+            )
+        )
+        if not (prediction_signal and reference_signal) or cls._has_explicit_optimization_contract(task_hint):
+            return
+        review.problem_paradigm = "ml_dl_prediction"
+        review.problem_structure = "prediction"
+        review.rl_as_required_paradigm = False
+        review.environment_source = "not_applicable"
+        review.rl_formulation_candidates = []
+        review.reasoning = (
+            "任务主体是以预测截止时刻 t 及以前可见的历史观测预测 t+1h 的目标值；"
+            "蒸汽流量输出是基于训练期历史支持数据的非因果参考。原始任务没有同时定义可执行的"
+            "优化变量与优化目标，不能仅因附带参考建议判为预测-优化混合任务；下游按 ml_dl_prediction 路由。"
+        )
+        conflicting_route_text = (
+            "hybrid",
+            "强化学习",
+            "reinforcement_learning",
+            "constructed_policy_optimization",
+            "policy_optimization",
+            "rl 路由",
+        )
+        review.method_routing_notes = cls._dedupe_strings(
+            [
+                item
+                for item in review.method_routing_notes or []
+                if not any(phrase in str(item).lower() for phrase in conflicting_route_text)
+            ]
+            + [
+                "确定性归一化：蒸汽/操作量仅作为训练期历史支持的非因果参考输出，"
+                "任务未定义可执行的优化变量与优化目标；下游按监督预测路由。",
+            ],
+            limit=12,
+        )
+        review.key_signals = cls._dedupe_strings(
+            [
+                item
+                for item in review.key_signals or []
+                if not any(phrase in str(item).lower() for phrase in conflicting_route_text)
+            ]
+            + ["附带参考输出不改变问题范式：problem_paradigm=ml_dl_prediction。"],
+            limit=20,
+        )
+        if not review.explicit_rl_requested:
+            non_prediction_methods = (
+                "reinforcement_learning",
+                "offline_rl",
+                "constructed_policy_optimization",
+                "policy_optimization",
+            )
+            review.allowed_method_families = [
+                item for item in review.allowed_method_families
+                if not any(token in str(item).strip().lower() for token in non_prediction_methods)
+            ]
+            review.recommended_solver_families = [
+                item for item in review.recommended_solver_families
+                if not any(token in str(item).strip().lower() for token in non_prediction_methods)
+            ]
+
+    @staticmethod
+    def _has_explicit_optimization_contract(text: str) -> bool:
+        """Require a named actionable variable and an optimization objective."""
+        lowered = str(text or "").lower()
+        has_decision_variable = bool(
+            re.search(
+                r"决策变量|优化变量|可控变量|可调变量|决策量|decision variables?|control variables?",
+                lowered,
+            )
+        )
+        has_objective = bool(
+            re.search(
+                r"目标函数|优化目标|最小化|最大化|minimi[sz](?:e|ation)|maximi[sz](?:e|ation)|objective function",
+                lowered,
+            )
+        )
+        return has_decision_variable and has_objective
+
+    @classmethod
+    def _normalize_prediction_reference_protocol_bundle(
+        cls,
+        bundle: DescriptionProtocolBundle,
+        *,
+        task_hint: str,
+    ) -> bool:
+        """Enforce time-safe semantics for a non-optimizing steam reference."""
+        if bundle.problem_paradigm != "ml_dl_prediction":
+            return False
+        changed = bundle.hybrid != HybridProtocol()
+        if changed:
+            bundle.hybrid = HybridProtocol()
+        text = str(task_hint or "").lower()
+        has_steam_reference = (
+            any(token in text for token in ("蒸汽", "steam"))
+            and any(token in text for token in ("参考", "建议", "recommendation", "reference"))
+        )
+        if not has_steam_reference:
+            return changed
+
+        required_guards = [
+            "附带蒸汽流量参考只使用预测截止时刻及之前可见的观测和冻结训练期参考数据；不得读取预测目标、目标标签或其派生量。",
+            "化验质量证据只有在预测截止时刻已发布且可见性可证明时才可使用；发布时间无法证明时不得作为推理输入。",
+        ]
+        bundle.ml_dl.leakage_guards = cls._dedupe_strings(
+            list(bundle.ml_dl.leakage_guards or []) + required_guards,
+            limit=20,
+        )
+        bundle.constraints = cls._dedupe_strings(
+            list(bundle.constraints or []) + required_guards,
+            limit=30,
+        )
+        bundle.output.format_rules = cls._dedupe_strings(
+            list(bundle.output.format_rules or [])
+            + [
+                "蒸汽流量参考是附带历史参考，不代表优化或控制结果；仅使用预测截止时刻之前可见的观测和冻结训练期参考数据。",
+                "当前蒸汽流量保留输入原始数值与量纲；单位未核实时标记 unit_unverified，不得与 kg/h 推荐值直接比较或换算。",
+            ],
+            limit=30,
+        )
+        return True
+
+    @staticmethod
+    def _synchronize_authoritative_steam_formula(
+        review: ProblemParadigmReview,
+        task_hint: str,
+    ) -> ProblemParadigmReview:
+        """Keep a generated paradigm report aligned with one explicit source formula."""
+        expressions = list(dict.fromkeys(
+            value.strip()
+            for value in re.findall(r"标准值\s*[=:：]\s*([^\n。；;]+)", str(task_hint or ""))
+            if "蒸汽进气压力" in value and "蒸汽进气流量" in value
+        ))
+        if len(expressions) != 1:
+            return review
+
+        formula_pattern = re.compile(
+            r"标准值\s*[=:：]\s*\(?\s*蒸汽进气压力\s*[-－−]\s*600\s*\)?"
+            r"\s*(?:\*\s*2\s*)?[+＋]\s*蒸汽进气流量"
+        )
+        replacement = f"标准值 = {expressions[0]}"
+        payload = review.model_dump()
+
+        def rewrite(value):
+            if isinstance(value, str):
+                return formula_pattern.sub(replacement, value)
+            if isinstance(value, list):
+                return [rewrite(item) for item in value]
+            if isinstance(value, dict):
+                return {key: rewrite(item) for key, item in value.items()}
+            return value
+
+        repaired = rewrite(payload)
+        if repaired == payload:
+            return review
+        return ProblemParadigmReview.model_validate(repaired)
+
+    @staticmethod
+    def _synchronize_hybrid_objective(
+        protocol_bundle: DescriptionProtocolBundle | None,
+        evaluation_contract: EvaluationContractReview,
+    ) -> bool:
+        """Align evaluation summaries without replacing the hybrid business objective."""
+        if protocol_bundle is None:
+            return False
+        metric = str(evaluation_contract.primary_metric or "").strip()
+        final_metric = str(evaluation_contract.final_evaluation_metric or "").strip()
+        changed = False
+        if (
+            protocol_bundle.problem_paradigm == "hybrid_ml_optimization"
+            and metric
+            and final_metric
+            and re.search(r"(?:holdout|final|test|留出|测试)", final_metric, re.IGNORECASE)
+        ):
+            old_validation = protocol_bundle.hybrid.validation_design
+            old_summary = protocol_bundle.evaluation_summary
+            old_objective = protocol_bundle.hybrid.final_objective
+            validation_clauses = [
+                clause.strip()
+                for clause in re.split(r"(?<=[。；;])\s*|\r?\n", protocol_bundle.hybrid.validation_design or "")
+                if clause.strip()
+            ]
+            validation_clauses = [
+                clause for clause in validation_clauses
+                if not (
+                    final_metric.casefold() in clause.casefold()
+                    and re.search(r"(?:主(?:评估|目标|指标)|primary|候选.*(?:选择|排序))", clause, re.IGNORECASE)
+                )
+            ]
+            contract_validation = (
+                f"预测候选只按评估合同规定的开发集指标 {metric} "
+                f"（{evaluation_contract.metric_direction or 'minimize'}）选择；"
+                f"{final_metric} 仅在候选冻结后评估一次，不参与搜索、排序或调参。"
+                "时间切分、边界清理和模型拟合范围均以 evaluation_contract.validation_protocol 为准。"
+            )
+            if contract_validation not in validation_clauses:
+                validation_clauses.append(contract_validation)
+            protocol_bundle.hybrid.validation_design = "；".join(validation_clauses)
+            protocol_bundle.evaluation_summary = (
+                f"主评估：固定开发集 {metric}，方向为 {evaluation_contract.metric_direction or 'minimize'}；"
+                f"最终评估：候选冻结后一次性评估 {final_metric}，不参与候选选择。"
+            )
+            changed = (
+                protocol_bundle.hybrid.final_objective != old_objective
+                or protocol_bundle.hybrid.validation_design != old_validation
+                or protocol_bundle.evaluation_summary != old_summary
+            )
+
+        audit_metrics = [
+            str(item).strip()
+            for item in evaluation_contract.audit_metrics or []
+            if str(item).strip()
+        ]
+        if audit_metrics:
+            audit_line = "辅助审计指标仅作报告，不参与候选排序：" + "；".join(audit_metrics)
+            if audit_line and audit_line not in protocol_bundle.evaluation_summary:
+                prior = protocol_bundle.evaluation_summary.rstrip("；。 ")
+                protocol_bundle.evaluation_summary = (
+                    f"{prior}。{audit_line}。" if prior else f"{audit_line}。"
+                )
+                changed = True
+        return changed
 
     @staticmethod
     def _contains_any(text: str, keywords: list[str] | tuple[str, ...]) -> bool:
@@ -853,6 +1148,10 @@ class TaskDefinitionModule:
                 bundle.output.columns = cols
             if not bundle.output.output_filename:
                 bundle.output.output_filename = str(downstream_context.get("submission_output_filename", ""))
+            self._normalize_prediction_reference_protocol_bundle(
+                bundle,
+                task_hint=original_text,
+            )
             if paradigm in {"static_optimization", "reinforcement_learning"} and not bundle.output.no_sample_submission_reason:
                 bundle.output.no_sample_submission_reason = (
                     "优化/强化学习任务以方案或策略评估为中心；只有权威输出合同明确要求时才需要 sample_submission。"
@@ -897,7 +1196,10 @@ class TaskDefinitionModule:
             return bool(problem_review.requires_sample_submission and (authoritative or has_columns or "official" in source or "sample" in source))
         if problem_review.requires_sample_submission:
             return True
-        return True
+        # A tabular prediction task is not itself evidence of a submission
+        # contract. Only an official template or explicit source contract may
+        # authorize creating a sample file.
+        return False
 
     def _write_protocol_artifacts(
         self,
@@ -1525,6 +1827,117 @@ class TaskDefinitionModule:
             "context_routing_notes": [str(x) for x in (qmem.get("context_routing_notes") or [])],
         }
 
+    def _evaluation_question_memory_pack(self, downstream_context: dict) -> dict:
+        """Pass only prior QDI conclusions that can change the evaluation contract."""
+        memory = self._question_memory_pack(downstream_context)
+        relevant_terms = (
+            "target", "label", "truth", "prediction", "cutoff", "timestamp", "time",
+            "metric", "score", "evaluation", "validation", "holdout", "split", "purge",
+            "leakage", "submission", "output", "schema", "unit", "sample", "population",
+            "lab", "result", "publication", "release",
+            "标签", "目标", "预测", "截止", "时间", "指标", "评分", "评估", "验证",
+            "留出", "切分", "泄漏", "提交", "输出", "字段", "单位", "样本", "人群",
+            "压滤液", "化验", "发布", "时延", "结果", "al(n)", "蒸汽", "steam",
+        )
+
+        def relevant(*values: object) -> bool:
+            text = " ".join(str(value or "") for value in values).lower()
+            return any(term in text for term in relevant_terms)
+
+        records = memory.get("question_records") if isinstance(memory.get("question_records"), list) else []
+        selected: list[dict[str, str]] = []
+        for record in records:
+            if not isinstance(record, dict) or not relevant(
+                record.get("question"), record.get("short_answer"), record.get("unresolved_reason")
+            ):
+                continue
+            selected.append(
+                {
+                    key: str(record.get(key) or "")[:900]
+                    for key in ("question_id", "question", "status", "short_answer", "unresolved_reason")
+                    if record.get(key) not in (None, "")
+                }
+            )
+            if len(selected) >= 12:
+                break
+
+        if not selected:
+            answers = memory.get("answers") if isinstance(memory.get("answers"), list) else []
+            for answer in answers:
+                if not isinstance(answer, dict):
+                    continue
+                question = answer.get("question") or answer.get("question_text") or ""
+                conclusion = (
+                    answer.get("short_answer")
+                    or answer.get("answer")
+                    or answer.get("conclusion")
+                    or answer.get("summary")
+                    or ""
+                )
+                if not relevant(question, conclusion):
+                    continue
+                selected.append(
+                    {
+                        key: str(value or "")[:900]
+                        for key, value in {
+                            "question_id": answer.get("question_id") or answer.get("id"),
+                            "question": question,
+                            "status": answer.get("status"),
+                            "short_answer": conclusion,
+                        }.items()
+                        if value not in (None, "")
+                    }
+                )
+                if len(selected) >= 12:
+                    break
+
+        unresolved = [
+            str(item)[:600]
+            for item in (memory.get("unresolved_questions") or [])
+            if str(item).strip() and relevant(item)
+        ]
+        return {
+            "relevant_prior_conclusions": selected,
+            "unresolved_questions": unresolved[:12],
+        }
+
+    @staticmethod
+    def _evaluation_source_coverage_pack(ledger: dict) -> dict:
+        """Keep source identity and row-count provenance without duplicating review queues."""
+        entry_keys = (
+            "table_id",
+            "source_file",
+            "sheet_name",
+            "table_kind",
+            "source_role",
+            "coverage_status",
+            "verified_shape",
+            "reader_reported_shape",
+            "verified_row_count",
+            "row_count_basis",
+            "worksheet_used_range_shape",
+            "row_count_conflict",
+            "layout_kind",
+            "schema_signature_fields",
+            "schema_signature_scope",
+            "field_count",
+        )
+        entries = []
+        for entry in ledger.get("entries", []) if isinstance(ledger, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            entries.append(
+                {key: entry[key] for key in entry_keys if entry.get(key) not in (None, "", [], {})}
+            )
+        return {
+            "entries": entries,
+            "counts": ledger.get("counts", {}) if isinstance(ledger, dict) else {},
+            "original_table_count": ledger.get("original_table_count", len(entries))
+            if isinstance(ledger, dict) else len(entries),
+            "omitted_table_count": ledger.get("omitted_table_count", 0)
+            if isinstance(ledger, dict) else 0,
+        }
+
     def _build_task_authority_pack(
         self,
         *,
@@ -1533,6 +1946,37 @@ class TaskDefinitionModule:
         downstream_context: dict,
     ) -> dict:
         auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
+        overview_authority_keys = (
+            "summary",
+            "task_goal",
+            "input_requirements",
+            "output_requirements",
+            "evaluation_requirements",
+            "constraints",
+            "leakage_guards",
+            "submission_contract",
+            "authority_conflicts",
+            "unresolved_questions",
+        )
+        overview_authority = {
+            key: auth[key]
+            for key in overview_authority_keys
+            if key in auth
+        }
+        review = problem_review.model_dump()
+        overview_review_keys = (
+            "problem_paradigm",
+            "problem_structure",
+            "decision_temporality",
+            "confidence",
+            "requires_sample_submission",
+            "output_contract_source",
+            "explicit_rl_requested",
+            "rl_as_required_paradigm",
+            "rl_required",
+        )
+        overview_review = {key: review[key] for key in overview_review_keys if key in review}
+        question_memory = self._question_memory_pack(downstream_context)
         return {
             "task_hint": task_hint,
             "authority_priority": [
@@ -1541,16 +1985,12 @@ class TaskDefinitionModule:
                 "官方说明/其他说明文档再次之",
                 "数据统计和 LLM 推断最低",
             ],
-            "authoritative_memory": dict(auth),
-            "problem_paradigm_review": problem_review.model_dump(),
-            "downstream_context": {
-                "train_table": downstream_context.get("train_table", ""),
-                "predict_table": downstream_context.get("predict_table", ""),
-                "target_column": downstream_context.get("target_column", ""),
-                "id_column": downstream_context.get("id_column", ""),
-                "submission_columns": downstream_context.get("submission_columns", []),
+            "authoritative_memory": overview_authority,
+            "problem_paradigm_review": overview_review,
+            "question_memory": {
+                "summary": str(question_memory.get("summary", "")),
+                "unresolved_questions": list(question_memory.get("unresolved_questions") or []),
             },
-            "question_memory": self._question_memory_pack(downstream_context),
         }
 
     def _build_evaluation_evidence_pack(
@@ -1562,41 +2002,46 @@ class TaskDefinitionModule:
         file_summaries: list,
         protocol_bundle: DescriptionProtocolBundle | None = None,
     ) -> dict:
-        auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
-        constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
-        compiled = self._compiled_context_for_sections(
-            file_summaries=file_summaries,
-            downstream_context=downstream_context,
-            relations=relations,
-            table_limit=20,
-            relation_limit=30,
+        del relations
+        source_coverage = build_source_coverage_ledger(file_summaries=file_summaries)
+        raw_problem = problem_review.model_dump()
+        problem_summary = {
+            key: raw_problem[key]
+            for key in (
+                "problem_paradigm",
+                "problem_structure",
+                "decision_temporality",
+                "confidence",
+                "requires_sample_submission",
+                "output_contract_source",
+                "explicit_rl_requested",
+                "rl_required",
+            )
+            if key in raw_problem
+        }
+        submission = downstream_context.get("authoritative_submission_contract", {})
+        submission_keys = (
+            "is_defined",
+            "is_authoritative",
+            "output_filename",
+            "sample_filename",
+            "columns",
+            "row_unit",
+            "row_count_rule",
+            "format_description",
+            "validation_rules",
+            "source",
+            "unresolved_questions",
         )
-        table_cards = self._select_relevant_table_cards(
-            compiled["table_cards"],
-            terms=["eval", "metric", "score", "评分", "评估", "目标", "成本", "费用", "label", "target", "提交", "output", "submission"],
-            limit=10,
+        submission_summary = (
+            {key: submission[key] for key in submission_keys if key in submission}
+            if isinstance(submission, dict) else {}
         )
         return {
-            "problem_paradigm": problem_review.model_dump(),
-            "evaluation_requirements": [str(x) for x in (auth.get("evaluation_requirements") or [])],
-            "objective_priority": [
-                str(x)
-                for x in (auth.get("constraints") or [])
-                if any(k in str(x).lower() for k in ["目标", "优先", "成本", "最小", "最大", "score", "metric", "penalty", "reward"])
-            ],
-            "submission_or_output_requirements": [str(x) for x in (auth.get("output_requirements") or [])],
-            "authoritative_submission_contract": downstream_context.get("authoritative_submission_contract", {}),
-            "constraint_memory": dict(constraint_memory),
-            "leakage_facts": [str(x) for x in (auth.get("leakage_guards") or [])],
-            # Compatibility key: tiny file/table handles only, not a full metadata bundle.
-            "evaluation_related_files": self._table_cards_as_file_index(table_cards),
-            "table_index": table_cards,
-            "source_coverage_ledger": compiled["source_coverage_ledger"],
-            "population_verification_queue": compiled["population_verification_queue"],
-            "relations": compiled["relations"][:20],
-            "relation_verification_queue": compiled["relation_verification_queue"],
-            "filename_sample_groups": compiled["filename_sample_groups"][:12],
-            "qdi_evaluation_output_constraint_conclusions": self._question_memory_pack(downstream_context),
+            "problem_summary": problem_summary,
+            "authoritative_output_contract": submission_summary,
+            "source_coverage": self._evaluation_source_coverage_pack(source_coverage),
+            "relevant_prior_qdi": self._evaluation_question_memory_pack(downstream_context),
             "protocol_evaluation_summary": (
                 protocol_bundle.evaluation_summary if protocol_bundle is not None else ""
             ),
@@ -1717,11 +2162,11 @@ class TaskDefinitionModule:
         constraint_memory = downstream_context.get("constraint_memory") if isinstance(downstream_context.get("constraint_memory"), dict) else {}
         relation_cards = build_relation_cards(relations, limit=30)
         return {
-            "authoritative_constraints": [str(x)[:500] for x in (auth.get("constraints") or [])[:20]],
-            "leakage_guards": [str(x)[:500] for x in (auth.get("leakage_guards") or [])[:12]],
+            "authoritative_constraints": [str(x) for x in (auth.get("constraints") or [])],
+            "leakage_guards": [str(x) for x in (auth.get("leakage_guards") or [])],
             "constraint_memory": {
-                "summary": str(constraint_memory.get("summary", ""))[:1200],
-                "items": (constraint_memory.get("items") or [])[:24],
+                "summary": str(constraint_memory.get("summary", "")),
+                "items": (constraint_memory.get("items") or []),
             },
             "relations": relation_cards[:20],
             "qdi_constraint_conclusions": self._question_memory_pack(downstream_context),
@@ -1730,8 +2175,8 @@ class TaskDefinitionModule:
     def _build_tips_pack(self, *, downstream_context: dict) -> dict:
         auth = downstream_context.get("authoritative_memory") if isinstance(downstream_context.get("authoritative_memory"), dict) else {}
         return {
-            "authority_conflicts": (auth.get("authority_conflicts") or [])[:12],
-            "unresolved_authority_questions": [str(x)[:360] for x in (auth.get("unresolved_questions") or [])[:12]],
+            "authority_conflicts": (auth.get("authority_conflicts") or []),
+            "unresolved_authority_questions": [str(x) for x in (auth.get("unresolved_questions") or [])],
             "qdi_memory": self._question_memory_pack(downstream_context),
             "mandatory_unresolved_guidance": (
                 "建模、数据处理、特征工程、约束设计和评分实现应避免依赖未验证疑惑；"
@@ -1808,12 +2253,12 @@ class TaskDefinitionModule:
         final_formula = str(contract.metric_formula or contract.scalar_score_formula or "").strip() or "未明确"
         lines = [
             "## 评估协议",
-            "### 主指标",
+            "### 候选搜索评分（开发/验证人口）",
             f"- 指标名称：{contract.primary_metric or '未明确'}",
             f"- 优化方向：{direction_text}",
             f"- 预测/决策单元：{contract.prediction_unit or '未明确'}",
             "### 计算公式",
-            f"- 最终评分公式：{final_formula}",
+            f"- 候选 Final Validation Score 公式：{final_formula}",
         ]
         lines.extend(
             [
@@ -1824,9 +2269,20 @@ class TaskDefinitionModule:
                 f"- 聚合方式：{contract.aggregation_rule or '未明确'}",
                 "### 验证协议",
                 f"- {contract.validation_protocol or '未明确'}",
-                "### 提交校验与防作弊",
+                "### 最终留出集评估（候选全局选定后）",
             ]
         )
+        if contract.final_evaluation_metric or contract.final_evaluation_formula or contract.final_evaluation_protocol:
+            lines.extend([
+                f"- 指标名称：{contract.final_evaluation_metric or '未明确'}",
+                f"- 优化方向：{contract.final_evaluation_direction or '未明确'}",
+                f"- 计算公式：{contract.final_evaluation_formula or '未明确'}",
+                f"- 执行规则：{contract.final_evaluation_protocol or '未明确'}",
+                "- 该结果只审计冻结后的最终方案，不得反馈给候选搜索或改变方案选择。",
+            ])
+        else:
+            lines.append("- 未定义独立最终评估人口；不得在候选执行期间读取最终留出集，也不得声称已完成留出集评估。")
+        lines.append("### 提交校验与防作弊")
         for item in contract.submission_checks or ["未明确"]:
             lines.append(f"- {item}")
         lines.append("### 防泄漏要求")
@@ -1968,6 +2424,37 @@ class TaskDefinitionModule:
         draft.section_id = section_id
         draft.markdown = self._ensure_section_header(draft.markdown, section_title)
         return draft
+
+    def _generate_constraints_and_tips(self, *, downstream_context: dict, relations: list,
+                                       frozen_sections: dict, original_text: str) -> tuple[DescriptionSectionDraft, DescriptionSectionDraft]:
+        """Share authority/QDI evidence once; keep both frozen section contracts."""
+        stable, dynamic = self._stage_prompt(
+            stage="description_constraints_and_tips",
+            stable={
+                "output_language_policy": self._output_language_policy(),
+                "original_requirements_full": original_text,
+                "constraint_evidence": self._build_constraint_section_pack(
+                    downstream_context=downstream_context, relations=relations),
+                "tips_evidence": self._build_tips_pack(downstream_context=downstream_context),
+                "frozen_previous_sections": frozen_sections,
+            },
+            dynamic={"instruction": "同时生成约束与防泄漏、关键坑点与待确认事项两个章节；相同规则只完整表述一次。"},
+            stable_title="Stable constraint and uncertainty evidence",
+            dynamic_title="Description section request",
+        )
+        result = self.services.llm_client.ask_structured(
+            model_cls=ConstraintsAndTipsDraft,
+            system_prompt=self.services.prompt_mgr.load("system/description_constraints_and_tips.md"),
+            user_prompt=dynamic, prompt_name="description_constraints_and_tips", max_tokens=6500,
+            static_context_prompt=stable, dynamic_user_prompt=dynamic,
+        )
+        for draft, section_id, title in (
+            (result.constraints, "constraints_leakage", "约束与防泄漏"),
+            (result.tips, "tips", "关键坑点与待确认事项"),
+        ):
+            draft.section_id = section_id
+            draft.markdown = self._ensure_section_header(draft.markdown, title)
+        return result.constraints, result.tips
 
     def _compose_description_sections(self, sections: list[str]) -> str:
         clean = [self._strip_markdown_fence(s).strip() for s in sections if str(s or "").strip()]
@@ -2196,7 +2683,8 @@ class TaskDefinitionModule:
         # Dotted references need a real source qualifier. A sentence-ending
         # period does not turn its last English word into a dataframe column.
         for name in sorted(non_column_names or [], key=len, reverse=True):
-            for match in re.findall(re.escape(name) + r"(?:::|[.：:])([^:\s`'\"，,。；;、]+)", reference_text):
+            qualifier = re.escape(name) + r"(?:[/\\][^:\s/\\]+)?"
+            for match in re.findall(qualifier + r"(?:::|[.：:])([^:\s`'\"，,。；;、]+)", reference_text):
                 token = re.split(r"[（(]", match, maxsplit=1)[0].strip()
                 if token and token not in tokens:
                     tokens.append(token)
@@ -2292,13 +2780,20 @@ class TaskDefinitionModule:
             source = str(table.get("source_file") or "")
             sheet = str(table.get("sheet_name") or "")
             qualifiers = [str(table.get("table_id") or "")]
-            qualifiers += [f"{source}::{sheet}", f"{source}.{sheet}"] if sheet else [source]
             if source and sheet:
-                qualifiers.append(f"{source} | {sheet}")
+                qualifiers += [
+                    f"{source}::{sheet}",
+                    f"{source}.{sheet}",
+                    f"{source}/{sheet}",
+                    f"{source}\\{sheet}",
+                    f"{source} | {sheet}",
+                ]
+            elif source:
+                qualifiers.append(source)
             for qualifier in qualifiers:
                 if not qualifier:
                     continue
-                for separator in ("::", ".", " | "):
+                for separator in ("::", ".", " | ", ":"):
                     prefix = qualifier + separator
                     if not field.startswith(prefix):
                         continue
@@ -2377,6 +2872,8 @@ class TaskDefinitionModule:
             "computation_scope",
             "aggregation_rule",
             "validation_protocol",
+            "final_evaluation_formula",
+            "final_evaluation_protocol",
             "rationale",
         ]:
             value = getattr(contract, attr, "")
@@ -3515,12 +4012,36 @@ class TaskDefinitionModule:
         authority = downstream_context.get("authoritative_submission_contract", {})
         return bool(official_sample_probe.get("columns") or authority.get("sample_filename"))
 
-    def _sync_sample_requirement(self, problem_review, protocol_bundle, downstream_context, official_sample_probe):
+    def _sync_sample_requirement(
+        self,
+        problem_review,
+        protocol_bundle,
+        downstream_context,
+        official_sample_probe,
+        sample_spec=None,
+    ):
         required = self._source_requires_sample(downstream_context, official_sample_probe)
         protocol_bundle.output.sample_submission_required = required
         problem_review.requires_sample_submission = required
         authority = downstream_context.get("authoritative_submission_contract", {})
         sample = downstream_context.get("sample_submission_spec", {})
+        if not required:
+            # Keep the LLM's format prose for the report, but never let its
+            # default ``should_generate=true`` create an invented artifact.
+            if sample_spec is not None:
+                sample_spec.should_generate = False
+                if not sample_spec.no_sample_submission_reason:
+                    sample_spec.no_sample_submission_reason = (
+                        "没有权威样例文件或明确提交合同；本任务使用算法/推理协议，不生成 sample_submission.csv。"
+                    )
+                sample = sample_spec.model_dump()
+            else:
+                sample["should_generate"] = False
+                sample.setdefault(
+                    "no_sample_submission_reason",
+                    "没有权威样例文件或明确提交合同；本任务使用算法/推理协议，不生成 sample_submission.csv。",
+                )
+            downstream_context["sample_submission_spec"] = sample
         if (problem_review.problem_paradigm in {"static_optimization", "reinforcement_learning"}
                 and authority.get("is_defined") is False and not authority.get("output_filename")
                 and sample.get("should_generate") is False and sample.get("output_filename") == ""
@@ -3695,6 +4216,29 @@ class TaskDefinitionModule:
         )
         return self._apply_source_alias_guard_to_description(current, guard)
 
+    @staticmethod
+    def _full_scan_audit_evidence(file_summaries: list | None) -> list[dict]:
+        evidence = []
+        for fs in file_summaries or []:
+            if Path(str(getattr(fs, "path", ""))).suffix.lower() != ".csv":
+                continue
+            metadata = getattr(fs, "source_metadata", {}) or {}
+            contract = metadata.get("csv_read_contract")
+            contract = contract if isinstance(contract, dict) else {}
+            evidence.append(
+                {
+                    "source_file": str(getattr(fs, "path", "")),
+                    "source_fingerprint": str(metadata.get("source_fingerprint") or ""),
+                    "read_parameters_verified": bool(contract.get("read_parameters_verified")),
+                    "pandas_kwargs": contract.get("pandas_kwargs", {}),
+                    "preview_scope": metadata.get("profile_sampling", {}),
+                    "full_table_scan": metadata.get("full_table_scan")
+                    if isinstance(metadata.get("full_table_scan"), dict)
+                    else {"status": "not_run"},
+                }
+            )
+        return evidence
+
     def _review_final_artifact_consistency(
         self,
         *,
@@ -3708,56 +4252,276 @@ class TaskDefinitionModule:
         main_task_protocol: dict,
         downstream_context: dict,
         deterministic_defects: list[str],
+        full_scan_evidence: list[dict] | None = None,
         round_idx: int,
     ) -> ArtifactConsistencyReview:
+        ledger_context = self._cross_stage_context.stable_context if self._cross_stage_context else {}
+        authoritative_memory = (
+            downstream_context.get("authoritative_memory")
+            if isinstance(downstream_context.get("authoritative_memory"), dict)
+            else {}
+        )
+        task_hint = str(
+            downstream_context.get("task_hint")
+            or ledger_context.get("task_hint")
+            or ""
+        )
         stable_payload = {
-            "context_policy": self._headroom_context_policy(),
-            "output_language_policy": self._prompt_language_policy(),
             "audit_rules": [
-                "只审查跨产物语义一致性和证据归属，不做文风润色。",
-                "真实 schema、官方合同和程序验证事实不可被任务书文本覆盖。",
-                "QDI unresolved 不得被提升为确定事实。",
-                "只引用输入中可见的 artifact/section/evidence，不得猜测隐藏内容。",
+                "逐项对照目标/时点、评估人群与公式、物理 schema、输出字段、QDI 未决事实和镜像合同。",
+                "只报告会导致错误实现、不可复现评估、非法输出或越权事实的具体冲突；不评价文风。",
+                "只引用本输入中可见的原产物和字段；不得把未决事实写成确定结论。",
+                "全表扫描证据以 full_scan_evidence 为准；源指纹匹配且扫描计数闭合即能验证人口数，即使没有有效时间值也不能判为未扫描。混合时区须读取分组时间范围。",
+                "最多 6 个独立问题；summary 不超过 120 字，message 不超过 160 字，repair_instruction 不超过 200 字，evidence_refs 最多 4 项。",
+                "没有未解决的 blocking 时 passed=true；warning 可保留且不阻断。",
             ],
+            "full_scan_evidence": list(full_scan_evidence or []),
+        }
+        review_pack = self._artifact_consistency_review_pack(automl_context_pack)
+        frozen_sections = main_task_protocol.get("frozen_description_sections", {})
+        review_protocol = {
+            "frozen_description_sections": {
+                str(key): {
+                    "section_id": str(value.get("section_id") or key),
+                    "description_ref": f"description_markdown::{key}",
+                }
+                for key, value in frozen_sections.items()
+                if isinstance(frozen_sections, dict) and isinstance(value, dict)
+            } if isinstance(frozen_sections, dict) else {},
+        }
+        problem_payload = problem_review.model_dump()
+        problem_payload = {
+            key: problem_payload[key]
+            for key in (
+                "problem_paradigm",
+                "problem_structure",
+                "decision_temporality",
+                "environment_source",
+                "confidence",
+                "required_method_families",
+                "allowed_method_families",
+                "requires_sample_submission",
+                "output_contract_source",
+                "explicit_rl_requested",
+                "rl_required",
+                "evidence",
+            )
+            if key in problem_payload
+        }
+        evaluation_payload = evaluation_contract.model_dump()
+        evaluation_payload = {
+            key: evaluation_payload[key]
+            for key in (
+                "passed",
+                "executable",
+                "authority_status",
+                "ranking_scope",
+                "score_representation",
+                "primary_metric",
+                "metric_direction",
+                "metric_formula",
+                "scalar_score_formula",
+                "final_evaluation_metric",
+                "final_evaluation_direction",
+                "final_evaluation_formula",
+                "final_evaluation_protocol",
+                "prediction_unit",
+                "y_true_source",
+                "y_pred_source",
+                "computation_scope",
+                "aggregation_rule",
+                "validation_protocol",
+                "submission_checks",
+                "leakage_guards",
+                "invalid_solution_rules",
+                "tie_break_rules",
+                "assumptions",
+                "residual_issues",
+            )
+            if key in evaluation_payload
+        }
+        protocol_payload = protocol_bundle.model_dump()
+        protocol_payload = {
+            key: protocol_payload[key]
+            for key in (
+                "problem_paradigm",
+                "problem_structure",
+                "decision_temporality",
+                "environment_source",
+                "required_method_families",
+                "allowed_method_families",
+                "overview",
+                "task_goal",
+                "data_access",
+                "ml_dl",
+                "hybrid",
+                "output",
+                "evaluation_summary",
+                "constraints",
+                "warnings",
+            )
+            if key in protocol_payload
+        }
+        qdi = self._question_memory_pack(downstream_context)
+        qdi_payload = {
+            "summary": qdi.get("summary", ""),
+            "question_records": [
+                {
+                    key: record.get(key)
+                    for key in ("question_id", "question", "status", "short_answer", "unresolved_reason")
+                    if key in record
+                }
+                for record in qdi.get("question_records", [])
+                if isinstance(record, dict)
+            ],
+            "unresolved_questions": qdi.get("unresolved_questions", []),
+        }
+        authority_payload = {
+            "task_hint": task_hint,
+            "authority_order": [
+                "Current user task_hint is authoritative for task scope.",
+                "Official/source documents are secondary and cannot replace explicit task_hint requirements.",
+                "Data profiling and model inference are evidence, not authority.",
+            ],
+            "authority_conflicts": authoritative_memory.get("authority_conflicts", []),
+            "authoritative_submission_contract": downstream_context.get(
+                "authoritative_submission_contract", {}
+            ),
         }
         dynamic_payload = {
-            "problem_paradigm_review": problem_review.model_dump(),
-            "evaluation_contract": evaluation_contract.model_dump(),
-            "sample_submission_spec": sample_spec.model_dump(),
-            "submission_report": submission_report,
-            "qdi_conclusions": self._question_memory_pack(downstream_context),
-            "source_alias_guard": downstream_context.get("source_alias_guard", []),
-            "description_protocol_bundle": protocol_bundle.model_dump(),
-            "automl_context_pack": automl_context_pack,
-            "main_task_protocol": main_task_protocol,
+            "problem_paradigm_review": problem_payload,
+            "evaluation_contract": evaluation_payload,
+            "sample_submission_spec": {
+                key: getattr(sample_spec, key)
+                for key in (
+                    "should_generate",
+                    "source",
+                    "output_filename",
+                    "sample_filename",
+                    "columns",
+                    "row_unit",
+                    "row_count_rule",
+                    "source_fields",
+                    "format_rules",
+                    "validation_rules",
+                    "no_sample_submission_reason",
+                )
+            },
+            "submission_report": {
+                key: submission_report.get(key)
+                for key in (
+                    "source",
+                    "passed",
+                    "issues",
+                    "sample_submission_available",
+                    "sample_validation_scope",
+                    "final_prediction_validated",
+                    "sample_submission_generation_status",
+                )
+                if key in submission_report
+            },
+            "qdi_conclusions": qdi_payload,
+            "description_protocol_bundle": protocol_payload,
+            "automl_context_pack": review_pack,
+            "main_task_protocol": review_protocol,
             "description_markdown": desc,
             "deterministic_defects": deterministic_defects,
-            "instruction": "审查当前最终候选产物；列出最小、可定位、可修复的问题。",
+            "instruction": (
+                "审查当前最终候选产物。仅输出指定 ArtifactConsistencyReview JSON，不输出分析过程。"
+            ),
             "round": round_idx,
         }
-        stable, dynamic = self._stage_prompt(
-            stage="artifact_consistency_reviewer",
-            stable=stable_payload,
-            dynamic=dynamic_payload,
-            stable_title="Stable artifact audit rules",
-            dynamic_title="Latest final artifact candidates",
-            dynamic_limit=52000,
-            complete_current_snapshot=True,
+        dynamic_title = "Latest final artifact candidates"
+        stable, dynamic = review_prompt_parts(
+            authority=authority_payload,
+            stage_evidence=stable_payload,
+            latest_request=dynamic_payload,
+            dynamic_title=dynamic_title,
         )
         review_model = ArtifactConsistencyReview
         review_system = self.services.prompt_mgr.load("system/artifact_consistency_reviewer.md")
-        if getattr(self.config.prompt, "lossless_review_prompts", False):
-            review_model = ArtifactConsistencyAudit
-            review_system += "\n" + REVIEW_COVERAGE_INSTRUCTIONS
+        window = int(getattr(self.config.llm, 'context_window_tokens', 0) or 0)
+        context_budget = int(window * .82) - 4096 - 6000 if window else 0
+        input_budget = min(64000, max(1000, context_budget)) if window else 64000
+        current_tokens = estimate_text_tokens(json.dumps({'messages':[
+            {'role':'user','content':stable}, {'role':'user','content':dynamic}]}, ensure_ascii=False))
+        if input_budget > 0 and current_tokens > input_budget:
+            batches = bounded_review_batches(
+                authority=authority_payload,
+                stage_evidence=stable_payload, latest_request=dynamic_payload,
+                dynamic_title=dynamic_title, input_budget=input_budget)
+            records, issues = [], []
+            for index, batch in enumerate(batches, 1):
+                part = self.services.llm_client.ask_structured(
+                    model_cls=review_model,
+                    system_prompt=self.services.prompt_mgr.load(
+                        "system/artifact_consistency_batch_reviewer.md"
+                    ),
+                    user_prompt=batch['dynamic'], prompt_name=f'artifact_consistency_reviewer_{round_idx}_batch_{index}',
+                    max_tokens=12288, length_retry_max_tokens=16384,
+                    static_context_prompt=batch['stable'], dynamic_user_prompt=batch['dynamic'])
+                for item in part.issues:
+                    issues.append(item.model_copy(update={'issue_id':f'b{index}_{item.issue_id or len(issues)+1}'}))
+                records.append({'batch':index, 'input_tokens_estimate':batch['input_tokens'],
+                    'included_paths':batch['included_paths'], 'review':part.model_dump()})
+                write_json_safe(self.report_dir / f'artifact_consistency_batches_round_{round_idx}.json',
+                    {'original_input_tokens_estimate':current_tokens,'input_budget':input_budget,
+                     'batch_count':len(batches),'completed_batches':len(records),'batches':records}, indent=2)
+            return ArtifactConsistencyReview(passed=all(r['review']['passed'] for r in records),
+                summary=f'完整证据分为{len(records)}批审查；各批保留共同原始需求和当前任务书，分片证据已按路径无损覆盖。'
+                    + ' '.join(r['review']['summary'] for r in records), issues=issues)
         return self.services.llm_client.ask_structured(
             model_cls=review_model,
             system_prompt=review_system,
             user_prompt=dynamic,
             prompt_name=f"artifact_consistency_reviewer_{round_idx}",
-            max_tokens=32768,
+            max_tokens=12288,
+            length_retry_max_tokens=16384,
             static_context_prompt=stable,
             dynamic_user_prompt=dynamic,
         )
+
+    @staticmethod
+    def _artifact_consistency_review_pack(pack: dict) -> dict:
+        """Keep compact, decision-relevant context for the final semantic audit."""
+        keep = (
+            "schema_version",
+            "priority_rules",
+            "problem_paradigm",
+            "problem_structure",
+            "decision_temporality",
+            "environment_source",
+            "task_goal",
+            "data_schema_contract",
+            "source_alias_guard",
+            "source_coverage_ledger",
+            "output_contract",
+            "source_artifacts",
+        )
+        projected = {key: pack[key] for key in keep if key in pack}
+        execution = pack.get("execution_contract")
+        if isinstance(execution, dict):
+            execution_projection = {
+                key: execution[key]
+                for key in (
+                    "readiness",
+                    "evaluation_id",
+                    "identity_semantics",
+                    "constraint_resolution_policy",
+                    "open_questions",
+                    "authority_conflict_assessments",
+                    "blocking_issues",
+                )
+                if key in execution and execution[key] not in (None, "", [], {})
+            }
+            if execution_projection:
+                projected["execution_contract"] = execution_projection
+        projected.update({
+            key: pack[key]
+            for key in ("modeling_boundary", "pitfalls")
+            if key in pack
+        })
+        return projected
 
     @staticmethod
     def _artifact_description_issues(review: ArtifactConsistencyReview) -> list[dict]:
@@ -3768,12 +4532,17 @@ class TaskDefinitionModule:
                          "overview_task_definition.overview_markdown": "任务概述",
                          "overview_task_definition.task_definition_markdown": "任务定义"}
         for issue in review.issues:
+            if str(issue.severity or "").lower() != "blocking":
+                continue
             item = issue.model_dump()
             section = str(issue.section or "").strip()
             if issue.repair_target == "machine_contract":
                 match = re.match(r"^main_task_protocol\.frozen_description_sections\.([a-z_]+\.[a-z_]+)(?:$|\s|/)", section)
                 titles = [mirror_titles[match.group(1)]] if match and match.group(1) in mirror_titles else []
-                for ref in issue.evidence_refs:
+                for ref in [section, *issue.evidence_refs]:
+                    mirror = re.match(r"^(?:main_task_protocol\.frozen_description_sections|description_sections|description_protocol_bundle)\.([a-z_]+\.[a-z_]+)(?:$|[\s:/])", ref)
+                    if mirror and mirror.group(1) in mirror_titles:
+                        titles.append(mirror_titles[mirror.group(1)])
                     prose = re.match(r"^(?:description\.md|description_markdown)\s*(?:::|>)\s*([^/>:]+)", ref)
                     if prose and prose.group(1).strip() in mirror_titles.values():
                         titles.append(prose.group(1).strip())
@@ -3782,6 +4551,7 @@ class TaskDefinitionModule:
                 continue
             if item["repair_target"] != "description_section" or not section:
                 continue
+            section = mirror_titles.get(section + ".markdown", section)
             if " > " in section:
                 section = section.split(" > ", 1)[0].strip()
             item["section"] = section
@@ -3883,8 +4653,17 @@ class TaskDefinitionModule:
         # Callers retain these object identities until the final report is saved.
         for field, value in repaired.model_dump().items():
             setattr(evaluation_contract, field, value)
+        if protocol_bundle is not None:
+            self._synchronize_hybrid_objective(protocol_bundle, evaluation_contract)
+            downstream_context["description_protocol_bundle"] = protocol_bundle.model_dump()
         downstream_context["evaluation_contract"] = repaired.model_dump()
         self._write_evaluation_contract_report(repaired)
+        if protocol_bundle is not None:
+            self._write_protocol_artifacts(
+                problem_review=problem_review,
+                deterministic_data_access=downstream_context.get("data_access_protocol", {}),
+                protocol_bundle=protocol_bundle,
+            )
         self._remember_stage("evaluation_contract", repaired.model_dump(), authority=repaired.authority_status)
         current = self._replace_h2_section(
             desc, "评估协议", self._render_evaluation_section(repaired, downstream_context)
@@ -4013,17 +4792,32 @@ class TaskDefinitionModule:
             stable_title="Stable repair policy", dynamic_title="Audited conflicts and exact current field values",
             complete_current_snapshot=True,
         )
+        attempts = []
         repair = self.services.llm_client.ask_structured(
             model_cls=DerivedContractRepair,
             system_prompt=self.services.prompt_mgr.load("system/derived_contract_repair.md"),
-            user_prompt=dynamic, prompt_name="derived_contract_repair", max_tokens=32768,
+            user_prompt=dynamic, prompt_name="derived_contract_repair_1", max_tokens=32768,
             static_context_prompt=stable, dynamic_user_prompt=dynamic,
         )
-        bundle, sample = apply_derived_repairs(
-            protocol_bundle, sample_spec, repair,
-            issue_ids={issue.issue_id for issue in review.issues}, evidence_refs=set(evidence),
-            allow_output_columns=allow_output_columns,
-        )
+        try:
+            if not repair.repairs:
+                # A prose-only conflict has no allowed machine field. Its
+                # original description patch and the next audit still run.
+                prose_ids = {item['issue_id'] for item in self._artifact_description_issues(review)}
+                if {issue.issue_id for issue in review.issues}.issubset(prose_ids):
+                    return
+            bundle, sample = apply_derived_repairs(
+                protocol_bundle, sample_spec, repair,
+                issue_ids={issue.issue_id for issue in review.issues}, evidence_refs=set(evidence),
+                allow_output_columns=allow_output_columns,
+            )
+            attempts.append({'attempt': 1, 'accepted': True, 'proposal': repair.model_dump()})
+        except ValueError as exc:
+            attempts.append({'attempt': 1, 'accepted': False,
+                'error': str(exc), 'proposal': repair.model_dump()})
+            raise
+        finally:
+            write_json_safe(self.report_dir / "derived_contract_repair_attempts.json", attempts, indent=2)
         for field, value in bundle.__dict__.items():
             setattr(protocol_bundle, field, value)
         for field, value in sample.__dict__.items():
@@ -4075,8 +4869,13 @@ class TaskDefinitionModule:
         current = desc
         review = ArtifactConsistencyReview(passed=True)
         rounds: list[dict] = []
+        full_scan_evidence = self._full_scan_audit_evidence(
+            (evaluation_repair_context or {}).get("file_summaries")
+        )
         max_rounds = max(1, int(getattr(self.config.prompt, "artifact_consistency_max_rounds", 2)))
-        for round_idx in range(1, max_rounds + 1):
+        # Allow the configured number of repair passes, then run one final
+        # review so defects found in the last repair pass are not left stale.
+        for round_idx in range(1, max_rounds + 2):
             try:
                 review = self._review_final_artifact_consistency(
                     desc=current,
@@ -4089,6 +4888,7 @@ class TaskDefinitionModule:
                     main_task_protocol=main_task_protocol,
                     downstream_context=downstream_context,
                     deterministic_defects=deterministic_defects,
+                    full_scan_evidence=full_scan_evidence,
                     round_idx=round_idx,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -4098,6 +4898,11 @@ class TaskDefinitionModule:
                 )
                 rounds.append({"round": round_idx, "reviewer_error": str(exc)[:1000]})
                 break
+            if artifact_consistency_warning_only(review):
+                review = review.model_copy(update={"passed": True})
+                review.summary = (
+                    (review.summary + " ") if review.summary else ""
+                ) + "仅有非阻断 warning；一致性门禁通过并保留警告。"
             rounds.append({"round": round_idx, "review": review.model_dump()})
             self._remember_stage(
                 f"artifact_consistency_review_{round_idx}",
@@ -4105,12 +4910,14 @@ class TaskDefinitionModule:
                 authority="semantic_audit",
             )
             blocking = [issue for issue in review.issues if str(issue.severity or "").lower() == "blocking"]
-            if review.passed and not blocking:
+            if artifact_consistency_gate_passes(review) and not blocking:
                 break
-            if round_idx >= max_rounds:
+            if round_idx > max_rounds:
                 break
             machine_repaired = False
-            question_issues = [issue for issue in review.issues if issue.repair_target == "machine_contract"
+            question_issues = [issue for issue in review.issues
+                               if str(issue.severity or "").lower() == "blocking"
+                               and issue.repair_target == "machine_contract"
                                and issue.section in {"open_questions", "execution_contract.open_questions"}]
             if question_issues and evaluation_repair_context is not None:
                 try:
@@ -4127,7 +4934,8 @@ class TaskDefinitionModule:
                     break
                 machine_repaired = True
             machine_issues = [issue for issue in review.issues
-                              if issue.repair_target == "machine_contract"
+                              if str(issue.severity or "").lower() == "blocking"
+                              and issue.repair_target == "machine_contract"
                               and (re.match(r"^evaluation_contract(?:$|[.\[/\s])", issue.section.strip())
                                    or "evaluation_contract" in re.split(r"[;,，；、\s]+", issue.artifact))]
             if machine_issues and evaluation_repair_context is not None:
@@ -4152,7 +4960,9 @@ class TaskDefinitionModule:
                     rounds[-1]["evaluation_repair_error"] = str(exc)
                     break
                 machine_repaired = True
-            derived_issues = [issue for issue in review.issues if issue.repair_target == "machine_contract"
+            derived_issues = [issue for issue in review.issues
+                              if str(issue.severity or "").lower() == "blocking"
+                              and issue.repair_target == "machine_contract"
                               and (re.match(r"^(?:sample_submission_spec|description_protocol_bundle)(?:$|[.\[/\s])", issue.section.strip())
                                    or issue.artifact.strip() in {"sample_submission_spec", "description_protocol_bundle"}
                                    or any(re.match(r"^(?:sample_submission_spec|description_protocol_bundle)\.", ref)
@@ -4176,6 +4986,7 @@ class TaskDefinitionModule:
                     rounds[-1]["derived_repair_error"] = str(exc)
                     break
             fact_issues = [issue for issue in review.issues
+                           if str(issue.severity or "").lower() == "blocking"
                            if section_fact_fields(downstream_context.get("description_sections", {}), [issue])]
             if fact_issues and evaluation_repair_context is not None:
                 try:
@@ -5132,6 +5943,10 @@ class TaskDefinitionModule:
                 static_context_prompt=stable,
                 dynamic_user_prompt=dynamic,
             )
+            review, normalized_fields = normalize_explicit_time_series_contract(
+                review,
+                original_text,
+            )
             if review.authority_status not in {"official", "autorealize_assumption", "unresolved"}:
                 review.authority_status = "unresolved"
             if review.assumptions and (review.passed or review.authority_status == "official"):
@@ -5162,6 +5977,7 @@ class TaskDefinitionModule:
                     "defects": defects,
                     "issues": review.issues,
                     "fixes": review.fixes,
+                    "deterministic_normalizations": normalized_fields,
                 }
             )
             log_event(
@@ -5656,6 +6472,13 @@ class TaskDefinitionModule:
             original_text=original_text,
             data_digest=data_description_text,
         )
+        self._synchronize_hybrid_objective(protocol_bundle, evaluation_contract)
+        downstream_context["description_protocol_bundle"] = protocol_bundle.model_dump()
+        self._write_protocol_artifacts(
+            problem_review=problem_review,
+            deterministic_data_access=deterministic_data_access,
+            protocol_bundle=protocol_bundle,
+        )
         downstream_context["evaluation_contract"] = evaluation_contract.model_dump()
         task_cls.primary_metric = evaluation_contract.primary_metric
         task_cls.metric_formula = evaluation_contract.metric_formula or evaluation_contract.scalar_score_formula
@@ -5718,7 +6541,13 @@ class TaskDefinitionModule:
             sample_spec.columns = [str(x) for x in official_sample_probe.get("columns", []) if str(x).strip()]
         protocol_bundle.output.columns = sample_spec.columns or protocol_bundle.output.columns
         protocol_bundle.output.output_filename = sample_spec.output_filename or protocol_bundle.output.output_filename
-        self._sync_sample_requirement(problem_review, protocol_bundle, downstream_context, official_sample_probe)
+        self._sync_sample_requirement(
+            problem_review,
+            protocol_bundle,
+            downstream_context,
+            official_sample_probe,
+            sample_spec=sample_spec,
+        )
         if sample_spec.format_rules:
             protocol_bundle.output.format_rules = list(dict.fromkeys(protocol_bundle.output.format_rules + sample_spec.format_rules))
         if sample_spec.no_sample_submission_reason:
@@ -5919,35 +6748,14 @@ class TaskDefinitionModule:
         )
         self._remember_stage("description_field_section", field_section.model_dump())
         frozen_sections["关键字段说明"] = field_section.markdown
-        constraint_section = self._generate_generic_section(
-            section_id="constraints_leakage",
-            section_title="约束与防泄漏",
-            evidence_pack=self._build_constraint_section_pack(
-                downstream_context=downstream_context,
-                relations=rel_hints_refined,
-            ),
+        constraint_section, tips_section = self._generate_constraints_and_tips(
+            downstream_context=downstream_context,
+            relations=rel_hints_refined,
             frozen_sections=frozen_sections,
             original_text=original_text,
-            artifact_refs=task_definition_artifact_refs,
-            extra_rules=[
-                "写硬约束、非法输出、防泄漏和验证边界。",
-                "不要发明权威材料中没有的约束。",
-            ],
         )
         self._remember_stage("description_constraint_section", constraint_section.model_dump())
         frozen_sections["约束与防泄漏"] = constraint_section.markdown
-        tips_section = self._generate_generic_section(
-            section_id="tips",
-            section_title="关键坑点与待确认事项",
-            evidence_pack=self._build_tips_pack(downstream_context=downstream_context),
-            frozen_sections=frozen_sections,
-            original_text=original_text,
-            artifact_refs=task_definition_artifact_refs,
-            extra_rules=[
-                "必须包含 QDI 未解问题处理原则。",
-                "提醒下游避免依赖未验证疑惑，无法避免时写成可配置假设或保守兜底。",
-            ],
-        )
         self._remember_stage("description_tips_section", tips_section.model_dump())
         frozen_sections["关键坑点与待确认事项"] = tips_section.markdown
 

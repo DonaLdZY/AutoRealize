@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -8,6 +9,11 @@ from autorealize.config import AutoRealizeConfig
 from autorealize.context_compiler import ArtifactStore
 from autorealize.investigation import (
     _qdi_answerer_stable_prefix,
+    _qdi_compact_constraint_memory,
+    _qdi_compact_coverage,
+    _qdi_project_cache_context,
+    _qdi_table_index_card,
+    _qdi_question_cache_context,
     _run_question_investigator_inner,
     _artifact_ids_in,
     _bounded_json_view,
@@ -15,6 +21,7 @@ from autorealize.investigation import (
     _merge_working_memory_card,
     _new_live_action_entry,
     _recent_action_window,
+    _working_memory_prompt_view,
 )
 from autorealize.models import (
     ContextRetrievalRequest,
@@ -79,6 +86,15 @@ class _TwoRoundLLM:
                 evidence_refs=["action:1/context_retrieved"],
             ),
         )
+
+
+class _CaptureReadyLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def ask_structured(self, *, model_cls, **kwargs):
+        self.calls.append({"model_cls": model_cls, **kwargs})
+        return QuestionInvestigationPlan(ready_to_answer=True)
 
 
 def test_recent_action_window_keeps_only_latest_three() -> None:
@@ -208,12 +224,163 @@ def test_stable_prefix_shares_planner_routing_key_and_preserves_changed_rules() 
     context = {"table_cards": [{"table_id": "orders"}], "authoritative_memory": {"capacity": 51}}
     planner, _ = stable_dynamic_prompt(stable=context, dynamic={"max_questions": 6})
     answerer = _qdi_answerer_stable_prefix(context)
-    assert planner == answerer
+    assert planner != answerer
+    assert '"table_cards"' in answerer
+    assert '"table_index"' in answerer
     cfg = AutoRealizeConfig()
     key_args = {"config": cfg, "base_url": "https://api.openai.com/v1"}
-    assert _provider_prompt_cache_key(stable_prefix=planner, **key_args) == _provider_prompt_cache_key(stable_prefix=answerer, **key_args)
+    assert _provider_prompt_cache_key(
+        stable_prefix=planner, cache_scope="qdi:project-prefix:v6", **key_args
+    ) == _provider_prompt_cache_key(
+        stable_prefix=answerer, cache_scope="qdi:project-prefix:v6", **key_args
+    )
     changed = _qdi_answerer_stable_prefix({**context, "authoritative_memory": {"capacity": 50}})
-    assert _provider_prompt_cache_key(stable_prefix=changed, **key_args) != _provider_prompt_cache_key(stable_prefix=answerer, **key_args)
+    assert _provider_prompt_cache_key(
+        stable_prefix=changed, cache_scope="qdi:project-prefix:v6", **key_args
+    ) == _provider_prompt_cache_key(
+        stable_prefix=answerer, cache_scope="qdi:project-prefix:v6", **key_args
+    )
+    assert _provider_prompt_cache_key(
+        stable_prefix=answerer, cache_scope="qdi:answerer:v6", **key_args
+    ) != _provider_prompt_cache_key(
+        stable_prefix=answerer, cache_scope="qdi:planner:v6", **key_args
+    )
+
+
+def test_qdi_question_segment_is_route_only_and_does_not_duplicate_table_cards() -> None:
+    context = {
+        "table_cards": [
+            {"table_id": "orders", "source_file": "orders.csv"},
+            {"table_id": "customers", "source_file": "customers.csv"},
+        ],
+        "authoritative_memory": {"capacity": 51},
+    }
+    question = {
+        "question_id": "q1",
+        "question": "Which table defines the output key?",
+        "candidate_files": ["orders.csv"],
+    }
+    segment = _qdi_question_cache_context(context, question, context)
+    assert "table_cards" not in segment
+    assert "table_index" not in segment
+    assert segment["question_route"]["candidate_table_ids"] == ["orders"]
+    assert segment["question_route"]["all_table_details_are_in_project_prefix"] is True
+
+
+def test_project_prefix_excludes_task_and_prior_run_state() -> None:
+    base = {
+        "task_hint": "predict Al(N)",
+        "data_root_name": "chemical",
+        "authoritative_memory": {"task_goal": "predict target"},
+        "table_cards": [{"table_id": "process", "source_file": "process.csv"}],
+        "prior_qdi_memory": {
+            "answers": [{"question_id": "old", "answer": "old answer"}],
+            "source_delta": {"changed_files": ["process.csv"]},
+        },
+    }
+    changed = {
+        **base,
+        "task_hint": "recommend steam flow",
+        "prior_qdi_memory": {
+            "answers": [{"question_id": "new", "answer": "new answer"}],
+            "source_delta": {"new_files": ["new.csv"]},
+        },
+    }
+    assert _qdi_project_cache_context(base) == _qdi_project_cache_context(changed)
+
+
+def test_compact_project_routes_every_table_but_coverage_is_exception_first() -> None:
+    card = {
+        "table_id": "wide",
+        "source_file": "wide.csv",
+        "shape": [10, 40],
+        "fields": [{"name": f"field_{i}", "role": "other"} for i in range(40)],
+    }
+    index = _qdi_table_index_card(card)
+    assert index["table_id"] == "wide"
+    assert len(index["field_names"]) == 16
+    assert index["field_names_omitted_count"] == 24
+
+    coverage = _qdi_compact_coverage(
+        {
+            "schema_version": "v1",
+            "entries": [
+                {"table_id": "ok", "coverage_status": "required", "verified_row_count": 10},
+                {"table_id": "bad", "coverage_status": "required", "row_count_conflict": True},
+            ],
+            "counts": {"required": 2},
+            "original_table_count": 2,
+            "visible_entry_count": 2,
+        }
+    )
+    assert [item["table_id"] for item in coverage["entries"]] == ["bad", "ok"]
+    assert coverage["entry_policy"]
+
+
+def test_constraint_projection_prioritizes_hard_items_and_counts_omissions() -> None:
+    memory = {
+        "summary": "constraints",
+        "items": [
+            {"name": f"soft-{i}", "priority": "low", "strength": "soft", "description": "x"}
+            for i in range(20)
+        ] + [
+            {"name": "hard-rule", "priority": "critical", "strength": "hard", "description": "never leak target"}
+        ],
+    }
+    compact = _qdi_compact_constraint_memory(memory)
+    assert compact["items"][0]["name"] == "hard-rule"
+    assert compact["items_omitted_count"] == 5
+
+
+def test_prior_qdi_memory_exposes_source_status_and_incremental_delta_to_planner(tmp_path: Path):
+    data_root = tmp_path / "input"
+    data_root.mkdir()
+    llm = _CaptureReadyLLM()
+    cfg = AutoRealizeConfig.from_env()
+    prior = {
+        "answers": [{
+            "question_id": "old-q1",
+            "question": "Which file defines the target?",
+            "answer": "target.csv",
+            "confidence": "high",
+            "source_status": "changed",
+            "changed_source_files": ["target.csv"],
+            "task_scope_status": "different",
+            "source_task_hint": "predict a different target",
+        }],
+        "source_delta": {
+            "unchanged_files": ["history.csv"],
+            "new_files": ["new_batch.csv"],
+            "changed_files": ["target.csv"],
+            "removed_files": ["old.csv"],
+        },
+    }
+    _run_question_investigator_inner(
+        cfg=cfg,
+        llm_client=llm,
+        prompt_mgr=_PromptManager(),
+        data_root=data_root,
+        task_hint="predict target",
+        file_summaries=[],
+        relation_hints=[],
+        constraint_memory={},
+        authoritative_memory={},
+        knowledge_base={},
+        prior_question_memory=prior,
+        report_dir=tmp_path / "report",
+    )
+    planner = next(call for call in llm.calls if call["model_cls"] is QuestionInvestigationPlan)
+    dynamic = planner["dynamic_user_prompt"]
+    combined = planner["static_context_prompt"] + dynamic
+    assert "source_status" in dynamic
+    assert "source_inventory_status" in dynamic
+    assert "qdi_contract_status" in dynamic
+    assert "task_scope_status" in dynamic
+    assert "predict a different target" in dynamic
+    assert "changed_source_files" in dynamic
+    assert "new_batch.csv" in dynamic
+    assert "old.csv" in dynamic
+    assert "只能作为假设" in combined or "hypotheses" in combined
 
 
 @pytest.mark.parametrize("recommended_actions", [0, 1, 2])
@@ -263,7 +430,53 @@ def test_full_qdi_loop_reuses_prefix_and_updates_memory_without_summary_call(
     assert report["working_memory_cards"][0]["last_updated_sequence"] == 2
 
 
-def test_adaptive_budget_preserves_explicit_one_round_cap(tmp_path: Path) -> None:
+def test_qdi_action_prompt_uses_compact_host_owned_decision_state() -> None:
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_root = root / "input"
+        report_dir = root / "report"
+        data_root.mkdir()
+        cfg = AutoRealizeConfig.from_env()
+        cfg.investigation.max_questions = 1
+        cfg.investigation.max_rounds_per_run = 2
+        cfg.investigation.max_scripts_per_question = 0
+        cfg.investigation.context_retrievals_per_question = 1
+        cfg.investigation.document_retrievals_per_question = 0
+        cfg.investigation.artifact_retrievals_per_question = 0
+        llm = _TwoRoundLLM()
+
+        _run_question_investigator_inner(
+            cfg=cfg,
+            llm_client=llm,
+            prompt_mgr=_PromptManager(),
+            data_root=data_root,
+            task_hint="test",
+            file_summaries=[],
+            relation_hints=[],
+            constraint_memory={},
+            authoritative_memory={},
+            knowledge_base={},
+            report_dir=report_dir,
+        )
+
+        action_prompts = [
+            call["dynamic_user_prompt"]
+            for call in llm.calls
+            if call["model_cls"] is QuestionInvestigationAction
+        ]
+        assert action_prompts
+        assert all('"protocol":"qdi-decision-state-v7"' in prompt for prompt in action_prompts)
+        assert all('"decision_state"' in prompt for prompt in action_prompts)
+        assert all("Append-only action and digest timeline" not in prompt for prompt in action_prompts)
+        assert all("Recent live action window" not in prompt for prompt in action_prompts)
+        assert '"next_step_hint"' in action_prompts[-1]
+        assert '"available_actions"' in action_prompts[-1]
+
+
+def test_one_investigation_slot_still_allows_context_retrieval_before_answer(tmp_path: Path) -> None:
     data_root = tmp_path / "input"
     data_root.mkdir()
     cfg = AutoRealizeConfig.from_env()
@@ -286,6 +499,33 @@ def test_adaptive_budget_preserves_explicit_one_round_cap(tmp_path: Path) -> Non
         report_dir=tmp_path / "report",
     )
 
-    assert llm.action_calls == 1
-    assert report["action_history"][0]["status"] == "illegal_action"
-    assert report["question_records"][0]["status"] == "unresolved"
+    assert llm.action_calls == 2
+    assert report["action_history"][0]["status"] == "context_retrieved"
+    assert report["question_records"][0]["status"] == "resolved"
+
+
+def test_complete_memory_survives_prompt_projection_and_long_gap_resolution(tmp_path: Path):
+    card = _empty_working_memory_card("q1")
+    gaps = [f"Gap {i}: " + "scope qualifier " * 70 + "DO NOT use holdout rows" for i in range(30)]
+    card = _merge_working_memory_card(card, QDIWorkingMemoryUpdate(
+        open_gaps=gaps, confirmed_facts=["Full population: " + "detail " * 180 + "except shutdown rows"],
+    ), sequence=1, max_chars=1200)
+    assert card["open_gaps"] == gaps
+    assert card["confirmed_facts"][0].endswith("except shutdown rows")
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = store.put("qdi_working_memory_full", "q1:1", card)
+    card["_full_memory_artifact"] = ref
+    view = _working_memory_prompt_view(card, max_chars=1200)
+    assert view["truncated"] is True
+    assert view["omitted_entries"]["open_gaps"] + len(view["open_gaps"]) == len(gaps)
+    assert all(item["text"] == gaps[item["index"]] for item in view["open_gaps"])
+    assert card["open_gaps"] == gaps
+    result = store.read_excerpt(ref["artifact_id"], json_path="open_gaps[29]", max_chars=3000)
+    assert json.loads(result["excerpt"]) == gaps[29]
+    resolved = _merge_working_memory_card(card, QDIWorkingMemoryUpdate(
+        evidence_refs=["action:2/full_scan"],
+        resolutions=[{"field": "open_gaps", "text": gaps[29], "reason": "verified complete scan",
+                      "evidence_refs": ["action:2/full_scan"]}],
+    ), sequence=2, max_chars=1200)
+    assert resolved["open_gaps"] == gaps[:29]
+    assert card["open_gaps"] == gaps
